@@ -359,10 +359,28 @@ ask them about. Deciding this on measurement beats deciding it now on priors.
   capped at ~150 nodes with the rest collapsed behind "N more". Force-directed layout via
   a small WebGL/canvas renderer (sigma.js or cosmograph — decide at build time; avoid
   d3-force at this node count).
-- **Heatmap (R9)**: on every query *and* every highlight-selection, embed the query, dot it
-  against the paper-level vectors of the visible subgraph, and shade nodes on a
-  perceptually-uniform sequential ramp. That's ~150 dot products — sub-millisecond, so it
-  can update live as the user drags a selection.
+- **Heatmap (R9)**: on every query *and* every highlight-selection, embed it once and score
+  each visible node, shading on a perceptually-uniform sequential ramp.
+
+  **Node score = mean of the paper's top-3 chunk similarities**, computed in tier-1 int8 —
+  not the paper-level abstract vector, and not the mean over all chunks. The reasoning:
+
+  - *Paper-level (title+abstract) vector* is one dot product and nearly free, but abstracts
+    are promotional summaries. A paper whose §4.2 exactly answers the question may have an
+    abstract that never mentions it.
+  - *Mean over all chunks* dilutes badly. A 100-chunk paper with one perfect chunk scores
+    low because the other 99 are irrelevant. Mean answers "is this paper **about** the
+    query", when exploration needs "does it **answer** the query".
+  - *Max over chunks* asks the right question but lets a single spurious chunk light up a
+    node.
+  - *Mean of top-3* keeps max's semantics with robustness against one outlier. **Chosen.**
+
+  Cost: ~150 visible nodes × ~50 chunks ≈ 7,500 int8 dot products at 256-d — microseconds,
+  so it recomputes live while the user drags a selection. Falls back to the paper-level
+  vector for papers whose full text has not been crawled yet, which under D2's lazy
+  fetching is a large fraction early on. Because the score comes from identified chunks, we
+  also know *which* chunk made a node hot — hovering surfaces it, giving a natural
+  jump-in point rather than just a colour.
 - Node colour = similarity, node size = citation count, edge direction = cites/cited-by.
 - "Ask about related work" = a retrieval scoped to the subgraph rather than the global
   index — same pipeline, a node-ID filter on tier 1.

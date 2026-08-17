@@ -219,6 +219,75 @@ def crawl(
 
 
 @app.command()
+def embed(
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    limit: int = typer.Option(0, help="Stop after N chunks (0 = drain)"),
+    device: str = typer.Option(None, help="Override device, e.g. cuda:0"),
+    no_compile: bool = typer.Option(False, "--no-compile", help="Disable torch.compile"),
+    fts: bool = typer.Option(True, help="Rebuild the BM25 index afterwards"),
+) -> None:
+    """Embed pending chunks into the tier-1/tier-2 vector files. Resumable."""
+    from lara.index import embed as emb
+    from lara.index.vectors import VectorStore
+    from lara.store import db
+
+    cfg = config_mod.load(config)
+    ecfg = cfg.get_in("embedding")
+    conn = db.connect(cfg.get_path("paths.metadata_db"))
+    store = VectorStore(
+        cfg.get_path("paths.vectors_fp16"), cfg.get_path("paths.vectors_int8"),
+        dim_full=int(ecfg["dim_full"]), dim_trunc=int(ecfg["dim_truncated"]),
+    )
+
+    pending = conn.execute("SELECT COUNT(*) FROM chunks WHERE vector_row IS NULL").fetchone()[0]
+    console.print(
+        f"[bold]{pending:,}[/bold] chunks pending, {store.rows():,} already embedded"
+    )
+    if not pending:
+        conn.close()
+        return
+
+    dev = device or f"cuda:{(ecfg.get('devices') or [0])[0]}"
+    mode = None if no_compile else ecfg.get("compile")
+    console.print(f"loading {ecfg['model']} on {dev} (compile={mode or 'off'})…")
+    model = emb.load_model(
+        ecfg["model"], device=dev, max_seq_length=int(ecfg["max_seq_len"]),
+        compile_mode=mode, compile_dynamic=bool(ecfg.get("compile_dynamic", True)),
+    )
+
+    def reporter():
+        total = 0
+        while True:
+            n, rate, start_row = yield
+            total += n
+            console.print(
+                f"  +{n:>5} chunks  {rate:6.0f}/s  rows {start_row:,}–{start_row + n:,}  "
+                f"({total:,}/{pending:,})"
+            )
+
+    progress = reporter()
+    next(progress)
+
+    try:
+        stats = emb.run(
+            conn, store, model,
+            batch_size=int(ecfg["batch_size"]),
+            slice_size=int(ecfg.get("slice_size", 8192)),
+            limit=limit, progress=progress,
+        )
+        console.print(
+            f"[green]embedded {stats['chunks']:,} chunks[/green] in "
+            f"{stats['seconds']/60:.1f} min "
+            f"({stats['chunks']/max(stats['seconds'],1e-6):.0f}/s)"
+        )
+        if fts:
+            n = emb.rebuild_fts(conn)
+            console.print(f"BM25 index rebuilt: {n:,} rows")
+    finally:
+        conn.close()
+
+
+@app.command()
 def status(config: str = typer.Option(None, help="Path to config.yaml")) -> None:
     """Corpus counts and per-stage progress."""
     from lara.store import db

@@ -95,8 +95,20 @@ embedding:
   #   bulk indexing: embedder uses cards 0+1, vLLM is not running
   #   serving:       embedder card 0, reranker card 1, vLLM card 2
   devices: [0, 1]
+  # torch.compile. dynamic=true is important: sentence-transformers sorts by length and
+  # pads per batch, so the encoder sees many shapes; static compilation would re-autotune
+  # on each one and lose more than it gains. See lara/index/embed.py.
+  # Measured: 'default' = 1027 chunks/s (2.19x eager). max-autotune-no-cudagraphs was
+  # tried and is far worse -- 51 chunks/s dynamic, 101 with padding forced static -- it
+  # never stops re-autotuning against length-sorted batches. See embed.py for the table.
+  compile: default                      # null to disable
+  compile_dynamic: true
+  slice_size: 8192                       # chunks per durable checkpoint
+  # Documents carry a contextual prefix: "title: {paper} > {section} | text: {chunk}".
+  # A free stand-in for contextual retrieval, which would otherwise cost one LLM call per
+  # chunk. Queries use a DIFFERENT prompt -- EmbeddingGemma is asymmetric.
   query_prefix: "task: search result | query: "
-  doc_prefix: "title: {title} | text: "
+  doc_prefix: "title: {title} > {section} | text: "
 
 index:
   warm:
