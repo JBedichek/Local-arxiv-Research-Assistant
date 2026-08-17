@@ -128,8 +128,13 @@ def retrieve(req: RetrieveRequest) -> JSONResponse:
         n = s.neighbours(req.paper)
         restrict = [req.paper, *n["cites"], *n["cited_by"]]
 
-    s.retriever.final_k = max(1, min(req.k, 32))
-    result = s.retriever.retrieve(req.query, papers=restrict, selection=req.selection)
+    # k is passed per call rather than assigned to the shared retriever: endpoints run
+    # concurrently in a threadpool, so mutating retriever state lets one request change
+    # another's result count mid-flight.
+    result = s.retriever.retrieve(
+        req.query, papers=restrict, selection=req.selection,
+        final_k=max(1, min(req.k, 32)),
+    )
     return JSONResponse({
         "timings_ms": {k: round(v, 1) for k, v in result.timings_ms.items()},
         "candidates": result.n_candidates,

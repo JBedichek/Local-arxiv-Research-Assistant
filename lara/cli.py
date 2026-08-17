@@ -413,13 +413,24 @@ def serve_llm(
     repo = model or v["default_model"]
     port = v["base_url"].rstrip("/").rsplit(":", 1)[-1].split("/")[0]
 
+    # vLLM lives in its own venv. The reader's environment is pinned to torch 2.9.1 /
+    # transformers 4.57 by other projects that share it, which is far too old for recent
+    # checkpoints (Qwen3.8 needs a `qwen3_5` implementation that vLLM 0.14 does not
+    # have). Since vLLM is a separate process reached over HTTP, isolating it costs
+    # nothing and leaves the shared environment untouched.
+    from pathlib import Path as _Path
+
+    isolated = _Path(__file__).resolve().parent.parent / ".venv-vllm" / "bin" / "vllm"
+    vllm_bin = str(isolated) if isolated.exists() else "vllm"
+
     cmd = [
-        "vllm", "serve", repo,
+        vllm_bin, "serve", repo,
         "--port", str(port),
         "--served-model-name", repo,
         "--gpu-memory-utilization", str(v.get("gpu_memory_utilization", 0.5)),
         "--max-model-len", str(v.get("max_model_len", 32768)),
         "--kv-cache-dtype", str(v.get("kv_cache_dtype", "auto")),
+        "--max-num-seqs", str(v.get("max_num_seqs", 64)),
     ]
     if v.get("enable_prefix_caching", True):
         cmd.append("--enable-prefix-caching")
@@ -427,6 +438,10 @@ def serve_llm(
     env = dict(os.environ)
     devices = v.get("gpu_devices") or [0]
     env["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in devices)
+    # The three cards are not identical — 0 and 1 are Max-Q, 2 is the full Workstation
+    # Edition — and CUDA's default ordering is by compute capability, not slot. Without
+    # this, "device 1" here and "device 1" in the reader can be different cards.
+    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
 
     console.print(f"[dim]CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}[/dim] {' '.join(cmd)}")
     if show:

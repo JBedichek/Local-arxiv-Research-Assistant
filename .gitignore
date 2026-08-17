@@ -10,8 +10,11 @@ data/
 # Python
 __pycache__/
 *.py[cod]
-.venv/
-venv/
+# Any virtualenv, however suffixed. `.venv/` alone missed `.venv-vllm/` and a plain
+# `git add -A` committed 3.4 GB of torch and CUDA libraries.
+.venv*/
+venv*/
+env/
 *.egg-info/
 build/
 dist/

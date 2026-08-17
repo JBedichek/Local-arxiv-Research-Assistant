@@ -179,6 +179,11 @@ serving:
     enable_prefix_caching: true
     kv_cache_dtype: auto
     max_model_len: 32768
+    # Qwen3.5 is a hybrid attention/Mamba architecture: every decode sequence needs its
+    # own Mamba cache block, and vLLM's default max_num_seqs of 1024 exceeds the ~280
+    # blocks that fit, which aborts CUDA graph capture. This is a single-user reader, so
+    # 64 concurrent sequences is already generous.
+    max_num_seqs: 64
     # D15: Qwen3.8-27B-FP8 — the checkpoint is natively FP8 (F8_E4M3), which Blackwell
     # sm_120 runs on hardware tensor cores. Supersedes base Mixtral: it is instruction
     # tuned, so the few-shot scaffolding D3 required for a base model is no longer

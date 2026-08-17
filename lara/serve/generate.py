@@ -25,6 +25,8 @@ from collections.abc import AsyncIterator
 
 import httpx
 
+OPEN, CLOSE = "<think>", "</think>"
+
 SYSTEM = """You answer questions about arXiv machine-learning papers using only the \
 excerpts provided. Rules:
 
@@ -49,6 +51,11 @@ Answer: It replaces recurrent layers with stacked self-attention and position-wi
 forward layers [1]. Because self-attention connects all positions in a constant number of \
 sequential operations rather than O(n) [2], sequence order is handled without any \
 recurrent step."""
+
+
+def prefix_body(prefix: str) -> str:
+    """The excerpt block, with the system text stripped (it moves to the system role)."""
+    return prefix.split('---\n\n', 1)[-1]
 
 
 def build_prompt(
@@ -80,23 +87,36 @@ async def stream_answer(
     temperature: float = 0.2,
     max_tokens: int = 1024,
 ) -> AsyncIterator[str]:
+    # Reasoning-block stripping runs over the accumulated stream, not per chunk.
+    acc, sent, state = "", 0, "unknown"
     vcfg = cfg.get_in("serving.vllm")
     base_url = vcfg["base_url"].rstrip("/")
     model_name = model or vcfg.get("default_model")
     prefix, tail = build_prompt(query, hits, selection)
 
+    # Chat completions, not raw completions: the generator is instruction tuned, so its
+    # chat template is what it was trained to answer in. Raw prompting works but produces
+    # noticeably worse grounding and ignores the system role.
+    #
+    # `enable_thinking: false` matters — Qwen3.x emits a <think> reasoning block by
+    # default, which for a two-sentence grounded answer is most of the latency and none
+    # of the output. The tags are also stripped below, since the flag is model-specific
+    # and silently ignored by generators that do not know it.
     payload = {
         "model": model_name,
-        "prompt": prefix + tail,
+        "messages": [
+            {"role": "system", "content": SYSTEM},
+            {"role": "user", "content": prefix_body(prefix) + tail},
+        ],
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": True,
-        "stop": ["\n\nQuestion:", "\n\nExcerpts:"],
+        "chat_template_kwargs": {"enable_thinking": False},
     }
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0)) as client:
         try:
-            async with client.stream("POST", f"{base_url}/completions", json=payload) as resp:
+            async with client.stream("POST", f"{base_url}/chat/completions", json=payload) as resp:
                 if resp.status_code != 200:
                     body = (await resp.aread()).decode()[:200]
                     raise RuntimeError(f"vLLM returned {resp.status_code}: {body}")
@@ -110,9 +130,37 @@ async def stream_answer(
                         chunk = json.loads(data)
                     except json.JSONDecodeError:
                         continue
-                    text = (chunk.get("choices") or [{}])[0].get("text", "")
-                    if text:
-                        yield text
+                    choice = (chunk.get("choices") or [{}])[0]
+                    delta = choice.get("delta", {})
+                    # Some builds stream reasoning in its own field; that is easy, we
+                    # simply never read it.
+                    text = delta.get("content") or choice.get("text") or ""
+                    if not text:
+                        continue
+
+                    acc += text
+                    if state == "unknown":
+                        stripped = acc.lstrip()
+                        if stripped.startswith(OPEN):
+                            state = "thinking"
+                        elif OPEN.startswith(stripped[: len(OPEN)]):
+                            # Could still turn into "<think>" — the tag arrives split
+                            # across token boundaries ("<", "think", ">"), which is why
+                            # a per-chunk substring test never fires. Wait for more.
+                            continue
+                        else:
+                            state = "plain"
+
+                    if state == "thinking":
+                        if CLOSE not in acc:
+                            continue
+                        acc = acc.split(CLOSE, 1)[1].lstrip()
+                        state, sent = "plain", 0
+
+                    out = acc[sent:]
+                    if out:
+                        sent = len(acc)
+                        yield out
         except httpx.ConnectError as exc:
             raise RuntimeError(
                 f"no vLLM server at {base_url} — start one with `lara serve-llm`"

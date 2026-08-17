@@ -119,6 +119,7 @@ class Retriever:
         papers: list[str] | None = None,
         rows: np.ndarray | None = None,
         selection: str | None = None,
+        final_k: int | None = None,
     ) -> RetrievalResult:
         """Run the full pipeline.
 
@@ -209,7 +210,7 @@ class Retriever:
         t["rerank"] = (clock() - t0) * 1000
         t["total"] = sum(v for k, v in t.items() if k != "total")
 
-        return RetrievalResult(ranked[: self.final_k], t, len(fused_ids))
+        return RetrievalResult(ranked[: (final_k or self.final_k)], t, len(fused_ids))
 
 
 def load_cross_encoder(
