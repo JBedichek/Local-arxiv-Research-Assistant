@@ -48,8 +48,14 @@ corpus:
 
 ingest:
   # D2: abstracts for everything up front; full text lazily + background crawl.
-  metadata_source: kaggle          # bootstrap snapshot; OAI-PMH for incrementals
-  oai_endpoint: http://export.arxiv.org/oai2
+  # D12: OAI-PMH rather than the Kaggle snapshot — no account or API token needed, and it
+  # doubles as the nightly incremental path. Harvests the `cs` and `stat` sets in FULL;
+  # the 2015 floor is applied to the v1 submission date at ingest, because OAI's `from=`
+  # filters on last-modified datestamp instead. See lara/ingest/oai.py.
+  metadata_source: oai
+  oai_endpoint: https://export.arxiv.org/oai2
+  oai_sets: [cs, stat]
+  oai_min_interval_sec: 3.0        # arXiv's stated OAI guidance; ~1300 records per request
   fulltext:
     # Q11: 2-4 req/s, back off hard on 429. Tune `rate_per_sec` down if arXiv complains.
     rate_per_sec: 3.0
@@ -84,7 +90,11 @@ embedding:
   dim_truncated: 256                     # MRL truncation for the warm tier
   batch_size: 512
   max_seq_len: 512
-  devices: [0, 1]                        # leave one card free for vLLM
+  # GPU plan — 3x RTX PRO 6000 Blackwell, 102 GB each, sm_120 (verified via torch;
+  # nvidia-smi's NVML is broken but CUDA itself is fine).
+  #   bulk indexing: embedder uses cards 0+1, vLLM is not running
+  #   serving:       embedder card 0, reranker card 1, vLLM card 2
+  devices: [0, 1]
   query_prefix: "task: search result | query: "
   doc_prefix: "title: {title} | text: "
 
@@ -97,11 +107,16 @@ index:
   rerank:
     tier2_candidates: 200                # exact fp16 rescore from mmap
     final_k: 20
-    # Q9: cross-encoder slot, disabled for v1 (no cross-encoder is cached; see PLAN §5.1)
+    # D13: cross-encoder reranking enabled. Qwen3-Reranker-4B ships native
+    # sentence-transformers support (config_sentence_transformers.json + 1_LogitScore),
+    # so no seq-cls conversion shim is needed. ~8 GB bf16. See PLAN.md §5.1.
     cross_encoder:
-      enabled: false
-      model: null
-      candidates: 50
+      enabled: true
+      model: Qwen/Qwen3-Reranker-4B
+      device: 1
+      candidates: 50               # rerank top-50 down to final_k
+      batch_size: 50               # one padded batch; ~30-60 ms on a Blackwell card
+      max_length: 512
   lexical:
     enabled: true
     backend: fts5

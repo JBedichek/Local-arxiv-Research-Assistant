@@ -614,6 +614,44 @@ corpus; incremental nightly index updates.
   refuses to start below 60 GB free. It also catches a stray `HF_HOME` in the environment.
 - **D11 — Name (Q10).** `Local-arxiv-Research-Assistant`, package `lara`, remote
   `git@github.com:JBedichek/Local-arxiv-Research-Assistant.git`.
+- **D12 — Metadata via OAI-PMH, not Kaggle.** No Kaggle credentials exist on this machine,
+  and OAI-PMH needs no account, no API token and no 4.5 GB download — plus it doubles as
+  the nightly incremental path. Verified 2026-08-17: ~1300 records/request with a
+  resumption token. **Trap found and handled:** OAI's `from=`/`until=` filter on the *OAI
+  datestamp* (last-modified), not the submission date — paper 1107.0901, submitted 2011,
+  carries datestamp 2026-08-03. So the sets are harvested in **full** and D1's 2015 floor
+  is applied to the `v1` version date at ingest. Consequence: `papers` holds every `cs` +
+  `stat` record (~1.1 M rows, ~2 GB) with an `in_scope` flag, so widening D1 Core →
+  Extended later is a re-flag, not a re-harvest.
+- **D13 — Reranker enabled: `Qwen/Qwen3-Reranker-4B`.** Reverses D9. Chosen from current
+  HF download rankings rather than priors: 4.02 B params, and since April it ships native
+  sentence-transformers support (`config_sentence_transformers.json`, `1_LogitScore`), so
+  it drops into a `CrossEncoder` with no seq-cls conversion shim. ~8 GB bf16 on card 1.
+  Rejected: `bge-reranker-v2-m3` (most-downloaded but older), `Qwen3-Reranker-8B` (~2×
+  the latency for a marginal gain on a 50-candidate list).
+- **D14 — GPU allocation.** Verified via torch: 3 × RTX PRO 6000 Blackwell, **102 GB
+  each**, sm_120. NVML is broken but `torch.cuda.is_available()` is True and device
+  properties read correctly, so vLLM is expected to run — the `nvidia-smi` failure is
+  cosmetic. Mixtral-8x7B at bf16 (93 GB) fits on one card without quantization, making
+  `fp8` optional rather than required. Allocation: *bulk indexing* — embedder on cards
+  0+1, vLLM not running; *serving* — embedder card 0, reranker card 1, vLLM card 2.
+
+### 12.0.1 Checkpointing (per the "save often so we can iterate" requirement)
+
+Every ingest stage is resumable at page granularity, so long jobs can run while the rest of
+the system is being built:
+
+- **Metadata.** `write_page()` commits the records *and* the next resumption token in one
+  SQLite transaction. A `kill -9` mid-harvest resumes from a token whose page is already
+  committed — never a lost page, never a double-counted one. Re-running `lara harvest`
+  picks up where it stopped; `--restart` forces a fresh pass.
+- **Full text.** Per-paper status column (`pending|ok|failed|unavailable`) plus
+  `fulltext_attempts`, so the crawler is a resumable queue rather than a linear scan.
+- **Citations.** Per-paper `s2_status`, same pattern, 500 ids per batch.
+- **Embeddings.** Vectors append to a fixed-stride flat file with the row offset recorded
+  per chunk, so an interrupted embed run resumes from the last committed offset.
+
+`lara status` reports all of it.
 
 ### 12.1 Still open
 
