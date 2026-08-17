@@ -43,9 +43,48 @@ class AppState:
             self.cfg.get_path("paths.vectors_int8"),
             dim_full=int(ecfg["dim_full"]), dim_trunc=int(ecfg["dim_truncated"]),
         )
+        # Paper-level index for semantic paper search. Optional: it may not be built yet,
+        # and search degrades to full-text-only rather than failing.
+        self.paper_store = VectorStore(
+            self.cfg.get_path("paths.papers_fp16"),
+            self.cfg.get_path("paths.papers_int8"),
+            dim_full=int(ecfg["dim_full"]), dim_trunc=int(ecfg["dim_truncated"]),
+        )
+        self.paper_index = None
+        self.paper_row_to_id: dict[int, str] = {}
+
         self.retriever: R.Retriever | None = None
         if load_models:
             self._load(ecfg, icfg)
+            self._load_paper_index()
+
+    def _load_paper_index(self) -> None:
+        from lara.index import search as S
+
+        try:
+            if self.paper_store.rows() == 0:
+                return
+            self.paper_index = S.DenseIndex(self.paper_store.load_int8(), device=self.device)
+            self.paper_row_to_id = {
+                r["vector_row"]: r["arxiv_id"]
+                for r in self.conn().execute("SELECT arxiv_id, vector_row FROM paper_vectors")
+            }
+            self.warmup_ms["paper_index"] = float(self.paper_index.n)
+        except (RuntimeError, FileNotFoundError, ValueError):
+            self.paper_index = None      # not built yet; search falls back to chunks
+
+    def chunk_row_to_paper(self, rows) -> dict[int, str]:
+        """Map chunk vector rows to their papers, for per-paper aggregation."""
+        ids = [int(r) for r in rows.tolist()]
+        if not ids:
+            return {}
+        ph = ",".join("?" * len(ids))
+        return {
+            r["vector_row"]: r["arxiv_id"]
+            for r in self.conn().execute(
+                f"SELECT vector_row, arxiv_id FROM chunks WHERE vector_row IN ({ph})", ids
+            )
+        }
 
     # ── connections ───────────────────────────────────────────────────────────────
 

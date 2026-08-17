@@ -29,6 +29,8 @@ paths:
   vectors_fp16: ${disk.root}/vectors/fp16.bin  # tier 2, mmap'd, 768-d
   vectors_int8: ${disk.root}/vectors/int8.bin  # tier 1, MRL-256
   ann_index:    ${disk.root}/vectors/hnsw.faiss
+  papers_fp16:  ${disk.root}/vectors/papers_fp16.bin   # paper-level, title+abstract
+  papers_int8:  ${disk.root}/vectors/papers_int8.bin
   graph:        ${disk.root}/graph/            # CSR citation adjacency
   raw_cache:    ${disk.root}/raw/              # transient fetched HTML, prunable
   logs:         ${disk.root}/logs/
@@ -165,6 +167,13 @@ hot_tier:
   lru_papers: 20
 
 serving:
+  # 127.0.0.1 keeps the reader on this machine only. Set 0.0.0.0 to reach it from other
+  # devices on the LAN (or run `lara serve --host 0.0.0.0`).
+  #
+  # There is NO authentication on any endpoint, so 0.0.0.0 exposes the corpus, the model
+  # picker and the generator to everything that can route to this host. Fine on a trusted
+  # home network; do not do it on a shared or public one without putting a reverse proxy
+  # with auth in front. Note vLLM already binds 0.0.0.0:8000 by default.
   host: 127.0.0.1
   port: 8080
   vllm:

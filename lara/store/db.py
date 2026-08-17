@@ -142,6 +142,17 @@ CREATE TRIGGER IF NOT EXISTS chunks_fts_au AFTER UPDATE OF text ON chunks BEGIN
     INSERT INTO chunks_fts(rowid, text) VALUES (new.chunk_id, new.text);
 END;
 
+-- Paper-level vectors over title+abstract, for semantic paper search and for the graph
+-- heatmap's abstract-only fallback. Separate from `chunks` because coverage differs by an
+-- order of magnitude: every in-scope paper has a title and abstract, but only the crawled
+-- minority has full text. Searching chunks alone would silently hide most of the corpus.
+CREATE TABLE IF NOT EXISTS paper_vectors (
+    arxiv_id   TEXT PRIMARY KEY,
+    vector_row INTEGER NOT NULL,
+    n_chars    INTEGER
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS paper_vectors_row ON paper_vectors(vector_row);
+
 -- Citation edges (D6, Semantic Scholar). Both endpoints are arXiv ids; references to
 -- non-arXiv works are dropped, which is fine since the graph UI only navigates arXiv.
 CREATE TABLE IF NOT EXISTS citations (

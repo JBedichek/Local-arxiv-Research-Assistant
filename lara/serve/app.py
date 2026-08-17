@@ -15,6 +15,7 @@ import json
 import os
 from pathlib import Path
 
+import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
@@ -195,6 +196,86 @@ def graph(arxiv_id: str, query: str = Query(default=""), limit: int = 60) -> JSO
     })
 
 
+class SearchRequest(BaseModel):
+    query: str
+    limit: int = 20
+    category: str | None = None
+    year_from: int | None = None
+    require_fulltext: bool = False
+
+
+@app.post("/api/search")
+def search_papers(req: SearchRequest) -> JSONResponse:
+    """Semantic paper search — "show me papers on Muon learning rate adaptation".
+
+    Fuses breadth (title+abstract vectors, which exist for every in-scope paper) with
+    depth (full-text chunks aggregated per paper). Neither alone is adequate: abstracts
+    miss methods introduced in section 4, and full text covers only the crawled minority.
+    """
+    import time
+
+    from lara.index import paper_search as PS
+    from lara.index.embed import embed_queries
+
+    s = _state()
+    assert s.retriever is not None
+    t: dict[str, float] = {}
+    clock = time.perf_counter
+
+    t0 = clock()
+    q_full = embed_queries(s.retriever.embedder, [req.query])[0]
+    dim = s.retriever.dim_trunc
+    q = q_full[:dim] / max(float(np.linalg.norm(q_full[:dim])), 1e-12)
+    t["embed"] = (clock() - t0) * 1000
+
+    # breadth: paper-level abstracts
+    t0 = clock()
+    paper_level: dict[str, float] = {}
+    if s.paper_index is not None:
+        rows, scores = s.paper_index.search(q, k=req.limit * 8)
+        paper_level = {
+            s.paper_row_to_id[int(r)]: float(sc)
+            for r, sc in zip(rows.tolist(), scores.tolist())
+            if int(r) in s.paper_row_to_id
+        }
+    t["abstracts"] = (clock() - t0) * 1000
+
+    # depth: full-text chunks, aggregated per paper
+    t0 = clock()
+    crows, cscores = s.retriever.dense.search(q, k=req.limit * 25)
+    chunk_level = PS.aggregate_chunk_hits(crows, cscores, s.chunk_row_to_paper(crows))
+    t["fulltext"] = (clock() - t0) * 1000
+
+    scored = PS.fuse(paper_level, chunk_level)
+    hits = PS.hydrate_papers(s.conn(), scored, req.limit * 3)
+
+    # filters applied after scoring so they never change relative ranking
+    if req.category:
+        hits = [h for h in hits if req.category in h.categories]
+    if req.year_from:
+        hits = [h for h in hits if h.submitted[:4].isdigit() and int(h.submitted[:4]) >= req.year_from]
+    if req.require_fulltext:
+        hits = [h for h in hits if h.fulltext]
+    hits = hits[: req.limit]
+    t["total"] = sum(t.values())
+
+    return JSONResponse({
+        "query": req.query,
+        "timings_ms": {k: round(v, 1) for k, v in t.items()},
+        "results": [
+            {
+                "arxiv_id": h.arxiv_id, "title": h.title, "abstract": h.abstract,
+                "authors": h.authors[:160], "categories": h.categories,
+                "submitted": h.submitted, "score": round(h.score, 4),
+                "n_chunks": h.n_chunks, "fulltext": h.fulltext,
+                "cited_by": h.cited_by, "version": h.version,
+                "evidence": {k: round(v, 4) for k, v in h.evidence.items()},
+            }
+            for h in hits
+        ],
+    })
+
+
 @app.post("/api/reload")
 def reload_index() -> JSONResponse:
     """Pick up vectors added since startup.
@@ -209,10 +290,16 @@ def reload_index() -> JSONResponse:
     from lara.index import search as S
 
     before = s.retriever.dense.n
+    papers_before = s.paper_index.n if s.paper_index is not None else 0
     s.retriever.dense = S.DenseIndex(s.store.load_int8(), device=s.device)
     s.retriever.fp16 = s.store.open_fp16()
     s.retriever.refresh_row_map()
-    return JSONResponse({"vectors_before": before, "vectors_now": s.retriever.dense.n})
+    s._load_paper_index()
+    return JSONResponse({
+        "chunks_before": before, "chunks_now": s.retriever.dense.n,
+        "papers_before": papers_before,
+        "papers_now": s.paper_index.n if s.paper_index is not None else 0,
+    })
 
 
 @app.get("/api/models")

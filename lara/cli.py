@@ -376,6 +376,69 @@ def search(
     conn.close()
 
 
+@app.command("embed-papers")
+def embed_papers(
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    limit: int = typer.Option(0, help="Stop after N papers (0 = drain)"),
+    device: str = typer.Option(None, help="Override device, e.g. cuda:2"),
+) -> None:
+    """Embed title+abstract for every in-scope paper (powers semantic paper search)."""
+    from lara.index import embed as emb
+    from lara.index.vectors import VectorStore
+    from lara.store import db
+
+    cfg = config_mod.load(config)
+    ecfg = cfg.get_in("embedding")
+    conn = db.connect(cfg.get_path("paths.metadata_db"))
+    store = VectorStore(
+        cfg.get_path("paths.papers_fp16"), cfg.get_path("paths.papers_int8"),
+        dim_full=int(ecfg["dim_full"]), dim_trunc=int(ecfg["dim_truncated"]),
+    )
+    pending = conn.execute(
+        "SELECT COUNT(*) FROM papers p LEFT JOIN paper_vectors v ON v.arxiv_id=p.arxiv_id "
+        "WHERE p.in_scope=1 AND p.deleted=0 AND v.arxiv_id IS NULL "
+        "AND p.abstract IS NOT NULL AND length(p.abstract) > 40"
+    ).fetchone()[0]
+    console.print(f"[bold]{pending:,}[/bold] papers pending, {store.rows():,} embedded")
+    if not pending:
+        conn.close()
+        return
+
+    devices = [int(d) for d in (ecfg.get("devices") or [0])]
+    if device:
+        devices = [int(device.rsplit(":", 1)[-1])]
+    model = emb.load_model(
+        ecfg["model"], device=f"cuda:{devices[0]}", max_seq_length=int(ecfg["max_seq_len"]),
+        compile_mode=ecfg.get("compile"), compile_dynamic=True,
+    )
+    encoder = model
+    if len(devices) > 1:
+        encoder = emb.MultiGPUEncoder(model, devices, chunk_size=2048)
+
+    def reporter():
+        total = 0
+        while True:
+            n, rate, start_row = yield
+            total += n
+            console.print(f"  +{n:>5} papers  {rate:6.0f}/s  ({total:,}/{pending:,})")
+
+    progress = reporter()
+    next(progress)
+    try:
+        stats = emb.run_papers(
+            conn, store, encoder, batch_size=int(ecfg["batch_size"]),
+            limit=limit, progress=progress,
+        )
+        console.print(
+            f"[green]embedded {stats['papers']:,} papers[/green] in "
+            f"{stats['seconds']/60:.1f} min"
+        )
+    finally:
+        if isinstance(encoder, emb.MultiGPUEncoder):
+            encoder.close()
+        conn.close()
+
+
 @app.command()
 def serve(
     config: str = typer.Option(None, help="Path to config.yaml"),

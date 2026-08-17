@@ -10,8 +10,8 @@
 <header id="bar">
   <span class="brand">lara</span>
   <form id="open-form">
-    <input id="arxiv-input" type="text" placeholder="arXiv id, e.g. 1706.03762" spellcheck="false" autocomplete="off">
-    <button type="submit">Open</button>
+    <input id="arxiv-input" type="text" placeholder="arXiv id, or search: papers on Muon learning rate adaptation" spellcheck="false" autocomplete="off">
+    <button type="submit">Go</button>
   </form>
   <label>scope
     <select id="scope">
@@ -35,7 +35,11 @@
 
   <section id="paper-pane">
     <div id="paper-meta"></div>
-    <article id="paper"><p class="placeholder">Enter an arXiv id above to open a paper.</p></article>
+    <article id="paper"><p class="placeholder">Enter an arXiv id to open a paper, or type a question to search the corpus.</p></article>
+    <div id="results" hidden>
+      <div id="results-head"></div>
+      <ol id="results-list"></ol>
+    </div>
   </section>
 
   <section id="chat-pane">

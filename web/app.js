@@ -394,10 +394,78 @@ $("#graph").addEventListener("click", (ev) => {
 
 /* ---------- chrome ---------- */
 
+/* The one box does both. An arXiv id is unambiguous — 4 digits, a dot, 4-5 digits, or
+ * the old `hep-th/9901001` form — so anything else is treated as a search query rather
+ * than making the user choose a mode first. */
+const ARXIV_ID = /^(arxiv:)?\s*(\d{4}\.\d{4,5}|[a-z-]+(\.[A-Z]{2})?\/\d{7})(v\d+)?$/i;
+
 $("#open-form").addEventListener("submit", (ev) => {
   ev.preventDefault();
-  const id = $("#arxiv-input").value.trim().replace(/^arxiv:/i, "").replace(/v\d+$/, "");
-  if (id) openPaper(id);
+  const raw = $("#arxiv-input").value.trim();
+  if (!raw) return;
+  const m = raw.match(ARXIV_ID);
+  if (m) {
+    hideResults();
+    openPaper(m[2]);
+  } else {
+    searchPapers(raw);
+  }
+});
+
+async function searchPapers(query) {
+  setStatus("searching…");
+  const list = $("#results-list");
+  $("#results").hidden = false;
+  $("#paper").hidden = true;
+  $("#paper-meta").innerHTML = "";
+  $("#results-head").innerHTML = `<h2>Searching…</h2>`;
+  try {
+    const t0 = performance.now();
+    const data = await api("/api/search", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query, limit: 25 }),
+    });
+    const ms = Math.round(performance.now() - t0);
+    $("#results-head").innerHTML =
+      `<h2>${data.results.length} papers for “${escapeHtml(query)}”</h2>
+       <p class="meta">${ms}ms · server ${Math.round(data.timings_ms.total)}ms
+       · abstracts ${Math.round(data.timings_ms.abstracts)}ms
+       · full text ${Math.round(data.timings_ms.fulltext)}ms</p>`;
+    list.innerHTML = data.results.map((r, i) => {
+      // Show which evidence carried the paper: its abstract, its body text, or both.
+      const ev = Object.entries(r.evidence)
+        .map(([k, v]) => `<span class="ev ${k}">${k} ${v.toFixed(3)}</span>`).join("");
+      return `<li class="result" data-id="${r.arxiv_id}">
+        <div class="rank">${i + 1}</div>
+        <div class="body">
+          <h3>${escapeHtml(r.title)}</h3>
+          <p class="meta">${r.arxiv_id} · ${escapeHtml(r.submitted)} ·
+            ${escapeHtml(r.categories.split(" ").slice(0, 3).join(" "))}
+            ${r.fulltext ? `· ${r.n_chunks} chunks` : "· abstract only"}
+            ${r.cited_by ? `· ${r.cited_by} citations` : ""}</p>
+          <p class="authors">${escapeHtml(r.authors)}</p>
+          <p class="abstract">${escapeHtml(r.abstract)}…</p>
+          <p class="evidence">score ${r.score.toFixed(3)} ${ev}</p>
+        </div></li>`;
+    }).join("") || `<li class="placeholder">No matches.</li>`;
+    setStatus("");
+  } catch (err) {
+    $("#results-head").innerHTML = `<h2 class="error">${escapeHtml(String(err.message || err))}</h2>`;
+    setStatus("search failed", "error");
+  }
+}
+
+function hideResults() {
+  $("#results").hidden = true;
+  $("#paper").hidden = false;
+}
+
+$("#results-list").addEventListener("click", (ev) => {
+  const li = ev.target.closest("li.result");
+  if (!li) return;
+  hideResults();
+  openPaper(li.dataset.id);
 });
 
 $("#temp").addEventListener("input", (e) => {

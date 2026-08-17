@@ -215,6 +215,76 @@ def run(
     return stats
 
 
+def pending_papers(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
+    """In-scope papers with no paper-level vector yet."""
+    return conn.execute(
+        """
+        SELECT p.arxiv_id, p.title, p.abstract
+        FROM papers p
+        LEFT JOIN paper_vectors v ON v.arxiv_id = p.arxiv_id
+        WHERE p.in_scope = 1 AND p.deleted = 0 AND v.arxiv_id IS NULL
+          AND p.abstract IS NOT NULL AND length(p.abstract) > 40
+        ORDER BY p.arxiv_id
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+
+def run_papers(
+    conn: sqlite3.Connection,
+    store: VectorStore,
+    model,
+    *,
+    batch_size: int = 256,
+    slice_size: int = 8192,
+    limit: int = 0,
+    progress=None,
+) -> dict[str, int | float]:
+    """Embed title+abstract for every in-scope paper (breadth half of paper search).
+
+    Cheap and worth doing regardless of crawl progress: every in-scope paper has an
+    abstract, while only a minority has full text, so this is what makes search cover the
+    whole corpus instead of the crawled slice.
+    """
+    stats: dict[str, int | float] = {"papers": 0, "seconds": 0.0}
+    started = time.time()
+    while True:
+        if limit and stats["papers"] >= limit:
+            break
+        rows = pending_papers(conn, slice_size)
+        if not rows:
+            break
+        if limit:
+            rows = rows[: limit - int(stats["papers"])]
+            if not rows:
+                break
+
+        texts = [document_text(r["title"], None, r["abstract"]) for r in rows]
+        t0 = time.time()
+        vectors = model.encode(
+            texts, batch_size=batch_size, convert_to_numpy=True,
+            normalize_embeddings=True, show_progress_bar=False,
+        ).astype(np.float32)
+        elapsed = time.time() - t0
+
+        start_row = store.append(vectors)
+        with conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO paper_vectors(arxiv_id, vector_row, n_chars) "
+                "VALUES (?,?,?)",
+                [
+                    (r["arxiv_id"], start_row + i, len(texts[i]))
+                    for i, r in enumerate(rows)
+                ],
+            )
+        stats["papers"] += len(rows)
+        stats["seconds"] = time.time() - started
+        if progress is not None:
+            progress.send((len(rows), len(rows) / max(elapsed, 1e-6), start_row))
+    return stats
+
+
 def rebuild_fts(conn: sqlite3.Connection) -> int:
     """(Re)populate the BM25 index. Cheap, and the lexical half of hybrid retrieval.
 
