@@ -265,11 +265,37 @@ plus those of its 1-hop citation neighbours, plus the last N papers viewed. That
 50 chunks × (1 + ~30 neighbours) ≈ 1.5–5 k vectors — a brute-force fp16 matmul, faster
 than any index. LRU-evicted, capped at a configurable ~2 GB.
 
-**Tier 1 — warm, whole corpus, in RAM (target <15 ms).**
-MRL-truncated 256-d int8 vectors for all ~30 M chunks (7.7 GB) under an HNSW graph
-(~3.8 GB). EmbeddingGemma is Matryoshka-trained, so truncating 768→256 costs little
-accuracy — and we recover it in tier 2 anyway. If RAM ever gets tight, swap HNSW for
-IVF-PQ64 at 1.9 GB.
+**Tier 1 — warm, whole corpus, exact, on GPU (measured 9.5 ms at 16 M).**
+MRL-truncated 256-d vectors for the whole corpus, resident on card 0 as an fp16 tensor
+(8.2 GB at 16 M), searched by **plain `torch` matmul + topk** — no ANN structure at all.
+
+This replaces the HNSW plan, on measurements taken against *real* corpus vectors:
+
+=========================  ==============  =========  ==========
+method                     latency @ 16 M  recall@200  memory
+=========================  ==============  =========  ==========
+GPU matmul, exact                  9.5 ms       100%   8.2 GB VRAM
+CPU HNSW M32 ef256                 ~7 ms       96.3%   ~5 GB RAM
+CPU HNSW M32 ef64                  ~3 ms       80.9%   ~5 GB RAM
+CPU numpy, exact                    455 ms      100%    16 GB RAM
+=========================  ==============  =========  ==========
+
+Exact search wins on every axis that matters: full recall at a latency HNSW only reaches
+by giving up 4–19% of it, and batched queries amortize to 0.04 ms each. Two operational
+wins decide it beyond the numbers — there is **no index build** (HNSW costs 74 s per
+million, ~20 minutes at full scale), and there is **no rebuild when the corpus grows**.
+Since the crawler appends chunks continuously, a matmul "index" is just a tensor to
+concatenate onto, where an HNSW graph would need periodic reconstruction.
+
+Two cautions worth recording. First, an earlier version of this benchmark used random
+Gaussian vectors and measured HNSW recall at 16–21%; that number is meaningless, because
+random points in 256 dimensions are near-orthogonal and give a proximity graph no
+structure to exploit. Recall must be measured on real embeddings. Second, **faiss GPU is
+unavailable on this machine** — faiss-gpu-cu12 1.13.2 aborts with `CUDA error 209: no
+kernel image is available` on sm_120, having no Blackwell kernels. Plain torch sidesteps
+that entirely, and is the reason the GPU path is viable at all.
+
+CPU HNSW remains a documented fallback for a GPU-less deployment.
 
 **Tier 2 — cold rerank, mmap'd from NVMe (target <25 ms).**
 Take tier-1's top ~200, read their full 768-d fp16 vectors from an mmap'd flat file, score
@@ -684,6 +710,43 @@ the system is being built:
 - **OAI page rate: ~20 s/page, not ~3 s.** The 3 s client throttle is not the binding
   constraint; arXiv takes most of that time to generate each 1300-record page. Full
   harvest is an overnight job.
+
+### 12.0.3 Retrieval, as built and measured
+
+Warm medians over 6 questions, ~1 M vectors / 2.5 M chunks:
+
+============  ==========  ==========  ============================================
+stage          first cut     shipped   what changed
+============  ==========  ==========  ============================================
+embed             19.6 ms    21.1 ms   —
+dense (GPU)        0.8 ms     0.8 ms   exact matmul; see §5 tier 1
+BM25             366.6 ms    15.8 ms   IDF query planning + indexed ``chunk_df``
+fuse               0.2 ms     0.2 ms   RRF
+tier 2             0.3 ms     0.1 ms   exact fp16 rescore from mmap
+rerank           921.1 ms    50.9 ms   bge-reranker-v2-m3, 24 candidates
+**total**     **1374.7 ms**  **81.3 ms**  17x
+============  ==========  ==========  ============================================
+
+Three defects found by measuring rather than by reading:
+
+- **The reranker was returning noise.** ``CrossEncoder`` cannot serve Qwen3-Reranker,
+  which scores via yes/no LM logits; it silently substitutes a randomly initialised
+  ``Qwen3ForSequenceClassification`` head. The model scored a self-attention passage 0.865
+  and a recipe for frying onions 0.862. This is now guarded at load time by
+  ``assert_reranker_works`` — a behavioural probe, because the failure produces
+  well-formed floats and passes any check of types or shapes. D13 revised to
+  ``BAAI/bge-reranker-v2-m3``, which is correct, separates cleanly (0.401 vs 0.000) and
+  is 8x faster than the 4B.
+- **BM25 term selection was reading a stemmed vocabulary with unstemmed tokens.** Under
+  the ``porter`` tokenizer every query term reported df=0, so the planner judged
+  everything maximally rare and kept ``does`` while discarding ``self-attention``. FTS5
+  rebuilt with plain ``unicode61`` so tokenizer and planner agree.
+- **Query planning cost 5x the query.** ``chunks_vocab`` is an ``fts5vocab`` virtual
+  table with no index on ``term``, so each lookup scanned all 743 k terms (~110 ms) to
+  plan a search that itself takes 4–19 ms. Materialized as the indexed ``chunk_df``.
+
+Also fixed: ``chunks_fts`` had drifted to 957 k rows against 2.38 M chunks, because
+external-content FTS5 does not track its content table. Triggers now maintain it.
 
 ### 12.1 Still open
 

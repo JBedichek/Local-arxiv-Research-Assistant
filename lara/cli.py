@@ -292,10 +292,72 @@ def embed(
         if fts:
             n = emb.rebuild_fts(conn)
             console.print(f"BM25 index rebuilt: {n:,} rows")
+            console.print(f"document frequencies refreshed: {emb.refresh_df(conn):,} terms")
     finally:
         if isinstance(encoder, emb.MultiGPUEncoder):
             encoder.close()
         conn.close()
+
+
+@app.command()
+def search(
+    query: str = typer.Argument(..., help="Question to retrieve for"),
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    k: int = typer.Option(8, help="Results to show"),
+    no_rerank: bool = typer.Option(False, "--no-rerank", help="Skip the cross-encoder"),
+    no_bm25: bool = typer.Option(False, "--no-bm25", help="Dense only"),
+    paper: str = typer.Option(None, help="Restrict to one arXiv id"),
+) -> None:
+    """Retrieve chunks for a query and show anchored citations with timings."""
+    from lara.index import embed as emb
+    from lara.index import retrieve as R
+    from lara.index.vectors import VectorStore
+    from lara.store import db
+
+    cfg = config_mod.load(config)
+    ecfg, icfg = cfg.get_in("embedding"), cfg.get_in("index")
+    conn = db.connect(cfg.get_path("paths.metadata_db"))
+    store = VectorStore(
+        cfg.get_path("paths.vectors_fp16"), cfg.get_path("paths.vectors_int8"),
+        dim_full=int(ecfg["dim_full"]), dim_trunc=int(ecfg["dim_truncated"]),
+    )
+    dev = f"cuda:{(ecfg.get('devices') or [0])[0]}"
+    console.print(f"loading index ({store.rows():,} vectors) and embedder on {dev}…")
+    embedder = emb.load_model(ecfg["model"], device=dev, max_seq_length=int(ecfg["max_seq_len"]))
+
+    ce = None
+    ccfg = icfg["rerank"].get("cross_encoder") or {}
+    if ccfg.get("enabled") and not no_rerank:
+        console.print(f"loading reranker {ccfg['model']}…")
+        ce = R.load_cross_encoder(
+            ccfg["model"], device=f"cuda:{ccfg.get('device', 1)}",
+            max_length=int(ccfg.get("max_length", 512)),
+        )
+
+    retr = R.Retriever(
+        conn, store, embedder, device=dev, dim_trunc=int(ecfg["dim_truncated"]),
+        tier2_candidates=int(icfg["rerank"]["tier2_candidates"]),
+        rerank_candidates=int(ccfg.get("candidates", 50)),
+        final_k=k, rrf_k=int(icfg["lexical"]["rrf_k"]),
+        lexical=bool(icfg["lexical"]["enabled"]) and not no_bm25,
+        cross_encoder=ce,
+    )
+    console.print(f"index VRAM: {retr.dense.vram_bytes()/1e9:.2f} GB\n")
+
+    result = retr.retrieve(query, papers=[paper] if paper else None)
+    for i, hit in enumerate(result.hits, 1):
+        console.print(
+            f"[bold]{i}.[/bold] [cyan]{hit.fragment()}[/cyan]  "
+            f"score {hit.score:.3f}  [{hit.kind}]"
+        )
+        console.print(f"   [dim]{hit.paper_title[:70]} › {hit.section_title[:34]}[/dim]")
+        console.print(f"   {hit.text[:200].strip()}…\n")
+    console.print(
+        "[bold]timings[/bold]: "
+        + "  ".join(f"{k}={v:.1f}ms" for k, v in result.timings_ms.items())
+        + f"   candidates={result.n_candidates}"
+    )
+    conn.close()
 
 
 @app.command()

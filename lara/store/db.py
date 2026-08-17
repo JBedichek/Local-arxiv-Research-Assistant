@@ -100,12 +100,47 @@ CREATE UNIQUE INDEX IF NOT EXISTS chunks_unique ON chunks(arxiv_id, version, ord
 
 -- BM25 half of the hybrid retriever (PLAN.md §5). Dense search is weak on exact model
 -- names, dataset names and symbols, which is most of what arXiv questions hinge on.
+--
+-- Tokenizer is plain unicode61, NOT 'porter unicode61'. Query planning selects terms by
+-- document frequency read from chunks_vocab, and a stemming tokenizer breaks that lookup:
+-- the vocab holds stemmed forms, so raw query tokens report df=0, every term looks
+-- maximally rare, and the planner keeps stopwords while discarding real signal. Exact
+-- tokens make df lookups exact. Losing morphology costs little here because the dense
+-- half already handles paraphrase and inflection.
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
     text,
     content='chunks',
     content_rowid='chunk_id',
-    tokenize='porter unicode61'
+    tokenize='unicode61'
 );
+
+-- Document frequencies for query planning.
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vocab USING fts5vocab(chunks_fts, 'row');
+
+-- Materialized copy of chunks_vocab. fts5vocab is a virtual table with no index on
+-- `term`, so a `WHERE term IN (...)` lookup scans the entire vocabulary — 743k terms,
+-- which measured at ~110 ms and made query *planning* five times more expensive than the
+-- search it was planning (the FTS queries themselves run in 4-19 ms). A real table with a
+-- primary key turns that into a handful of index seeks. Refreshed by lara.index.embed;
+-- df drift between refreshes only nudges term selection, so staleness is harmless.
+CREATE TABLE IF NOT EXISTS chunk_df (
+    term TEXT PRIMARY KEY,
+    doc  INTEGER NOT NULL
+) WITHOUT ROWID;
+
+-- External-content FTS5 does not track its content table automatically; without these
+-- the index silently drifts as the crawler inserts (it was 957k rows against 2.38M
+-- chunks before they were added) and BM25 quietly stops seeing recent papers.
+CREATE TRIGGER IF NOT EXISTS chunks_fts_ai AFTER INSERT ON chunks BEGIN
+    INSERT INTO chunks_fts(rowid, text) VALUES (new.chunk_id, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_fts_ad AFTER DELETE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', old.chunk_id, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_fts_au AFTER UPDATE OF text ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', old.chunk_id, old.text);
+    INSERT INTO chunks_fts(rowid, text) VALUES (new.chunk_id, new.text);
+END;
 
 -- Citation edges (D6, Semantic Scholar). Both endpoints are arXiv ids; references to
 -- non-arXiv works are dropped, which is fine since the graph UI only navigates arXiv.

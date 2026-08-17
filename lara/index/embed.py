@@ -216,7 +216,19 @@ def run(
 
 
 def rebuild_fts(conn: sqlite3.Connection) -> int:
-    """(Re)populate the BM25 index. Cheap, and the lexical half of hybrid retrieval."""
+    """(Re)populate the BM25 index. Cheap, and the lexical half of hybrid retrieval.
+
+    Triggers keep ``chunks_fts`` in sync on insert, so this is only needed after a bulk
+    load that bypassed them or a tokenizer change.
+    """
     with conn:
         conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
     return conn.execute("SELECT COUNT(*) FROM chunks_fts").fetchone()[0]
+
+
+def refresh_df(conn: sqlite3.Connection) -> int:
+    """Materialize document frequencies for query planning. See the chunk_df schema note."""
+    with conn:
+        conn.execute("DELETE FROM chunk_df")
+        conn.execute("INSERT INTO chunk_df(term, doc) SELECT term, doc FROM chunks_vocab")
+    return conn.execute("SELECT COUNT(*) FROM chunk_df").fetchone()[0]

@@ -102,12 +102,18 @@ class FullTextFetcher:
         )
         wait = min(wait, self.backoff_max)
         self._pause_until = asyncio.get_running_loop().time() + wait
+        print(
+            f"  [429] #{self.stats['429']} (streak {self._consecutive_429}) "
+            f"pausing {wait:.0f}s at {self.rate:.1f} req/s",
+            flush=True,
+        )
         if self.adaptive and self._consecutive_429 >= 3:
             # The server has refused this rate three times running. Retrying at the same
             # pace after a wait is not politeness, it is stubbornness.
             self.rate = max(self.rate / 2.0, 0.2)
             self._limiter = AsyncLimiter(self.rate, 1.0)
             self._consecutive_429 = 0
+            print(f"  [THROTTLE] standing rate halved to {self.rate:.2f} req/s", flush=True)
 
     async def _get(self, url: str) -> tuple[int, bytes | None]:
         await self._respect_pause()
