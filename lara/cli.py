@@ -76,6 +76,9 @@ def list_models(
 def harvest(
     config: str = typer.Option(None, help="Path to config.yaml"),
     sets: str = typer.Option("cs,stat", help="OAI sets to harvest"),
+    from_date: str = typer.Option(
+        None, "--from", help="OAI datestamp floor (YYYY-MM-DD). Controls ORDERING, not scope."
+    ),
     restart: bool = typer.Option(False, "--restart", help="Ignore saved resumption tokens"),
     max_pages: int = typer.Option(0, help="Stop after N pages (0 = until complete)"),
 ) -> None:
@@ -96,21 +99,25 @@ def harvest(
 
     try:
         for set_spec in [s.strip() for s in sets.split(",") if s.strip()]:
-            if db.get_state(conn, f"oai_complete:{set_spec}") and not restart:
-                console.print(f"[dim]set {set_spec}: already complete, skipping[/dim]")
+            # Streams are keyed by (set, from) so a scope-first pass and a full backfill
+            # can each keep their own resumption token without clobbering one another.
+            stream = f"{set_spec}@{from_date or 'all'}"
+            if db.get_state(conn, f"oai_complete:{stream}") and not restart:
+                console.print(f"[dim]stream {stream}: already complete, skipping[/dim]")
                 continue
 
-            token = None if restart else db.get_state(conn, f"oai_token:{set_spec}")
-            n = 0 if restart or not token else int(db.get_state(conn, f"oai_requests:{set_spec}") or 0)
+            token = None if restart else db.get_state(conn, f"oai_token:{stream}")
+            n = 0 if restart or not token else int(db.get_state(conn, f"oai_requests:{stream}") or 0)
             console.print(
-                f"[bold]set {set_spec}[/bold]: {'resuming at page ' + str(n) if token else 'starting fresh'}"
+                f"[bold]stream {stream}[/bold]: "
+                f"{'resuming at page ' + str(n) if token else 'starting fresh'}"
             )
 
-            for records, next_token in harvester.pages(set_spec, token):
+            for records, next_token in harvester.pages(set_spec, token, from_date=from_date):
                 n += 1
                 kept = oai.write_page(
                     conn, records, in_scope,
-                    set_spec=set_spec, next_token=next_token, request_n=n,
+                    set_spec=stream, next_token=next_token, request_n=n,
                 )
                 c = db.counts(conn)
                 console.print(
@@ -125,6 +132,83 @@ def harvest(
                     break
     finally:
         harvester.close()
+        conn.close()
+
+
+@app.command()
+def crawl(
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    limit: int = typer.Option(0, help="Stop after N papers (0 = drain the queue)"),
+    batch: int = typer.Option(200, help="Queue slice per round"),
+) -> None:
+    """Fetch and parse full text for in-scope papers. Resumable; commits per paper."""
+    import asyncio
+
+    from lara.ingest import fulltext as ft
+    from lara.store import db
+
+    cfg = config_mod.load(config)
+    conn = db.connect(cfg.get_path("paths.metadata_db"))
+    fcfg = cfg.get_in("ingest.fulltext")
+    sources = list(fcfg.get("sources", ["arxiv_html", "ar5iv", "pdf"]))
+
+    fetcher = ft.FullTextFetcher(
+        user_agent=fcfg["user_agent"],
+        rate_per_sec=float(fcfg.get("rate_per_sec", 3.0)),
+        max_concurrency=int(fcfg.get("max_concurrency", 6)),
+        raw_root=cfg.get_path("paths.raw_cache"),
+        adaptive_throttle=bool(fcfg.get("backoff", {}).get("adaptive_throttle", True)),
+        on_429_initial_sec=float(fcfg.get("backoff", {}).get("on_429_initial_sec", 60)),
+        backoff_multiplier=float(fcfg.get("backoff", {}).get("multiplier", 2.0)),
+        backoff_max_sec=float(fcfg.get("backoff", {}).get("max_sec", 3600)),
+    )
+
+    async def run() -> None:
+        try:
+            await _drain()
+        finally:
+            # Must close on the loop the client was created on, not a fresh one.
+            await fetcher.close()
+
+    async def _drain() -> None:
+        done = 0
+        while True:
+            queue = ft.pending_queue(conn, batch)
+            if not queue:
+                console.print("[green]queue empty[/green]")
+                return
+            if limit:
+                queue = queue[: max(0, limit - done)]
+                if not queue:
+                    console.print(f"[yellow]stopped at --limit {limit}; resumable[/yellow]")
+                    return
+
+            results = await asyncio.gather(
+                *(fetcher.fetch(aid, ver, sources) for aid, ver in queue)
+            )
+            for res in results:
+                if res.status == "ok" and res.raw and res.source:
+                    fetcher.write_raw(res.arxiv_id, res.source, res.raw)
+                n = ft.persist(conn, res)
+                fetcher.stats[res.status] = fetcher.stats.get(res.status, 0) + 1
+                done += 1
+                if res.status == "ok":
+                    console.print(
+                        f"  [green]ok[/green] {res.arxiv_id:16} {res.source:11} {n:4} chunks"
+                    )
+                else:
+                    console.print(
+                        f"  [red]{res.status}[/red] {res.arxiv_id:16} {(res.error or '')[:52]}"
+                    )
+            s = fetcher.stats
+            console.print(
+                f"[bold]{done} done[/bold] — ok {s['ok']} / failed {s['failed']} / "
+                f"unavailable {s['unavailable']} / 429s {s['429']} / rate {fetcher.rate:.1f}/s"
+            )
+
+    try:
+        asyncio.run(run())
+    finally:
         conn.close()
 
 

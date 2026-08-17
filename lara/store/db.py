@@ -65,6 +65,48 @@ CREATE TABLE IF NOT EXISTS harvest_log (
     note      TEXT
 );
 
+-- Parsed structure. `anchor` values are LaTeXML DOM ids ('S3.SS2', 'S3.p4') and are
+-- valid only for the specific `version` they were parsed from — anchors shift between
+-- versions, which is why every citation link carries one (PLAN.md §4).
+CREATE TABLE IF NOT EXISTS sections (
+    arxiv_id TEXT NOT NULL,
+    version  INTEGER NOT NULL,
+    anchor   TEXT NOT NULL,
+    title    TEXT,
+    kind     TEXT,
+    depth    INTEGER,
+    ordinal  INTEGER,
+    PRIMARY KEY (arxiv_id, version, anchor)
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS chunks (
+    chunk_id       INTEGER PRIMARY KEY,
+    arxiv_id       TEXT NOT NULL,
+    version        INTEGER NOT NULL,
+    ordinal        INTEGER NOT NULL,
+    section_anchor TEXT,
+    anchor_start   TEXT NOT NULL,   -- scroll target
+    char_start     INTEGER NOT NULL,
+    anchor_end     TEXT NOT NULL,   -- highlight range end
+    char_end       INTEGER NOT NULL,
+    kind           TEXT,            -- abstract|body|equation|caption|theorem
+    n_chars        INTEGER,
+    vector_row     INTEGER,         -- row index into the flat vector files; NULL = unembedded
+    text           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS chunks_paper  ON chunks(arxiv_id, version, ordinal);
+CREATE INDEX IF NOT EXISTS chunks_vector ON chunks(vector_row);
+CREATE UNIQUE INDEX IF NOT EXISTS chunks_unique ON chunks(arxiv_id, version, ordinal);
+
+-- BM25 half of the hybrid retriever (PLAN.md §5). Dense search is weak on exact model
+-- names, dataset names and symbols, which is most of what arXiv questions hinge on.
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    text,
+    content='chunks',
+    content_rowid='chunk_id',
+    tokenize='porter unicode61'
+);
+
 -- Citation edges (D6, Semantic Scholar). Both endpoints are arXiv ids; references to
 -- non-arXiv works are dropped, which is fine since the graph UI only navigates arXiv.
 CREATE TABLE IF NOT EXISTS citations (

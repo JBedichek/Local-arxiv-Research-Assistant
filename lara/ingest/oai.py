@@ -201,15 +201,29 @@ class Harvester:
             resp.raise_for_status()
         raise RuntimeError(f"OAI request failed after {self.max_retries} attempts: {params}")
 
-    def pages(self, set_spec: str, resume_token: str | None = None) -> Iterator[tuple[list[Record], str | None]]:
-        """Yield (records, next_token) per page. Caller commits, then continues."""
+    def pages(
+        self,
+        set_spec: str,
+        resume_token: str | None = None,
+        from_date: str | None = None,
+    ) -> Iterator[tuple[list[Record], str | None]]:
+        """Yield (records, next_token) per page. Caller commits, then continues.
+
+        ``from_date`` filters on the OAI *datestamp* (last-modified), not submission date.
+        That makes it useless as a submission-date filter — but very useful as an
+        *ordering* control: records come back in datestamp order, so ``from_date`` skips
+        the long chronological runway of pre-2015 material and starts returning papers
+        that pass our scope filter on page one. Every paper submitted on or after the
+        floor necessarily has a datestamp at or after it, so nothing in scope is missed.
+        """
         token = resume_token
         while True:
-            params = (
-                {"verb": "ListRecords", "resumptionToken": token}
-                if token else
-                {"verb": "ListRecords", "set": set_spec, "metadataPrefix": "arXivRaw"}
-            )
+            if token:
+                params = {"verb": "ListRecords", "resumptionToken": token}
+            else:
+                params = {"verb": "ListRecords", "set": set_spec, "metadataPrefix": "arXivRaw"}
+                if from_date:
+                    params["from"] = from_date
             try:
                 records, token = parse_page(self._get(params))
             except OAIError as exc:
