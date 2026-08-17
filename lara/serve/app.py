@@ -195,6 +195,26 @@ def graph(arxiv_id: str, query: str = Query(default=""), limit: int = 60) -> JSO
     })
 
 
+@app.post("/api/reload")
+def reload_index() -> JSONResponse:
+    """Pick up vectors added since startup.
+
+    The tier-2 mmap self-heals per request, but the tier-1 GPU tensor is a snapshot
+    taken at load time, so chunks embedded since then are not *searchable* until it is
+    rebuilt. That rebuild copies the whole matrix to VRAM, so it is explicit rather than
+    automatic — call it after an embed run finishes.
+    """
+    s = _state()
+    assert s.retriever is not None
+    from lara.index import search as S
+
+    before = s.retriever.dense.n
+    s.retriever.dense = S.DenseIndex(s.store.load_int8(), device=s.device)
+    s.retriever.fp16 = s.store.open_fp16()
+    s.retriever.refresh_row_map()
+    return JSONResponse({"vectors_before": before, "vectors_now": s.retriever.dense.n})
+
+
 @app.get("/api/models")
 def models() -> JSONResponse:
     """Generators available from the HF cache (R6, R7)."""

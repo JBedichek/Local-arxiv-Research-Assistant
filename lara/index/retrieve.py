@@ -105,6 +105,23 @@ class Retriever:
 
     # ── stages ────────────────────────────────────────────────────────────────────
 
+    def _ensure_fp16_current(self) -> None:
+        """Re-open the vector mmap if the file has grown since it was mapped.
+
+        ``np.memmap`` fixes its length at open time, but the embedder appends to this
+        file continuously while the server runs. Without this, any chunk embedded after
+        startup raises ``IndexError: index N is out of bounds`` the moment BM25 surfaces
+        it — a 500 that only appears once the corpus has moved on, and never in a test
+        against older chunks.
+        """
+        try:
+            on_disk = self.store.rows()
+        except RuntimeError:
+            return                      # torn write between the two files; try later
+        if on_disk > self.fp16.shape[0]:
+            self.fp16 = self.store.open_fp16()
+            self._row_to_chunk = self._load_row_map()
+
     def _tier2_rescore(self, rows: np.ndarray, query_full: np.ndarray) -> np.ndarray:
         """Exact fp16 768-d scores for shortlisted rows, read from the mmap."""
         if rows.size == 0:
@@ -177,15 +194,18 @@ class Retriever:
         # 256-d truncation gives up. Chunks BM25 surfaced that dense search missed have
         # vectors too, so they are rescored on the same footing.
         t0 = clock()
-        rows_for_rescore = np.array(
-            [hits_by_id[c].vector_row for c in shortlist
-             if c in hits_by_id and hits_by_id[c].vector_row >= 0],
-            dtype=np.int64,
-        )
-        ids_for_rescore = [
-            c for c in shortlist
-            if c in hits_by_id and hits_by_id[c].vector_row >= 0
+        self._ensure_fp16_current()
+        # ids and rows are built in one pass and share the same bound, so the zip below
+        # stays aligned. Filtering inside _tier2_rescore would silently misalign scores
+        # with chunks — worse than the IndexError it was meant to avoid.
+        n_rows = self.fp16.shape[0]
+        pairs = [
+            (c, hits_by_id[c].vector_row)
+            for c in shortlist
+            if c in hits_by_id and 0 <= hits_by_id[c].vector_row < n_rows
         ]
+        ids_for_rescore = [c for c, _ in pairs]
+        rows_for_rescore = np.fromiter((r for _, r in pairs), dtype=np.int64, count=len(pairs))
         exact = self._tier2_rescore(rows_for_rescore, q_full)
         for cid, score in zip(ids_for_rescore, exact):
             hits_by_id[cid].score = float(score)
