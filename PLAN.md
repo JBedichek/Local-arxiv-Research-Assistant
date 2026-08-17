@@ -653,6 +653,20 @@ the system is being built:
 
 `lara status` reports all of it.
 
+### 12.0.2 Measured corrections to §2–§3
+
+- **Disk: ~70 GB, not ~35 GB.** The zstd-compressed raw HTML measures ~**100 KB/paper**,
+  double the §2.2 assumption, so the raw cache alone is ~33 GB at Core scope. Still
+  comfortable against 245 GB free, and worth keeping — it means a parser fix costs a
+  re-parse rather than another multi-day crawl. Prunable if space tightens.
+- **arXiv HTML coverage is better than assumed.** §3.2 expected `arxiv.org/html` only for
+  Dec 2023+ with ar5iv covering older work. In practice 2015-era papers are served
+  natively (16 of the first 18 crawled), so arXiv has backfilled LaTeXML conversions.
+  Fewer PDF fallbacks than budgeted and better anchor precision overall.
+- **OAI page rate: ~20 s/page, not ~3 s.** The 3 s client throttle is not the binding
+  constraint; arXiv takes most of that time to generate each 1300-record page. Full
+  harvest is an overnight job.
+
 ### 12.1 Still open
 
 Nothing blocking. Deferred until there is a corpus to measure against:

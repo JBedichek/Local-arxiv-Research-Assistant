@@ -183,10 +183,14 @@ def crawl(
                     console.print(f"[yellow]stopped at --limit {limit}; resumable[/yellow]")
                     return
 
-            results = await asyncio.gather(
-                *(fetcher.fetch(aid, ver, sources) for aid, ver in queue)
-            )
-            for res in results:
+            # as_completed, not gather: each paper is persisted the moment it lands, so a
+            # kill loses at most the few in flight rather than the whole batch. Keeps the
+            # DB continuously usable while a long crawl runs.
+            tasks = [
+                asyncio.create_task(fetcher.fetch(aid, ver, sources)) for aid, ver in queue
+            ]
+            for coro in asyncio.as_completed(tasks):
+                res = await coro
                 if res.status == "ok" and res.raw and res.source:
                     fetcher.write_raw(res.arxiv_id, res.source, res.raw)
                 n = ft.persist(conn, res)
@@ -200,6 +204,8 @@ def crawl(
                     console.print(
                         f"  [red]{res.status}[/red] {res.arxiv_id:16} {(res.error or '')[:52]}"
                     )
+                if done % 25 == 0:
+                    console.file.flush()
             s = fetcher.stats
             console.print(
                 f"[bold]{done} done[/bold] — ok {s['ok']} / failed {s['failed']} / "
