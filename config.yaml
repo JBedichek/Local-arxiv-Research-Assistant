@@ -94,7 +94,10 @@ embedding:
   # nvidia-smi's NVML is broken but CUDA itself is fine).
   #   bulk indexing: embedder uses cards 0+1, vLLM is not running
   #   serving:       embedder card 0, reranker card 1, vLLM card 2
-  devices: [0, 1]
+  # All three cards during bulk indexing; vLLM reclaims card 2 at serve time. Fanned out
+  # via one worker pool with a single parent writer -- separate processes per GPU would
+  # race on the append-only vector files.
+  devices: [0, 1, 2]
   # torch.compile. dynamic=true is important: sentence-transformers sorts by length and
   # pads per batch, so the encoder sees many shapes; static compilation would re-autotune
   # on each one and lose more than it gains. See lara/index/embed.py.

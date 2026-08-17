@@ -247,13 +247,22 @@ def embed(
         conn.close()
         return
 
-    dev = device or f"cuda:{(ecfg.get('devices') or [0])[0]}"
+    devices = [int(d) for d in (ecfg.get("devices") or [0])]
+    if device:
+        devices = [int(device.rsplit(":", 1)[-1])]
     mode = None if no_compile else ecfg.get("compile")
-    console.print(f"loading {ecfg['model']} on {dev} (compile={mode or 'off'})…")
+    console.print(
+        f"loading {ecfg['model']} on cuda:{devices} (compile={mode or 'off'})…"
+    )
     model = emb.load_model(
-        ecfg["model"], device=dev, max_seq_length=int(ecfg["max_seq_len"]),
+        ecfg["model"], device=f"cuda:{devices[0]}", max_seq_length=int(ecfg["max_seq_len"]),
         compile_mode=mode, compile_dynamic=bool(ecfg.get("compile_dynamic", True)),
     )
+    encoder = model
+    if len(devices) > 1:
+        encoder = emb.MultiGPUEncoder(
+            model, devices, chunk_size=int(ecfg.get("slice_size", 8192)) // len(devices)
+        )
 
     def reporter():
         total = 0
@@ -270,7 +279,7 @@ def embed(
 
     try:
         stats = emb.run(
-            conn, store, model,
+            conn, store, encoder,
             batch_size=int(ecfg["batch_size"]),
             slice_size=int(ecfg.get("slice_size", 8192)),
             limit=limit, progress=progress,
@@ -284,6 +293,8 @@ def embed(
             n = emb.rebuild_fts(conn)
             console.print(f"BM25 index rebuilt: {n:,} rows")
     finally:
+        if isinstance(encoder, emb.MultiGPUEncoder):
+            encoder.close()
         conn.close()
 
 

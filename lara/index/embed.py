@@ -27,6 +27,15 @@ Compilation, at bf16 msl 512::
     eager, fixed pad 512              355 chunks/s   12.5 GPU-h
     max-autotune + fixed pad 512      101 chunks/s   44.1 GPU-h
 
+Device count, at bf16 msl 512 compiled::
+
+    1 GPU  (cuda:0)          1030 chunks/s    4.3 GPU-h
+    3 GPUs (cuda:0,1,2)      2600 chunks/s    1.7 wall-h    <- chosen for bulk indexing
+
+5.5x over the eager single-GPU baseline in total. Scaling is ~2.5x rather than 3x because
+the parent process still tokenizes and marshals results, and the slice boundary is a
+synchronization point.
+
 ``max-autotune`` is a trap here in both shape regimes. With dynamic shapes it re-tunes on
 essentially every batch, because length-sorted batching hands it a new sequence length
 each time — 51 chunks/s, nine times slower than eager. Forcing one static shape to stop
@@ -87,6 +96,35 @@ def load_model(
             model[0].auto_model, mode=compile_mode, dynamic=compile_dynamic
         )
     return model
+
+
+class MultiGPUEncoder:
+    """Fan encoding across several cards while keeping a single writer.
+
+    The obvious alternative — one ``lara embed`` process per GPU — races on the
+    append-only vector files: two processes appending concurrently interleave rows and
+    hand out row numbers that point at each other's data. sentence-transformers' worker
+    pool keeps encoding parallel but returns results to one parent, so exactly one process
+    ever appends.
+
+    Exposes the same ``.encode(...)`` shape as a plain SentenceTransformer so
+    :func:`run` does not care which it was handed.
+    """
+
+    def __init__(self, model, devices: list[int], chunk_size: int | None = None) -> None:
+        self.model = model
+        self.devices = devices
+        self.chunk_size = chunk_size
+        self.pool = model.start_multi_process_pool([f"cuda:{d}" for d in devices])
+
+    def encode(self, texts: list[str], batch_size: int = 256, **_: object) -> np.ndarray:
+        return self.model.encode_multi_process(
+            texts, self.pool, batch_size=batch_size,
+            chunk_size=self.chunk_size, normalize_embeddings=True,
+        )
+
+    def close(self) -> None:
+        self.model.stop_multi_process_pool(self.pool)
 
 
 def embed_queries(model, queries: list[str], dim_trunc: int | None = None) -> np.ndarray:
