@@ -172,12 +172,19 @@ serving:
     base_url: http://127.0.0.1:8000/v1
     policy: single_resident              # stop the running server before starting another
     startup_timeout_sec: 300
-    gpu_devices: [2]                     # the 10de:2bb1 card
+    # Card 1 alongside the reranker, which uses only ~1 GB of 102 GB. Cards are big
+    # enough that co-tenancy is free; card 2 stays clear for bulk embedding.
+    gpu_devices: [1]
+    gpu_memory_utilization: 0.5          # ~51 GB: 28 GB weights + ~23 GB KV cache
     enable_prefix_caching: true
     kv_cache_dtype: auto
-    # D3: strict cache-only. Populated at runtime by the HF-cache completeness scan.
-    default_model: mistralai/Mixtral-8x7B-v0.1
-    default_quantization: fp8            # runtime weight-only FP8; 93 GB bf16 -> ~47 GB
+    max_model_len: 32768
+    # D15: Qwen3.8-27B-FP8 — the checkpoint is natively FP8 (F8_E4M3), which Blackwell
+    # sm_120 runs on hardware tensor cores. Supersedes base Mixtral: it is instruction
+    # tuned, so the few-shot scaffolding D3 required for a base model is no longer
+    # load-bearing (it stays in the cached prefix, where it costs nothing).
+    default_model: Qwen/Qwen3.8-27B-FP8
+    default_quantization: fp8
   sampling:
     temperature: 0.2
     top_p: 0.9

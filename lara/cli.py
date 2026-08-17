@@ -398,6 +398,42 @@ def serve(
     uvicorn.run("lara.serve.app:app", host=host, port=port, workers=1, log_level="info")
 
 
+@app.command("serve-llm")
+def serve_llm(
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    model: str = typer.Option(None, help="Override the model repo"),
+    show: bool = typer.Option(False, "--show", help="Print the command instead of running"),
+) -> None:
+    """Start vLLM for the selected generator (D4: one model resident at a time)."""
+    import os
+    import subprocess
+
+    cfg = config_mod.load(config)
+    v = cfg.get_in("serving.vllm")
+    repo = model or v["default_model"]
+    port = v["base_url"].rstrip("/").rsplit(":", 1)[-1].split("/")[0]
+
+    cmd = [
+        "vllm", "serve", repo,
+        "--port", str(port),
+        "--served-model-name", repo,
+        "--gpu-memory-utilization", str(v.get("gpu_memory_utilization", 0.5)),
+        "--max-model-len", str(v.get("max_model_len", 32768)),
+        "--kv-cache-dtype", str(v.get("kv_cache_dtype", "auto")),
+    ]
+    if v.get("enable_prefix_caching", True):
+        cmd.append("--enable-prefix-caching")
+
+    env = dict(os.environ)
+    devices = v.get("gpu_devices") or [0]
+    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in devices)
+
+    console.print(f"[dim]CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}[/dim] {' '.join(cmd)}")
+    if show:
+        return
+    subprocess.run(cmd, env=env, check=False)
+
+
 @app.command()
 def status(config: str = typer.Option(None, help="Path to config.yaml")) -> None:
     """Corpus counts and per-stage progress."""

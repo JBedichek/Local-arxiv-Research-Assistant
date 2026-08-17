@@ -83,6 +83,22 @@ class Retriever:
             )
         }
 
+    def rows_for_papers(self, papers: list[str]) -> np.ndarray:
+        """Vector rows belonging to a set of papers — the tier-0 / scoped-search filter."""
+        if not papers:
+            return np.empty(0, dtype=np.int64)
+        ph = ",".join("?" * len(papers))
+        return np.fromiter(
+            (
+                r[0] for r in self.conn.execute(
+                    f"SELECT vector_row FROM chunks "
+                    f"WHERE arxiv_id IN ({ph}) AND vector_row IS NOT NULL",
+                    papers,
+                )
+            ),
+            dtype=np.int64,
+        )
+
     def refresh_row_map(self) -> None:
         """Call after an incremental embed run extends the corpus."""
         self._row_to_chunk = self._load_row_map()
@@ -122,6 +138,12 @@ class Retriever:
         t["embed"] = (clock() - t0) * 1000
 
         t0 = clock()
+        if rows is None and papers:
+            # A scope restriction has to reach the dense path too. Passing it only to
+            # BM25 silently returns whole-corpus hits for "this paper" searches.
+            rows = self.rows_for_papers(papers)
+            if rows.size == 0:
+                return RetrievalResult([], t, 0)
         dense_rows, _ = self.dense.search(q_trunc, k=self.tier2_candidates, rows=rows)
         dense_ids = [
             self._row_to_chunk[int(r)] for r in dense_rows if int(r) in self._row_to_chunk

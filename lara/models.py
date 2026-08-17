@@ -20,6 +20,7 @@ VLLM_ARCHS = {
     "LlamaForCausalLM", "MistralForCausalLM", "MixtralForCausalLM",
     "GraniteForCausalLM", "GraniteMoeForCausalLM", "Qwen2ForCausalLM",
     "Qwen2MoeForCausalLM", "Qwen3ForCausalLM", "Qwen3MoeForCausalLM",
+    "Qwen3_5ForConditionalGeneration", "Qwen3_5MoeForConditionalGeneration",
     "Phi3ForCausalLM", "PhiMoEForCausalLM", "Gemma2ForCausalLM", "Gemma3ForCausalLM",
     "OlmoeForCausalLM", "GptOssForCausalLM", "DeepseekV2ForCausalLM",
 }
