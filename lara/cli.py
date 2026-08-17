@@ -189,23 +189,39 @@ def crawl(
             tasks = [
                 asyncio.create_task(fetcher.fetch(aid, ver, sources)) for aid, ver in queue
             ]
-            for coro in asyncio.as_completed(tasks):
-                res = await coro
-                if res.status == "ok" and res.raw and res.source:
-                    fetcher.write_raw(res.arxiv_id, res.source, res.raw)
-                n = ft.persist(conn, res)
-                fetcher.stats[res.status] = fetcher.stats.get(res.status, 0) + 1
-                done += 1
-                if res.status == "ok":
-                    console.print(
-                        f"  [green]ok[/green] {res.arxiv_id:16} {res.source:11} {n:4} chunks"
-                    )
-                else:
-                    console.print(
-                        f"  [red]{res.status}[/red] {res.arxiv_id:16} {(res.error or '')[:52]}"
-                    )
-                if done % 25 == 0:
-                    console.file.flush()
+            try:
+                for coro in asyncio.as_completed(tasks):
+                    # One bad paper must not end a multi-hour crawl. A transient
+                    # `database is locked` (an index rebuild holding an exclusive lock
+                    # longer than busy_timeout) previously escaped here, closed the HTTP
+                    # client in the finally block, and produced 304 cascading
+                    # "client has been closed" errors that buried the real cause.
+                    try:
+                        res = await coro
+                        if res.status == "ok" and res.raw and res.source:
+                            fetcher.write_raw(res.arxiv_id, res.source, res.raw)
+                        n = ft.persist(conn, res)
+                    except Exception as exc:
+                        fetcher.stats["failed"] = fetcher.stats.get("failed", 0) + 1
+                        console.print(f"  [red]error[/red] {type(exc).__name__}: {str(exc)[:70]}")
+                        continue
+                    fetcher.stats[res.status] = fetcher.stats.get(res.status, 0) + 1
+                    done += 1
+                    if res.status == "ok":
+                        console.print(
+                            f"  [green]ok[/green] {res.arxiv_id:16} {res.source:11} {n:4} chunks"
+                        )
+                    else:
+                        console.print(
+                            f"  [red]{res.status}[/red] {res.arxiv_id:16} {(res.error or '')[:52]}"
+                        )
+                    if done % 25 == 0:
+                        console.file.flush()
+            finally:
+                # Never leave tasks in flight when the client may close underneath them.
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
             s = fetcher.stats
             console.print(
                 f"[bold]{done} done[/bold] — ok {s['ok']} / failed {s['failed']} / "
@@ -358,6 +374,28 @@ def search(
         + f"   candidates={result.n_candidates}"
     )
     conn.close()
+
+
+@app.command()
+def serve(
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    host: str = typer.Option(None),
+    port: int = typer.Option(None),
+) -> None:
+    """Run the reader server. Models load once at startup, before the first request."""
+    import os
+
+    import uvicorn
+
+    cfg = config_mod.load(config)
+    if config:
+        os.environ["LARA_CONFIG"] = config
+    host = host or cfg.get_in("serving.host", "127.0.0.1")
+    port = port or int(cfg.get_in("serving.port", 8080))
+    console.print(f"[bold]http://{host}:{port}[/bold]  (warming models — first start is slow)")
+    # One worker: the GPU index, embedder and reranker are process-local and would be
+    # duplicated per worker, tripling VRAM for no throughput gain on a single-user tool.
+    uvicorn.run("lara.serve.app:app", host=host, port=port, workers=1, log_level="info")
 
 
 @app.command()

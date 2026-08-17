@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local arXiv Research Assistant</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header id="bar">
+  <span class="brand">lara</span>
+  <form id="open-form">
+    <input id="arxiv-input" type="text" placeholder="arXiv id, e.g. 1706.03762" spellcheck="false" autocomplete="off">
+    <button type="submit">Open</button>
+  </form>
+  <label>scope
+    <select id="scope">
+      <option value="corpus">whole corpus</option>
+      <option value="paper">this paper</option>
+      <option value="neighbourhood">citation neighbourhood</option>
+    </select>
+  </label>
+  <label>model <select id="model"><option value="">(loading)</option></select></label>
+  <label>quant <select id="quant"></select></label>
+  <label>temp <input id="temp" type="range" min="0" max="1.5" step="0.05" value="0.2"><span id="temp-val">0.20</span></label>
+  <span id="status" class="status"></span>
+</header>
+
+<main>
+  <section id="graph-pane">
+    <h2>Citation graph <small id="graph-hint">heat = relevance to your question</small></h2>
+    <canvas id="graph"></canvas>
+    <div id="graph-tip" hidden></div>
+  </section>
+
+  <section id="paper-pane">
+    <div id="paper-meta"></div>
+    <article id="paper"><p class="placeholder">Enter an arXiv id above to open a paper.</p></article>
+  </section>
+
+  <section id="chat-pane">
+    <div id="messages"></div>
+    <form id="ask-form">
+      <textarea id="question" rows="3" placeholder="Ask about the paper, or highlight a passage first…"></textarea>
+      <div id="selection-chip" hidden><span></span><button type="button" id="clear-sel">×</button></div>
+      <button type="submit" id="ask-btn">Ask</button>
+    </form>
+  </section>
+</main>
+
+<button id="ask-float" hidden>Ask about this</button>
+<script type="module" src="/app.js"></script>
+</body>
+</html>

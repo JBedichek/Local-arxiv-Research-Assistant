@@ -166,7 +166,10 @@ def connect(path: str | Path, *, read_only: bool = False) -> sqlite3.Connection:
     if not read_only:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=30000")
+        # Generous, because maintenance holds real locks: an FTS5 'rebuild' over a few
+        # million chunks takes ~55 s exclusively, and a writer that gives up at 30 s dies
+        # mid-crawl for no good reason.
+        conn.execute("PRAGMA busy_timeout=300000")
         conn.executescript(SCHEMA)
         conn.commit()
     return conn

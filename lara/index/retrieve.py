@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -27,7 +28,7 @@ class RetrievalResult:
 class Retriever:
     def __init__(
         self,
-        conn: sqlite3.Connection,
+        conn: sqlite3.Connection | Callable[[], sqlite3.Connection],
         store: VectorStore,
         embedder,
         *,
@@ -42,7 +43,14 @@ class Retriever:
         df_ceiling_frac: float = 0.005,
         cross_encoder=None,
     ) -> None:
-        self.conn = conn
+        # A connection may be passed directly (CLI, single-threaded) or as a factory
+        # (server). It must be a factory under a server: Starlette dispatches sync
+        # endpoints across a threadpool, and sqlite3 refuses to use a connection from a
+        # thread other than the one that created it. Sharing one connection makes
+        # requests fail or succeed depending on which worker thread they land on.
+        self._conn_factory: Callable[[], sqlite3.Connection] = (
+            conn if callable(conn) else (lambda c=conn: c)
+        )
         self.store = store
         self.embedder = embedder
         self.dim_trunc = dim_trunc
@@ -54,11 +62,18 @@ class Retriever:
         self.max_terms = max_terms
         self.df_ceiling_frac = df_ceiling_frac
         self.cross_encoder = cross_encoder
-        self.corpus_size = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] or 1
+        self.corpus_size = (
+            self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] or 1
+        )
 
         self.dense = S.DenseIndex(store.load_int8(), device=device)
         self.fp16 = store.open_fp16()          # mmap; the OS page cache does the rest
         self._row_to_chunk = self._load_row_map()
+
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """The connection belonging to the calling thread."""
+        return self._conn_factory()
 
     def _load_row_map(self) -> dict[int, int]:
         return {
