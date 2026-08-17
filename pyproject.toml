@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lara"
+version = "0.1.0"
+description = "Local arXiv Research Assistant — RAG over arXiv ML papers with local LLMs on vLLM"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "J. Bedichek" }]
+
+dependencies = [
+  # config / CLI
+  "pydantic>=2.9",
+  "pydantic-settings>=2.5",
+  "pyyaml>=6.0",
+  "typer>=0.12",
+  "rich>=13.9",
+  # ingest
+  "httpx[http2]>=0.27",
+  "aiolimiter>=1.1",
+  "tenacity>=9.0",
+  "lxml>=5.3",
+  "pymupdf>=1.24",          # PDF fallback when no LaTeXML rendering exists
+  # storage
+  "numpy>=2.1",
+  "pyarrow>=17.0",
+  "zstandard>=0.23",
+  # embedding
+  "sentence-transformers>=5.0",
+  "transformers>=4.55",
+  "torch>=2.7",
+  # serving
+  "fastapi>=0.115",
+  "uvicorn[standard]>=0.32",
+  "sse-starlette>=2.1",
+  "openai>=1.54",           # client for vLLM's OpenAI-compatible server
+]
+
+[project.optional-dependencies]
+# ANN index. Pick exactly one to match your CUDA situation.
+#   faiss-cpu       — works anywhere, fine for the warm tier at our scale
+#   faiss-gpu-cu12  — what is already in the Learned-Data-Selection venv
+cpu = ["faiss-cpu>=1.9"]
+gpu = ["faiss-gpu-cu12>=1.9"]
+# vLLM is heavy and CUDA-version-sensitive; install separately in most setups.
+serve = ["vllm>=0.10"]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.7", "mypy>=1.13"]
+
+[project.scripts]
+lara = "lara.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lara"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

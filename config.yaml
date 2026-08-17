@@ -1,0 +1,136 @@
+# Local arXiv Research Assistant — runtime configuration
+#
+# ── DISK SAFETY ────────────────────────────────────────────────────────────────
+# This machine has three filesystems and only ONE of them is usable:
+#
+#   /                        nvme0n1p5   949G, 245G free   <-- everything goes here
+#   /data                    nvme0n1p3   883G,   0G free   <-- FULL, do not use
+#   /media/user/Extreme SSD  sda1        3.7T,  31G free   <-- nearly full, external
+#
+# Every path below is checked by `lara preflight`, which resolves symlinks with
+# realpath and refuses to run if any path lands off the root filesystem or if free
+# space is below `disk.min_free_gb`. Do not replace these with relative paths that
+# could be resolved from a different cwd.
+# ───────────────────────────────────────────────────────────────────────────────
+
+disk:
+  # Absolute, symlink-free. Resolved and validated at startup.
+  root: /home/user/Desktop/Local-arxiv-Research-Assistant/data
+  required_device: /dev/nvme0n1p5
+  min_free_gb: 60            # projected need is ~35 GB; refuse to start below this
+  forbid_paths:              # hard-blocked prefixes, even if something points there
+    - /data
+    - /media/user/Extreme SSD
+    - /media/user/ExtremeSSD
+
+paths:
+  metadata_db:  ${disk.root}/meta.sqlite       # papers, sections, chunks, FTS5
+  chunk_text:   ${disk.root}/chunks/           # zstd parquet shards
+  vectors_fp16: ${disk.root}/vectors/fp16.bin  # tier 2, mmap'd, 768-d
+  vectors_int8: ${disk.root}/vectors/int8.bin  # tier 1, MRL-256
+  ann_index:    ${disk.root}/vectors/hnsw.faiss
+  graph:        ${disk.root}/graph/            # CSR citation adjacency
+  raw_cache:    ${disk.root}/raw/              # transient fetched HTML, prunable
+  logs:         ${disk.root}/logs/
+
+# Hugging Face cache — verified to be a real directory on /, NOT a symlink.
+# Pinned explicitly so a stray HF_HOME in the environment cannot redirect 100 GB
+# of downloads onto a full disk.
+huggingface:
+  home: /home/user/.cache/huggingface
+  offline: false
+
+corpus:
+  # D1: Core scope, 2015+  (~330k papers, ~16M chunks)
+  categories: [cs.LG, cs.CL, stat.ML, cs.NE]
+  date_floor: "2015-01-01"
+  include_cross_lists: true
+
+ingest:
+  # D2: abstracts for everything up front; full text lazily + background crawl.
+  metadata_source: kaggle          # bootstrap snapshot; OAI-PMH for incrementals
+  oai_endpoint: http://export.arxiv.org/oai2
+  fulltext:
+    # Q11: 2-4 req/s, back off hard on 429. Tune `rate_per_sec` down if arXiv complains.
+    rate_per_sec: 3.0
+    max_concurrency: 6
+    user_agent: "Local-arxiv-Research-Assistant/0.1 (+https://github.com/JBedichek/Local-arxiv-Research-Assistant; mailto:james.bedichek@gmail.com)"
+    backoff:
+      on_429_initial_sec: 60
+      multiplier: 2.0
+      max_sec: 3600
+      # Three consecutive 429s drops rate_per_sec by half and logs a warning.
+      adaptive_throttle: true
+    sources: [arxiv_html, ar5iv, pdf]   # tried in order
+    priority: citation_count             # curated top-30k crawled first
+    eager_top_n: 30000
+  citations:
+    # Q6: Semantic Scholar, unauthenticated to start. Verified working 2026-08-17.
+    provider: semanticscholar
+    batch_endpoint: https://api.semanticscholar.org/graph/v1/paper/batch
+    batch_size: 500                      # 330k papers ≈ 660 requests
+    api_key_env: S2_API_KEY              # optional; set it if we ever get throttled
+    fallback: openalex
+
+chunking:
+  target_chars: 1000
+  overlap_frac: 0.15
+  never_cross_sections: true
+  keep_kinds: [abstract, body, caption, equation, table, theorem, footnote]
+
+embedding:
+  model: google/embeddinggemma-300m      # fully present in cache (1.2 GB), Matryoshka
+  dim_full: 768
+  dim_truncated: 256                     # MRL truncation for the warm tier
+  batch_size: 512
+  max_seq_len: 512
+  devices: [0, 1]                        # leave one card free for vLLM
+  query_prefix: "task: search result | query: "
+  doc_prefix: "title: {title} | text: "
+
+index:
+  warm:
+    kind: hnsw                           # faiss HNSW over int8 MRL-256
+    m: 32
+    ef_construction: 200
+    ef_search: 64
+  rerank:
+    tier2_candidates: 200                # exact fp16 rescore from mmap
+    final_k: 20
+    # Q9: cross-encoder slot, disabled for v1 (no cross-encoder is cached; see PLAN §5.1)
+    cross_encoder:
+      enabled: false
+      model: null
+      candidates: 50
+  lexical:
+    enabled: true
+    backend: fts5
+    rrf_k: 60                            # reciprocal rank fusion constant
+
+hot_tier:
+  # Tier 0: pin the open paper + its 1-hop citation neighbourhood at full fp16.
+  max_bytes: 2_000_000_000
+  pin_open_paper: true
+  pin_neighbors_hops: 1
+  lru_papers: 20
+
+serving:
+  host: 127.0.0.1
+  port: 8080
+  vllm:
+    # D4: GGUF ignored, vLLM only. Q4: rare switching — one model resident at a time.
+    base_url: http://127.0.0.1:8000/v1
+    policy: single_resident              # stop the running server before starting another
+    startup_timeout_sec: 300
+    gpu_devices: [2]                     # the 10de:2bb1 card
+    enable_prefix_caching: true
+    kv_cache_dtype: auto
+    # D3: strict cache-only. Populated at runtime by the HF-cache completeness scan.
+    default_model: mistralai/Mixtral-8x7B-v0.1
+    default_quantization: fp8            # runtime weight-only FP8; 93 GB bf16 -> ~47 GB
+  sampling:
+    temperature: 0.2
+    top_p: 0.9
+    top_k: 50
+    max_tokens: 1024
+    repetition_penalty: 1.0

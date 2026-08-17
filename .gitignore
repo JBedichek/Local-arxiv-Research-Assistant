@@ -1,0 +1,28 @@
+# Corpus, indexes, vectors — tens of GB, never committed.
+data/
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.faiss
+*.bin
+*.parquet
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Web
+web/node_modules/
+web/dist/
+
+# Local overrides
+config.local.yaml
+.env
