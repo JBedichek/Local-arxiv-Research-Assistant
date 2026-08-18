@@ -13,6 +13,12 @@
 }
 
 * { box-sizing: border-box; }
+
+/* The `hidden` attribute is only `display: none` in the UA stylesheet, so ANY author rule
+   that sets display beats it. #selection-chip { display: flex } did exactly that: setting
+   .hidden = true updated the property but changed nothing on screen, which is why its
+   dismiss button appeared to do nothing and an empty chip sat above the Ask button. */
+[hidden] { display: none !important; }
 html, body { height: 100%; }
 body {
   margin: 0; background: var(--bg); color: var(--text);

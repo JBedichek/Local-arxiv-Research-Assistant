@@ -18,7 +18,8 @@
 const $ = (s) => document.querySelector(s);
 const state = {
   paper: null, version: 1, hits: [], pendingHits: null,
-  selection: null, models: [], busy: false, breadth: 'balanced', abort: null,
+  selection: null, candidate: null, models: [], busy: false,
+  breadth: 'balanced', abort: null,
 };
 
 /* ---------- helpers ---------- */
@@ -178,14 +179,16 @@ function handleSelection() {
     float.hidden = true;
     return;
   }
-  state.selection = text;
+  // Highlighting is not the same as asking. People select text to read it, to copy it, or
+  // to keep their place; attaching it to the prompt automatically hijacks an ordinary
+  // reading gesture. The passage is only staged as context once "Ask about this" is
+  // clicked. Retrieval still fires now, invisibly, so the latency saving survives — it is
+  // just thrown away if the selection was never meant as a question.
+  state.candidate = text;
   const rect = sel.getRangeAt(0).getBoundingClientRect();
   float.style.top = `${window.scrollY + rect.bottom + 8}px`;
   float.style.left = `${window.scrollX + rect.left}px`;
   float.hidden = false;
-
-  showSelectionChip(text);
-  // Fire retrieval now, while the user is still reading and typing.
   state.pendingHits = retrieve(text.slice(0, 600), text).catch(() => null);
 }
 
@@ -196,13 +199,29 @@ function showSelectionChip(text) {
     text.length > 120 ? text.slice(0, 120) + "…" : text;
 }
 
-$("#clear-sel").addEventListener("click", () => {
-  state.selection = null;
-  state.pendingHits = null;
-  $("#selection-chip").hidden = true;
+$("#clear-sel").addEventListener("click", (ev) => {
+  ev.preventDefault();
+  ev.stopPropagation();
+  clearSelectionContext();
 });
 
+function clearSelectionContext() {
+  state.selection = null;
+  state.candidate = null;
+  state.pendingHits = null;
+  $("#selection-chip").hidden = true;
+  $("#ask-float").hidden = true;
+  // Collapse the document selection too. Without this the browser keeps the range, the
+  // debounced selectionchange handler fires again, and the chip reappears — which is why
+  // the dismiss button looked like it did nothing.
+  const sel = document.getSelection();
+  if (sel && !sel.isCollapsed) sel.removeAllRanges();
+}
+
 $("#ask-float").addEventListener("click", () => {
+  if (!state.candidate) return;
+  state.selection = state.candidate;      // promote only on explicit request
+  showSelectionChip(state.selection);
   $("#ask-float").hidden = true;
   $("#question").focus();
 });
@@ -319,6 +338,7 @@ $("#ask-form").addEventListener("submit", async (ev) => {
     $("#ask-btn").disabled = false;
     $("#ask-btn").textContent = "Ask";
     state.pendingHits = null;
+    clearSelectionContext();
     const el = $("#cancel-btn");
     if (el) el.remove();
   }
@@ -613,7 +633,11 @@ function applyLayout() {
 
 /* Keyboard: [ and ] toggle the sidebars, \ gives the paper the whole window. */
 document.addEventListener("keydown", (ev) => {
-  if (ev.target.matches("input, textarea, select")) return;
+  // ev.target is not always an Element (it is `document` for synthetic events and when
+  // nothing has focus), and Document has no .matches — calling it threw and killed the
+  // handler before any shortcut could run.
+  const t = ev.target;
+  if (t instanceof Element && t.matches("input, textarea, select")) return;
   const root = document.documentElement;
   const toggle = (v, dflt, edge) => {
     const cur = parseInt(getComputedStyle(root).getPropertyValue(v), 10) || 0;
@@ -624,7 +648,7 @@ document.addEventListener("keydown", (ev) => {
   };
   if (ev.key === "[") { toggle("--col-left", "300px", "left"); drawGraph(); }
   else if (ev.key === "]") { toggle("--col-right", "400px", "right"); }
-  else if (ev.key === "\\") {
+  else if (ev.key === "\\" || ev.code === "Backslash") {
     const hidden = parseInt(getComputedStyle(root).getPropertyValue("--col-left"), 10) === 0;
     const l = hidden ? "300px" : "0px", r = hidden ? "400px" : "0px";
     root.style.setProperty("--col-left", l);
@@ -783,7 +807,7 @@ function renderClarify(msgEl, payload) {
 let searchData = null;
 let searchView = "graph";
 
-const ROW_H = 26, PAD_L = 54, PAD_T = 16, PAD_B = 26, NODE_LABEL_GAP = 10;
+const ROW_H = 26, PAD_L = 54, PAD_T = 16, PAD_B = 26, LABEL_GUTTER = 22;
 
 function graphHeight(n) {
   return Math.max(160, PAD_T + n * ROW_H + PAD_B);
@@ -803,11 +827,18 @@ function layoutSearchGraph(width) {
   const xRank = new Array(nodes.length);
   order.forEach((o, rank) => { xRank[o.i] = rank; });
 
-  const plotW = Math.max(120, width * 0.42 - PAD_L);
+  // Labels go in a fixed column so the timeline gets the rest of the width. Previously
+  // each label began at its own node, which confined the plot to ~42% of the canvas —
+  // 225px for 20 papers, under 12px apart. Spacing was already even; the band was just
+  // far too narrow to read as a timeline. A fixed column also left-aligns the titles,
+  // which makes them scannable as a list.
+  const labelW = Math.min(Math.max(width * 0.42, 240), 460);
+  const plotW = Math.max(160, width - PAD_L - labelW - LABEL_GUTTER);
   const denom = Math.max(nodes.length - 1, 1);
   return nodes.map((n, i) => ({
     ...n,
     x: PAD_L + (xRank[i] / denom) * plotW,
+    labelX: PAD_L + plotW + LABEL_GUTTER,
     y: PAD_T + i * ROW_H + ROW_H / 2,
     radius: 4.5 + Math.min(n.in_degree, 6) * 1.5,
   }));
@@ -870,6 +901,17 @@ function drawSearchGraph() {
   const scores = placed.map((n) => n.score);
   const lo = Math.min(...scores), hi = Math.max(...scores);
   for (const n of placed) {
+    // Faint leader from the dot to its label column, so the eye keeps the row together
+    // now that the two are far apart.
+    ctx.strokeStyle = "rgba(140,150,170,.22)";
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 3]);
+    ctx.beginPath();
+    ctx.moveTo(n.x + n.radius + 3, n.y);
+    ctx.lineTo(n.labelX - 6, n.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
     const t = hi > lo ? (n.score - lo) / (hi - lo) : 1;
     ctx.beginPath(); ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
     ctx.fillStyle = heatColor(t); ctx.fill();
@@ -883,7 +925,7 @@ function drawSearchGraph() {
   // open the paper — an earlier version put the link only on the text, so clicking the
   // dot silently did nothing, which is the most natural thing to click.
   overlay.innerHTML = placed.map((n) => {
-    const pad = Math.round(n.x + n.radius + NODE_LABEL_GAP);
+    const pad = Math.round(n.labelX);
     const cites = n.in_degree
       ? `<span class="deg" title="cited by ${n.in_degree} of these results">↩${n.in_degree}</span>` : "";
     return `<a class="glabel" href="/p/${n.arxiv_id}v${n.version}" data-id="${n.arxiv_id}"
