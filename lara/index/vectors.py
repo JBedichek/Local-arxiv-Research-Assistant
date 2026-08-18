@@ -59,10 +59,25 @@ class VectorStore:
         self.fp16_path.parent.mkdir(parents=True, exist_ok=True)
         self.int8_path.parent.mkdir(parents=True, exist_ok=True)
 
+    @property
+    def has_fp16(self) -> bool:
+        """Whether the tier-2 file is present. False on a ``core``-tier install."""
+        return self.fp16_path.exists()
+
     def rows(self) -> int:
-        """Row count implied by file size, and a consistency check between the two files."""
-        n_fp16 = self._rows_of(self.fp16_path, self.dim_full, 2)
+        """Row count implied by file size, and a consistency check between the two files.
+
+        **The fp16 file is optional.** The ``core`` distribution tier ships int8 only
+        (see ``lara/serve/dataset.py``), and tier 2 rescores from the truncated vectors
+        rather than failing, so a *missing* fp16 file is a supported state and int8 alone
+        decides the count. A file that exists but disagrees is a torn write, and that is
+        still an error — the two cases look identical if you only compare row counts,
+        which is why existence is checked first.
+        """
         n_int8 = self._rows_of(self.int8_path, self.dim_trunc, 1)
+        if not self.fp16_path.exists():
+            return n_int8
+        n_fp16 = self._rows_of(self.fp16_path, self.dim_full, 2)
         if n_fp16 != n_int8:
             raise RuntimeError(
                 f"vector files disagree: fp16 has {n_fp16} rows, int8 has {n_int8}. "
@@ -85,6 +100,14 @@ class VectorStore:
         if vectors.ndim != 2 or vectors.shape[1] != self.dim_full:
             raise ValueError(f"expected (n, {self.dim_full}), got {vectors.shape}")
         start = self.rows()
+        if start and not self.fp16_path.exists():
+            # Appending here would write fp16 row 0 where row `start` is expected and
+            # misalign every vector_row in the database — silent, total corruption.
+            raise RuntimeError(
+                f"{self.int8_path.name} holds {start:,} rows but {self.fp16_path.name} is "
+                f"missing, which is what a `core`-tier download looks like: it ships int8 "
+                f"only. Pull the `full` tier before embedding more, or rebuild both files."
+            )
         fp16 = np.ascontiguousarray(vectors, dtype=np.float16)
         int8 = to_int8_mrl(vectors, self.dim_trunc)
 
@@ -96,7 +119,10 @@ class VectorStore:
                 os.fsync(fh.fileno())
         return start
 
-    def open_fp16(self) -> np.memmap:
+    def open_fp16(self) -> "np.memmap | None":
+        """The tier-2 mmap, or None when the fp16 file is absent (``core``-tier install)."""
+        if not self.fp16_path.exists():
+            return None
         return np.memmap(self.fp16_path, dtype=np.float16, mode="r").reshape(-1, self.dim_full)
 
     def load_int8(self, mmap: bool = False) -> np.ndarray:

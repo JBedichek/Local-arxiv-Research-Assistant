@@ -123,9 +123,14 @@ where it stopped.
 
 | tier | size | what it adds |
 |---|---|---|
-| `core` | ~51 GB | paper text, BM25 index, citations, and the search vectors. **Start here.** |
+| `core` | ~50 GB | paper text, BM25 index, citations, and the search vectors. **Start here.** |
 | `full` | +45 GB | fp16 vectors for exact rescoring — slightly better ranking |
 | `archive` | +38 GB | raw crawled HTML; only useful if you intend to re-parse |
+
+**`core` runs on its own.** It ships the int8 vectors only, so tier-2 rescore falls back to
+those instead of the 768-d fp16 file. Measured against a `full` install on the same queries,
+that costs about 15 % of the top-8 result set and no latency — adding `full` sharpens the
+ranking rather than switching search on.
 
 ```bash
 lara dataset pull --tiers core,full          # both

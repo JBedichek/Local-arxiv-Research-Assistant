@@ -89,7 +89,10 @@ class Retriever:
             store.load_int8(mmap=lazy), backend=chosen, precision=precision,
             device=self.device, row_ids=resident_rows, faiss_cfg=faiss_cfg,
         )
+        # None on a `core`-tier install, which ships int8 only. Tier 2 then rescores from
+        # the truncated vectors instead of failing — see `vectors_for` / `query_for`.
         self.fp16 = store.open_fp16()          # mmap; the OS page cache does the rest
+        self._int8_mm: "np.ndarray | None" = None
         self._row_to_chunk = self._load_row_map()
 
     @property
@@ -127,6 +130,49 @@ class Retriever:
 
     # ── stages ────────────────────────────────────────────────────────────────────
 
+    @property
+    def has_fp16(self) -> bool:
+        """False on a ``core``-tier install: tier 2 runs at 256-d int8 instead of 768-d."""
+        return self.fp16 is not None
+
+    @property
+    def n_vector_rows(self) -> int:
+        """Rows addressable in whichever tier backs the rescore."""
+        if self.fp16 is not None:
+            return int(self.fp16.shape[0])
+        return int(self._int8().shape[0])
+
+    def _int8(self) -> "np.ndarray":
+        """The int8 file, mapped lazily — only a core-tier install ever touches this."""
+        if self._int8_mm is None:
+            self._int8_mm = self.store.load_int8(mmap=True)
+        return self._int8_mm
+
+    def vectors_for(self, rows: np.ndarray) -> np.ndarray:
+        """float32 vectors for ``rows``, at whatever precision this install has.
+
+        768-d from the fp16 tier when it is present, 256-d MRL from int8 when it is not.
+        Always pair with :meth:`query_for`, which puts the query in the same space — the
+        two dimensionalities are not interchangeable and mixing them silently produces a
+        shape error at best and a meaningless dot product at worst.
+        """
+        if self.fp16 is not None:
+            return np.asarray(self.fp16[rows], dtype=np.float32)
+        return np.asarray(self._int8()[rows], dtype=np.float32) / 127.0
+
+    def query_for(self, q_full: np.ndarray) -> np.ndarray:
+        """``q_full`` projected into the space :meth:`vectors_for` returns."""
+        q = np.asarray(q_full, dtype=np.float32)
+        if self.fp16 is not None:
+            return q
+        q = q[: self.dim_trunc]
+        return q / max(float(np.linalg.norm(q)), 1e-12)
+
+    def remap_vectors(self) -> None:
+        """Re-open the tier-2 backing after the files on disk have changed."""
+        self.fp16 = self.store.open_fp16()
+        self._int8_mm = None
+
     def _ensure_fp16_current(self) -> None:
         """Re-open the vector mmap if the file has grown since it was mapped.
 
@@ -136,6 +182,8 @@ class Retriever:
         it — a 500 that only appears once the corpus has moved on, and never in a test
         against older chunks.
         """
+        if self.fp16 is None:
+            return                      # core tier: nothing mapped, so nothing to re-map
         try:
             on_disk = self.store.rows()
         except RuntimeError:
@@ -150,11 +198,16 @@ class Retriever:
             self.fp16 = self.store.open_fp16()
 
     def _tier2_rescore(self, rows: np.ndarray, query_full: np.ndarray) -> np.ndarray:
-        """Exact fp16 768-d scores for shortlisted rows, read from the mmap."""
+        """Exact fp16 768-d scores for shortlisted rows, read from the mmap.
+
+        On a ``core``-tier install there is no fp16 file, and this falls back to the
+        stored 256-d int8 rows. The shortlist is identical either way — only the final
+        ordering is coarser, which is the documented `core` trade-off rather than a
+        failure.
+        """
         if rows.size == 0:
             return np.empty(0, dtype=np.float32)
-        vectors = np.asarray(self.fp16[rows], dtype=np.float32)
-        return vectors @ query_full
+        return self.vectors_for(rows) @ self.query_for(query_full)
 
     def retrieve(
         self,
@@ -225,7 +278,7 @@ class Retriever:
         # ids and rows are built in one pass and share the same bound, so the zip below
         # stays aligned. Filtering inside _tier2_rescore would silently misalign scores
         # with chunks — worse than the IndexError it was meant to avoid.
-        n_rows = self.fp16.shape[0]
+        n_rows = self.n_vector_rows
         pairs = [
             (c, hits_by_id[c].vector_row)
             for c in shortlist

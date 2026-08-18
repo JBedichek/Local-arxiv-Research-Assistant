@@ -624,7 +624,7 @@ def reload_index() -> JSONResponse:
     before = s.retriever.dense.n
     papers_before = s.paper_index.n if s.paper_index is not None else 0
     s.retriever.dense = S.DenseIndex(s.store.load_int8(), device=s.device)
-    s.retriever.fp16 = s.store.open_fp16()
+    s.retriever.remap_vectors()
     s.retriever.refresh_row_map()
     s._load_paper_index()
     return JSONResponse({
@@ -672,7 +672,7 @@ def heatmap(req: HeatmapRequest) -> JSONResponse:
         "FROM chunks WHERE arxiv_id=? AND vector_row IS NOT NULL ORDER BY ordinal",
         (req.arxiv_id,),
     ).fetchall()
-    rows = [x for x in rows if 0 <= x["vector_row"] < r.fp16.shape[0]]
+    rows = [x for x in rows if 0 <= x["vector_row"] < r.n_vector_rows]
     if not rows:
         return JSONResponse({"mode": req.mode, "chunks": []})
 
@@ -682,15 +682,17 @@ def heatmap(req: HeatmapRequest) -> JSONResponse:
         ).fetchone()
         if ref_row is None or ref_row["vector_row"] is None:
             return JSONResponse({"mode": req.mode, "chunks": [], "error": "anchor has no vector"})
-        ref = np.asarray(r.fp16[ref_row["vector_row"]], dtype=np.float32)
+        ref = r.vectors_for(np.asarray([ref_row["vector_row"]], dtype=np.int64))[0]
     else:
         if not (req.query or "").strip():
             return JSONResponse({"mode": req.mode, "chunks": []})
-        ref = embed_queries(r.embedder, [req.query])[0]
+        # query_for keeps the query in the same space as vectors_for, which is 256-d
+        # rather than 768-d on a core-tier install.
+        ref = r.query_for(embed_queries(r.embedder, [req.query])[0])
     ref = ref / max(float(np.linalg.norm(ref)), 1e-12)
 
     idx = np.fromiter((x["vector_row"] for x in rows), dtype=np.int64, count=len(rows))
-    scores = np.asarray(r.fp16[idx], dtype=np.float32) @ ref
+    scores = r.vectors_for(idx) @ ref
     k = max(1, min(req.k, 25))
     top = np.argsort(-scores)[:k]
 
