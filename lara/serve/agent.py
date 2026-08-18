@@ -45,6 +45,7 @@ class Breadth:
     allow_clarify: bool
     budget_sec: float
     estimate: str
+    decompose: bool = False
 
 
 # Estimates are MEASURED end-to-end medians, not search overhead. They matter: an earlier
@@ -57,9 +58,9 @@ class Breadth:
 SPECTRUM: list[Breadth] = [
     Breadth("instant", "Instant", 1, 5, 100, False, False, 20, "~5s"),
     Breadth("fast", "Fast", 1, 8, 200, False, False, 30, "~5s"),
-    Breadth("balanced", "Balanced", 2, 8, 200, True, False, 60, "~6s"),
-    Breadth("thorough", "Thorough", 3, 12, 300, True, True, 120, "~6-9s"),
-    Breadth("exhaustive", "Exhaustive", 5, 20, 400, True, True, 300, "~10-17s"),
+    Breadth("balanced", "Balanced", 2, 8, 200, True, False, 60, "~6s", decompose=True),
+    Breadth("thorough", "Thorough", 3, 12, 300, True, True, 120, "~7-10s", decompose=True),
+    Breadth("exhaustive", "Exhaustive", 5, 20, 400, True, True, 300, "~10-18s", decompose=True),
 ]
 BY_NAME = {b.name: b for b in SPECTRUM}
 DEFAULT = "balanced"
@@ -349,3 +350,102 @@ def check_grounding(cross_encoder, answer: str, hits: list[dict],
         rec["supported"] = float(sc) >= threshold
         out.append(rec)
     return out
+
+
+# ── query decomposition ────────────────────────────────────────────────────────────
+
+DECOMPOSE_SYSTEM = """You split a research question into independently searchable parts. \
+You do not answer it. Reply with one JSON object and nothing else:
+
+{"kind": "atomic" | "parallel" | "sequential",
+ "parts": ["<self-contained sub-question>", ...],
+ "reason": "<one short clause>"}
+
+"atomic"     one thing is being asked; parts must be [].
+"parallel"   several things are asked that can be looked up independently.
+"sequential" a later part needs the answer to an earlier one (multi-hop).
+
+Rules:
+- Prefer "atomic". Most questions are atomic, and splitting one needlessly retrieves
+  worse for every part than not splitting at all.
+- At most 3 parts.
+- Each part must stand alone: resolve pronouns and carry over the subject, so "and which
+  is faster?" becomes "Is X faster than Y?" rather than a fragment.
+- Split on what is being ASKED, not on grammar. "How does GQA reduce memory and latency?"
+  is one mechanism asked about twice over and stays atomic."""
+
+# Cheap pre-filter. Running the decomposer on every question would add a full LLM turn to
+# the majority of asks that are plainly atomic, so an LLM turn is only spent when the
+# surface form suggests more than one thing is being asked.
+_COMPOUND = re.compile(
+    r"\b(compare[sd]?|versus|vs\.?|difference between|better than|trade-?offs?"
+    r"|and (?:which|what|how|why|when)|as well as|both .+ and )\b",
+    re.I,
+)
+
+
+def looks_compound(q: str) -> bool:
+    if q.count("?") > 1:
+        return True
+    return bool(_COMPOUND.search(q))
+
+
+async def decompose(cfg, question: str, model: str | None,
+                    max_parts: int = 3) -> dict[str, Any]:
+    """Split a compound question, or report it atomic."""
+    if not looks_compound(question):
+        return {"kind": "atomic", "parts": [], "reason": "no compound markers", "via": "heuristic"}
+
+    buf = ""
+    async for tok in stream_answer(
+        cfg, f"Question: {question}\n\nReply with the JSON object only.",
+        [], system=DECOMPOSE_SYSTEM, model=model,
+        temperature=0.0, max_tokens=300, raw_user=True,
+    ):
+        buf += tok
+    m = _JSON.search(buf or "")
+    if not m:
+        return {"kind": "atomic", "parts": [], "reason": "unparseable", "via": "default"}
+    try:
+        d = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return {"kind": "atomic", "parts": [], "reason": "unparseable", "via": "default"}
+
+    kind = d.get("kind") if d.get("kind") in {"atomic", "parallel", "sequential"} else "atomic"
+    parts = [str(p).strip() for p in (d.get("parts") or []) if str(p).strip()][:max_parts]
+    # A "compound" verdict with fewer than two usable parts is just an atomic question
+    # with extra steps.
+    if kind == "atomic" or len(parts) < 2:
+        return {"kind": "atomic", "parts": [], "reason": str(d.get("reason") or "")[:120],
+                "via": "model"}
+    return {"kind": kind, "parts": parts, "reason": str(d.get("reason") or "")[:120],
+            "via": "model"}
+
+
+def merge_parts(part_hits: list[tuple[str, list[dict]]], cap: int) -> list[dict]:
+    """Interleave per-part results so every part is represented near the top.
+
+    Concatenating the parts would let one part with high absolute scores fill the context
+    and starve the others — which reproduces exactly the failure decomposition exists to
+    fix. Round-robin guarantees each sub-question contributes before any contributes
+    twice. Each hit records the part it came from, so the prompt can group evidence and
+    the model can see which half of the question it is answering.
+    """
+    for part, hits in part_hits:
+        for h in hits:
+            h.setdefault("part", part)
+    merged: list[dict] = []
+    seen: set[int] = set()
+    for rank in range(max((len(h) for _, h in part_hits), default=0)):
+        for _, hits in part_hits:
+            if rank >= len(hits):
+                continue
+            h = hits[rank]
+            cid = h.get("chunk_id")
+            if cid in seen:
+                continue
+            seen.add(cid)
+            merged.append(h)
+            if len(merged) >= cap:
+                return merged
+    return merged

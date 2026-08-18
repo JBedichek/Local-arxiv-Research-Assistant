@@ -494,6 +494,7 @@ async def ask(req: AskRequest) -> StreamingResponse:
     s = _state()
     assert s.retriever is not None
 
+    import asyncio
     import time
 
     from lara.serve import agent as AG
@@ -525,8 +526,33 @@ async def ask(req: AskRequest) -> StreamingResponse:
         try:
             hits = req.hits
             if hits is None:
-                yield step("search", f"Searching ({breadth.label})…")
-                hits = await run_in_threadpool(run_search, req.query, breadth.k)
+                # A compound question embeds to a single vector sitting BETWEEN its parts,
+                # retrieving well for none of them. Splitting first and searching each
+                # part is the fix; the parts run concurrently, so the extra cost is one
+                # decomposition call rather than N retrievals.
+                split = {"kind": "atomic", "parts": []}
+                if breadth.decompose:
+                    split = await AG.decompose(s.cfg, req.query, req.model)
+
+                if split["parts"]:
+                    yield step(
+                        "decompose",
+                        f"Split into {len(split['parts'])} parts: "
+                        + " | ".join(p[:48] for p in split["parts"]),
+                        # not `kind=`: that is step()'s own positional parameter
+                        parts=split["parts"], split_kind=split["kind"],
+                    )
+                    per_part = max(3, breadth.k // len(split["parts"]) + 2)
+                    results = await asyncio.gather(*[
+                        run_in_threadpool(run_search, part, per_part)
+                        for part in split["parts"]
+                    ])
+                    hits = AG.merge_parts(
+                        list(zip(split["parts"], results)), breadth.k * 2
+                    )
+                else:
+                    yield step("search", f"Searching ({breadth.label})…")
+                    hits = await run_in_threadpool(run_search, req.query, breadth.k)
             yield f"event: hits\ndata: {json.dumps(hits)}\n\n"
 
             rounds = 0

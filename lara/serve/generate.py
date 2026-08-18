@@ -119,8 +119,12 @@ def build_prompt(
         title = h.get("paper_title") or h.get("arxiv_id", "")
         date = (h.get("submitted") or "")[:7]
         stamp = f", {date}" if date else ""
+        # Carry the sub-question an excerpt was retrieved for. Without it the model sees a
+        # flat pile of evidence for a two-part question and typically answers whichever
+        # part the strongest excerpts happen to cover, leaving the other unanswered.
+        part = f" [for: {h['part']}]" if h.get("part") else ""
         lines.append(
-            f"[{h['marker']}] ({title}{stamp} > {where}) {h.get('text', '').strip()}"
+            f"[{h['marker']}] ({title}{stamp} > {where}){part} {h.get('text', '').strip()}"
         )
     excerpts = "\n\n".join(lines) if lines else "(no excerpts retrieved)"
 
@@ -128,6 +132,11 @@ def build_prompt(
     tail = ""
     if selection:
         tail += f"\nThe reader has highlighted this passage:\n\"{selection.strip()}\"\n"
+    parts = [p for p in dict.fromkeys(h.get("part") for h in hits) if p]
+    if len(parts) > 1:
+        tail += ("\nThis question has several parts. Address each one, and say so "
+                 "explicitly if the excerpts answer some parts but not others:\n"
+                 + "\n".join(f"  - {p}" for p in parts) + "\n")
     tail += f"\nQuestion: {query.strip()}\n\nAnswer:"
     return prefix, tail
 
