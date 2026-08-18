@@ -78,10 +78,22 @@ def reader(arxiv_id: str) -> FileResponse:
 @app.get("/api/health")
 def health() -> dict:
     s = state
+    sc = getattr(s, "scope", None) if s else None
     return {
         "ready": bool(s and s.ready),
         "warmup_ms": (s.warmup_ms if s else {}),
         "vectors": (s.store.rows() if s else 0),
+        # D22: null when the whole corpus is resident. Surfaced so the UI can say what the
+        # dense index actually covers — a scoped index is not a broken one, but a user
+        # deserves to know that semantic recall is narrowed to their topics.
+        "scope": None if sc is None else {
+            "topics": sc.topics,
+            "fraction": sc.fraction,
+            "papers": sc.n_papers,
+            "resident_chunks": sc.n_rows,
+            "corpus_chunks": sc.corpus_chunks,
+            "resident_gb": round(sc.resident_bytes() / 1e9, 2),
+        },
     }
 
 

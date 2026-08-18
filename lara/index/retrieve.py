@@ -43,6 +43,7 @@ class Retriever:
         max_terms: int = 3,
         df_ceiling_frac: float = 0.005,
         cross_encoder=None,
+        resident_rows: "np.ndarray | None" = None,
     ) -> None:
         # A connection may be passed directly (CLI, single-threaded) or as a factory
         # (server). It must be a factory under a server: Starlette dispatches sync
@@ -72,7 +73,10 @@ class Retriever:
         )
 
         self.device = dev.resolve(device)
-        self.dense = S.DenseIndex(store.load_int8(), device=self.device)
+        # resident_rows is D22's keep-set. None means the whole corpus is resident, which
+        # is the default and the behaviour everything else assumes.
+        self.dense = S.DenseIndex(store.load_int8(), device=self.device,
+                                  row_ids=resident_rows)
         self.fp16 = store.open_fp16()          # mmap; the OS page cache does the rest
         self._row_to_chunk = self._load_row_map()
 

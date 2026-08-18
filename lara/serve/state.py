@@ -22,6 +22,7 @@ from lara import config as config_mod
 from lara import device as dev
 from lara.index import embed as emb
 from lara.index import retrieve as R
+from lara.index import scope as SC
 from lara.index.vectors import VectorStore
 from lara.store import db
 
@@ -57,6 +58,7 @@ class AppState:
         self.paper_row_to_id: dict[int, str] = {}
 
         self.retriever: R.Retriever | None = None
+        self.scope: SC.Scope | None = None
         if load_models:
             self._load(ecfg, icfg)
             self._load_paper_index()
@@ -123,6 +125,10 @@ class AppState:
         t0 = time.time()
         db.connect(self.db_path).close()          # ensure the schema exists, then let go
         lex = icfg["lexical"]
+        # D22: if a keep-set exists, only those rows go into tier 1. BM25 and tier 2 stay
+        # whole-corpus, so a scoped index narrows semantic recall rather than coverage.
+        self.scope = SC.Scope.load(self.cfg.get_path("disk.root"))
+        resident = self.scope.rows if self.scope is not None else None
         # Pass the thread-local factory, not a connection — see Retriever.__init__.
         self.retriever = R.Retriever(
             self.conn, self.store, embedder, device=self.device,
@@ -134,6 +140,7 @@ class AppState:
             max_terms=int(lex.get("max_terms", 3)),
             df_ceiling_frac=float(lex.get("df_ceiling_frac", 0.005)),
             cross_encoder=cross,
+            resident_rows=resident,
         )
         self.warmup_ms["index"] = (time.time() - t0) * 1000
 

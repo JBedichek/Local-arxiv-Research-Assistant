@@ -1091,6 +1091,54 @@ Implementation notes:
   a 42 GB transfer into a few GB. This is the cheapest path to a useful install and is
   worth wiring up once §13.4 exists.
 
+### 13.6.1 Measured, 2026-08-18
+
+Built with two topics — *"data selection and curation for training large language models"*
+and *"learning rate schedules and optimizers for deep networks"* — at `keep=0.02`,
+`expand=3`, against 377,090 papers / 28.5 M embedded chunks:
+
+============================  ==========================================
+metric                        value
+============================  ==========================================
+papers kept                   17,818 (7,542 topic + 10,276 citation)
+chunks resident               1,400,610 of 28,535,295 (**4.9 %**)
+tier-1 memory                 **0.72 GB**, from 14.61 GB — a **20x** cut
+build time                    26 s end to end, no re-embedding
+============================  ==========================================
+
+**Citation expansion is doing real work, not padding.** Ranked by in-degree from the kept
+set it pulled in GPT-4, Llama 2, Llama 3, GPT-3, LLaMA, BERT, InstructGPT, T5, GSM8K,
+Mistral 7B, MMLU and Scaling Laws. Their *topic* ranks show why similarity alone could
+never have found them:
+
+==========================  ==============  ============================
+paper                       topic rank      kept by
+==========================  ==============  ============================
+Scaling Laws (2001.08361)   8,191           citation (cut is 7,542)
+GPT-3 (2005.14165)          19,125          citation
+Batch Norm (1502.03167)     19,277          citation
+Attention (1706.03762)      101,405         citation
+BERT (1810.04805)           123,809         citation
+GPT-4 (2303.08774)          250,926         citation
+==========================  ==============  ============================
+
+Topical similarity finds what a field talks *about*; the citation graph finds what it is
+built *on*. (D22 originally cited Adam as the example — it is a 2014 paper and therefore
+below the D1 date floor, so it is not in the corpus at all. The point holds via BERT and
+Attention.)
+
+**The BM25 safety net is verified, not assumed.** Querying text taken verbatim from a
+*non-resident* paper (1503.01596) retrieved it at **rank 1**, with all five top hits
+non-resident — their dense vectors are not in RAM, so the recall came entirely from FTS5
+and survived reciprocal rank fusion. Timings on the scoped index: dense 1 ms (down from
+~4 ms, the index being 20x smaller), BM25 105 ms, total 181 ms.
+
+Two honest caveats. `expand=3` is permissive at this corpus size — it contributed 58 % of
+the kept set, with a median in-degree of 5 — so raising it is the first dial to reach for
+if the keep-set is larger than expected. And the cut line is genuinely fuzzy: at the
+`keep=0.02` boundary, ranks 7,542 and 7,543 both score 0.546, which is exactly why
+`--preview` shows both sides of it.
+
 ### 13.7 Phasing
 
 ============  =======================================================  ==========================
