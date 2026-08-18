@@ -217,38 +217,57 @@ only one that reports the metrics you actually care about: retrieval quality aga
 
 ### What k-fold actually said (2026-08-18)
 
-5 folds split by query, 3,520 triples from 440 queries, on the full harvested set:
+5 folds split by query, 3,520 triples from 440 queries, on the full harvested set. Three
+runs, and the differences between them are the useful part:
 
-| | before | after | |
-|---|---|---|---|
-| pairwise accuracy | 0.8219 ± 0.0328 | 0.8196 ± 0.0296 | unchanged |
-| **rank correlation** | **0.7289 ± 0.0287** | **0.6617 ± 0.0512** | **worse** |
-| margin error | 0.6068 ± 0.0114 | 0.5166 ± 0.0143 | better |
+| | base | batch 64, 3 ep | **batch 128, 3 ep** | batch 128, 12 ep + stop |
+|---|---|---|---|---|
+| pairwise accuracy | 0.8219 | 0.8196 *(flat)* | **0.8526** | 0.8472 |
+| rank correlation | 0.7289 | 0.6617 *(5/5 worse)* | **0.7243** | 0.7128 |
+| margin error | 0.6068 | 0.5166 | 0.5279 | 0.5144 |
 
-**This is a negative result, and the shape of it is the informative part.** Margin error is
-the quantity MarginMSE directly optimises, and it improved. The two metrics that were *not*
-optimised did not: pairwise accuracy moved within noise (up in 3 folds, down in 2), and
-rank correlation fell **in all five folds** — a consistency that rules out chance.
+**The first run was a negative result, and its shape said why.** Margin error is what
+MarginMSE directly optimises, and it improved. The metrics that were *not* optimised did
+not: pairwise accuracy moved within noise, and rank correlation fell **in all five folds** —
+too consistent for chance. The model was reproducing the *magnitude* of the teacher's score
+gap while getting worse at ordering, which is what retrieval needs. Fitting the loss is not
+learning the task.
 
-So the student is learning to reproduce the *magnitude* of the teacher's score gap while
-getting slightly worse at the thing retrieval actually needs, which is ordering. Fitting
-the loss is not the same as learning the task.
+**Doubling the batch to 128 fixed it.** Pairwise accuracy now improves in **5 of 5 folds**
+(+0.031 overall) and rank correlation no longer collapses. Fewer, better-conditioned
+updates — 54 steps instead of 132 — drift less far from the pretrained weights.
 
-**Do not adopt a model on these numbers.** The overfit check passing (pairwise accuracy
-1.000) established only that the training loop works; k-fold is what answers whether
-anything transfers to unseen queries, and here it does not.
+**Early stopping did not help, and the reason is worth knowing.** With `epochs=3` it never
+fires: validation loss is still falling at the cap. Raising the cap to 12 makes it fire
+(around step 60–70 of 216) and the result gets *worse* despite training longer — because
+the cosine LR schedule is sized to the epoch cap, so stopping mid-schedule leaves the model
+at a near-peak learning rate. Measured: the 3-epoch run anneals to 1.3e-6 by its last step;
+the 12-epoch run stops with LR still at 4.4e-5. An unannealed checkpoint loses more than
+the extra steps gain.
 
-Three plausible causes, in the order worth testing:
+> **Practical advice.** Set `--epochs` to a realistic number so the schedule anneals
+> properly, and treat `--patience` as a safety net against over-training rather than the
+> primary control. Cosine annealing and early stopping are two mechanisms for the same job;
+> mis-sizing one to serve the other costs accuracy.
 
-1. **The objective rewards the wrong thing.** MarginMSE is a regression on score gaps. A
-   ranking loss — InfoNCE over in-batch negatives, or a listwise objective — optimises
-   order directly, which is what rank correlation measures.
-2. **Not enough signal.** 2,816 training triples per fold against a 300 M-parameter encoder
-   that already scores 0.82 is a thin prior to move honestly.
-3. **Exposure bias in the labels.** Positives are drawn from what retrieval already
-   returned, so the data mostly describes orderings the base model already produces. The
-   `explore` run's source-recall misses (~45 %) are the part that carries genuinely new
-   information, and they are a small fraction of the total.
+Early stopping selects on an *inner* split carved from the training folds, never on the
+held-out fold — choosing a checkpoint with the data you then report on would leak and make
+the numbers optimistic by an unknown amount.
+
+**This still is not a model worth adopting.** Pairwise accuracy improved, but rank
+correlation is at best unchanged and `lara finetune` measures the thing that actually
+matters — retrieval against human citation judgements — which none of these runs tested.
+Three things worth trying next, in order:
+
+1. **A ranking objective.** MarginMSE is a regression on score gaps. InfoNCE over in-batch
+   negatives, or a listwise loss, optimises order directly — which is what rank correlation
+   measures and what the first run degraded.
+2. **More signal.** 2,392 training triples per fold against a 300 M-parameter encoder that
+   already scores 0.82 is a thin basis for moving it honestly.
+3. **Exposure bias in the labels.** Positives come from what retrieval already returned, so
+   the data mostly describes orderings the base model already produces. The `explore` run's
+   source-recall misses (~45 %) carry the genuinely new information and are a small
+   fraction of the total.
 
 ---
 

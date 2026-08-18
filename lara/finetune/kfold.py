@@ -193,6 +193,14 @@ class Recipe:
     # Evaluated against an INNER split carved out of the training data, never against the
     # held-out fold: selecting a checkpoint on the fold you then report would leak, and the
     # reported numbers would be optimistic by an unknown amount.
+    #
+    # **Keep `epochs` realistic rather than a large cap.** The cosine LR schedule is sized
+    # to `epochs`, so a big cap means stopping mid-schedule at a near-peak learning rate.
+    # Measured: epochs=3 anneals to 1.3e-6 by its final step and scores pair_acc 0.8526;
+    # epochs=12 stops around step 65 of 216 with LR still at 4.4e-5 and scores 0.8472,
+    # despite training *longer*. Cosine annealing and early stopping are two mechanisms for
+    # the same job, and an unannealed checkpoint loses more than the extra steps gain.
+    # Early stopping is best used here as a safety net, not as the primary control.
     patience: int = 3              # evaluations without improvement before stopping
     eval_every: int = 5            # steps between validation passes
     inner_val_frac: float = 0.15   # of the training set, split by query
