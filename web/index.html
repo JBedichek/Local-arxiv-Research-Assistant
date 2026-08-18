@@ -22,7 +22,28 @@
   </label>
   <label>model <select id="model"><option value="">(loading)</option></select></label>
   <label>quant <select id="quant"></select></label>
-  <label>temp <input id="temp" type="range" min="0" max="1.5" step="0.05" value="0.2"><span id="temp-val">0.20</span></label>
+  <button type="button" id="adv-btn" title="Advanced settings">⚙</button>
+  <div id="advanced" hidden>
+    <h4>Advanced</h4>
+    <label class="adv">passage heatmap
+      <select id="heat-mode">
+        <option value="answer">similar to the answer passage</option>
+        <option value="query">similar to my question</option>
+        <option value="off">off</option>
+      </select>
+    </label>
+    <p class="adv-note" id="heat-note"></p>
+    <label class="adv">highlight top
+      <input id="heat-k" type="range" min="1" max="15" step="1" value="5">
+      <span id="heat-k-val">5</span> passages
+    </label>
+    <label class="adv">temperature
+      <input id="temp" type="range" min="0" max="1.5" step="0.05" value="0.2">
+      <span id="temp-val">0.20</span>
+    </label>
+    <p class="adv-note">Lower is more literal and repeatable; higher is more exploratory
+      and more likely to drift from the sources.</p>
+  </div>
   <label class="breadth" id="breadth-label">
     <span class="cap">answer depth</span>
     <input id="breadth" type="range" min="0" max="4" step="1" value="2">

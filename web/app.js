@@ -19,7 +19,7 @@ const $ = (s) => document.querySelector(s);
 const state = {
   paper: null, version: 1, hits: [], pendingHits: null,
   selection: null, candidate: null, models: [], busy: false,
-  breadth: 'balanced', abort: null,
+  breadth: 'balanced', abort: null, lastAsk: null, lastAnswerChunk: null,
 };
 
 /* ---------- helpers ---------- */
@@ -75,6 +75,7 @@ async function openPaper(id, fragment, push = true) {
     setStatus("");
     loadGraph();
     if (fragment) scrollToAnchor(fragment);
+    applyHeatmap();
   } catch (err) {
     setStatus(String(err.message || err), "error");
   }
@@ -88,6 +89,7 @@ async function fetchFullText(id) {
       const fresh = await api(`/api/paper/${encodeURIComponent(id)}`);
       if (state.paper === id && fresh.html) {
         $("#paper").innerHTML = fresh.html;
+        applyHeatmap();
         setStatus(`fetched ${d.chunks || fresh.n_chunks} chunks via ${d.source || "cache"}`);
       }
     } else if (d.status === "in_progress") {
@@ -272,6 +274,8 @@ $("#ask-form").addEventListener("submit", async (ev) => {
       hits = fresh.hits;
     }
     state.hits = hits;
+    state.lastAsk = q;
+    state.lastAnswerChunk = hits[0]?.chunk_id ?? null;
     renderCitations(answerEl, hits);
 
     const res = await fetch("/api/ask", {
@@ -332,6 +336,9 @@ $("#ask-form").addEventListener("submit", async (ev) => {
     }
     if (!body) textEl.innerHTML ||= `<span class="dim">(no generation — is vLLM running?)</span>`;
     loadGraph(q);
+    // Repaint here too, not only on paper-open: asking while already reading a paper is
+    // the common case, and it is exactly when the reference vector becomes available.
+    applyHeatmap();
   } catch (err) {
     answerEl.querySelector(".text").innerHTML =
       `<span class="error">${escapeHtml(String(err.message || err))}</span>`;
@@ -1025,9 +1032,186 @@ $("#topk").addEventListener("change", () => {
  * so bindSearchGraph() never ran and nothing in the graph was clickable. Search still
  * worked, because its listener is registered at top level, which made the failure
  * look like a graph bug rather than a load-order bug. */
-(async function boot() {
+
+
+/* ---------- coverage + grounding badges ---------- */
+
+/* Both of these exist so the reader can calibrate trust without clicking every citation.
+ * A grounded answer and a confidently-worded guess look identical in prose; the only
+ * honest fix is to surface what the system itself knows about its evidence. */
+
+const COVERAGE_UI = {
+  full:    { label: "Sources answer this", cls: "cov-full" },
+  partial: { label: "Partially answered",  cls: "cov-partial" },
+  none:    { label: "Not answered by sources", cls: "cov-none" },
+};
+
+function renderCoverage(msgEl, v) {
+  const ui = COVERAGE_UI[v.coverage] || COVERAGE_UI.full;
+  const bits = [];
+  if (v.missing) bits.push(`<div class="cov-detail">Missing: ${escapeHtml(v.missing)}</div>`);
+  if (v.conflict) bits.push(`<div class="cov-detail warn">Sources disagree: ${escapeHtml(v.conflict)}</div>`);
+  const el = document.createElement("div");
+  el.className = `coverage ${ui.cls}`;
+  el.innerHTML = `<span class="dot"></span><b>${ui.label}</b>` +
+    (v.via === "scores" ? `<span class="dim"> · from retrieval scores</span>` : "") +
+    bits.join("");
+  const anchor = msgEl.querySelector(".steps");
+  anchor ? anchor.after(el) : msgEl.prepend(el);
+}
+
+function renderGrounding(msgEl, checks) {
+  const weak = checks.filter((c) => !c.supported);
+  const el = document.createElement("div");
+  el.className = "grounding" + (weak.length ? " has-weak" : "");
+  if (!weak.length) {
+    el.innerHTML = `<span class="ok">✓</span> all ${checks.length} cited statement${
+      checks.length === 1 ? "" : "s"} matched their source`;
+  } else {
+    el.innerHTML =
+      `<b>${weak.length} of ${checks.length} cited statement${checks.length === 1 ? "" : "s"} ` +
+      `may not be supported by the excerpt cited</b>` +
+      weak.map((c) => `<div class="weak">[${c.marker}] “${escapeHtml(c.sentence)}”
+         <span class="dim">score ${c.support.toFixed(3)}</span></div>`).join("");
+  }
+  msgEl.append(el);
+}
+
+/* ================= passage heatmap ================= */
+
+/* When a citation is followed, shade the paper's most relevant passages so the reader can
+ * see at a glance where else the answer is supported — not just the one chunk that was
+ * cited. Two reference vectors, because they answer different questions:
+ *
+ *   answer  similarity to the top retrieved chunk. Surfaces the argument AROUND the
+ *           answer — its setup, its caveat, the ablation that qualifies it. Usually what
+ *           someone following a citation wants next, so it is the default.
+ *   query   similarity to what was asked. Surfaces restatements of the question, which is
+ *           better for "where else does this paper discuss this".
+ *
+ * Bands are assigned by RANK, not raw score. Scores within one paper often sit in a narrow
+ * range, and normalising them would render five nearly identical shades; rank guarantees
+ * the gradation is actually visible.
+ */
+
+const HEAT_BANDS = 5;
+let heatRegistry = [];
+
+function clearHeatmap() {
+  if (!window.CSS || !CSS.highlights) return;
+  for (let b = 1; b <= HEAT_BANDS; b++) CSS.highlights.delete(`lara-heat-${b}`);
+  heatRegistry = [];
+  const el = $("#heat-legend");
+  if (el) el.remove();
+}
+
+async function applyHeatmap() {
+  const mode = prefs.get("heatMode", "answer");
+  clearHeatmap();
+  if (mode === "off" || !state.paper || !window.CSS || !CSS.highlights) return;
+
+  const q = state.lastAsk;
+  const anchorChunk = state.lastAnswerChunk;
+  if (mode === "query" && !q) return;
+  if (mode === "answer" && !anchorChunk) return;
+
+  try {
+    const data = await api("/api/heatmap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        arxiv_id: state.paper, query: q, anchor_chunk_id: anchorChunk,
+        mode, k: Number(prefs.get("heatK", "5")),
+      }),
+    });
+    paintHeatmap(data.chunks || [], mode);
+  } catch { /* heatmap is decoration; never block reading */ }
+}
+
+function paintHeatmap(chunks, mode) {
+  if (!chunks.length) return;
+  const perBand = Math.ceil(chunks.length / HEAT_BANDS);
+  const groups = Array.from({ length: HEAT_BANDS }, () => []);
+  let painted = 0;
+  chunks.forEach((c, i) => {
+    const el = document.getElementById(c.anchor);
+    if (!el) return;
+    const r = rangeFromOffsets(el, c.char_start, c.char_end);
+    if (!r) return;
+    groups[Math.min(HEAT_BANDS - 1, Math.floor(i / perBand))].push(r);
+    painted++;
+  });
+  groups.forEach((ranges, b) => {
+    if (!ranges.length) return;
+    const h = new Highlight(...ranges);
+    CSS.highlights.set(`lara-heat-${b + 1}`, h);
+    heatRegistry.push(h);
+  });
+  if (!painted) return;
+
+  const legend = document.createElement("p");
+  legend.id = "heat-legend";
+  legend.innerHTML =
+    `<span class="ramp"></span> ${painted} passage${painted === 1 ? "" : "s"} shaded by
+     relevance to ${mode === "answer" ? "the answer passage" : "your question"}
+     <button type="button" id="heat-jump">jump to top passage</button>`;
+  $("#paper-meta").append(legend);
+  $("#heat-jump").addEventListener("click", () => {
+    const c = chunks[0];
+    scrollToAnchor(`#${c.anchor}:${c.char_start}-${c.char_end}`);
+  });
+}
+
+/* ---------- advanced settings ---------- */
+
+$("#adv-btn").addEventListener("click", () => {
+  const panel = $("#advanced");
+  panel.hidden = !panel.hidden;
+  $("#adv-btn").classList.toggle("on", !panel.hidden);
+});
+document.addEventListener("click", (ev) => {
+  if (ev.target.closest("#advanced") || ev.target.closest("#adv-btn")) return;
+  $("#advanced").hidden = true;
+  $("#adv-btn").classList.remove("on");
+});
+
+const HEAT_NOTES = {
+  answer: "Shades passages similar to the excerpt that answered you — the surrounding "
+        + "argument, caveats and ablations.",
+  query:  "Shades passages similar to your question — other places the paper discusses it.",
+  off:    "No passage shading.",
+};
+
+function applyHeatPrefs() {
+  const mode = prefs.get("heatMode", "answer");
+  const k = prefs.get("heatK", "5");
+  $("#heat-mode").value = mode;
+  $("#heat-k").value = k;
+  $("#heat-k-val").textContent = k;
+  $("#heat-note").textContent = HEAT_NOTES[mode] || "";
+}
+
+$("#heat-mode").addEventListener("change", (e) => {
+  prefs.set("heatMode", e.target.value);
+  applyHeatPrefs();
+  applyHeatmap();
+});
+$("#heat-k").addEventListener("input", (e) => {
+  prefs.set("heatK", e.target.value);
+  $("#heat-k-val").textContent = e.target.value;
+});
+$("#heat-k").addEventListener("change", () => applyHeatmap());
+
+/* ---------- boot ----------
+ * Deferred with queueMicrotask so file ORDER stops being load-bearing. Twice now an
+ * appended block landed after this IIFE and boot hit the temporal dead zone on a
+ * `const` below it — 'Cannot access prefs/HEAT_NOTES before initialization' — which
+ * aborts boot entirely and silently disables every listener it registers. Deferring
+ * runs boot after the whole module has evaluated, so a later append cannot break it. */
+async function boot() {
   applyLayout();
   applyTypography();
+  applyHeatPrefs();
   document.documentElement.style.setProperty("--graph-h", prefs.get("graphH", "460px"));
   $("#topk").value = prefs.get("topk", "20");
   $("#topk-val").textContent = $("#topk").value;
@@ -1075,47 +1259,8 @@ $("#topk").addEventListener("change", () => {
 
   const h = await api("/api/health").catch(() => null);
   if (h) setStatus(`${h.vectors.toLocaleString()} chunks indexed`);
-})();
-
-/* ---------- coverage + grounding badges ---------- */
-
-/* Both of these exist so the reader can calibrate trust without clicking every citation.
- * A grounded answer and a confidently-worded guess look identical in prose; the only
- * honest fix is to surface what the system itself knows about its evidence. */
-
-const COVERAGE_UI = {
-  full:    { label: "Sources answer this", cls: "cov-full" },
-  partial: { label: "Partially answered",  cls: "cov-partial" },
-  none:    { label: "Not answered by sources", cls: "cov-none" },
-};
-
-function renderCoverage(msgEl, v) {
-  const ui = COVERAGE_UI[v.coverage] || COVERAGE_UI.full;
-  const bits = [];
-  if (v.missing) bits.push(`<div class="cov-detail">Missing: ${escapeHtml(v.missing)}</div>`);
-  if (v.conflict) bits.push(`<div class="cov-detail warn">Sources disagree: ${escapeHtml(v.conflict)}</div>`);
-  const el = document.createElement("div");
-  el.className = `coverage ${ui.cls}`;
-  el.innerHTML = `<span class="dot"></span><b>${ui.label}</b>` +
-    (v.via === "scores" ? `<span class="dim"> · from retrieval scores</span>` : "") +
-    bits.join("");
-  const anchor = msgEl.querySelector(".steps");
-  anchor ? anchor.after(el) : msgEl.prepend(el);
 }
-
-function renderGrounding(msgEl, checks) {
-  const weak = checks.filter((c) => !c.supported);
-  const el = document.createElement("div");
-  el.className = "grounding" + (weak.length ? " has-weak" : "");
-  if (!weak.length) {
-    el.innerHTML = `<span class="ok">✓</span> all ${checks.length} cited statement${
-      checks.length === 1 ? "" : "s"} matched their source`;
-  } else {
-    el.innerHTML =
-      `<b>${weak.length} of ${checks.length} cited statement${checks.length === 1 ? "" : "s"} ` +
-      `may not be supported by the excerpt cited</b>` +
-      weak.map((c) => `<div class="weak">[${c.marker}] “${escapeHtml(c.sentence)}”
-         <span class="dim">score ${c.support.toFixed(3)}</span></div>`).join("");
-  }
-  msgEl.append(el);
-}
+queueMicrotask(() => boot().catch((e) => {
+  console.error('boot failed', e);
+  setStatus('startup error: ' + (e?.message || e), 'error');
+}));

@@ -414,6 +414,81 @@ def reload_index() -> JSONResponse:
     })
 
 
+class HeatmapRequest(BaseModel):
+    arxiv_id: str
+    query: str | None = None
+    anchor_chunk_id: int | None = None
+    mode: str = "query"          # query | answer
+    k: int = 5
+
+
+@app.post("/api/heatmap")
+def heatmap(req: HeatmapRequest) -> JSONResponse:
+    """Score every chunk of one paper, for shading the most relevant passages.
+
+    Two reference vectors, because they answer different questions:
+
+    ``query``   similarity to what the reader asked. Surfaces passages that restate the
+                question — good for "where else is this discussed".
+    ``answer``  similarity to the top retrieved chunk. Surfaces the argument *around* the
+                answer — the setup, the caveat, the ablation that qualifies it — which is
+                usually what someone following a citation actually wants to read next.
+
+    Scored at full 768-d precision from the mmap rather than the 256-d tier-1 vectors: a
+    single paper is a few hundred rows, so exactness is free here.
+    """
+    import numpy as np
+
+    from lara.index.embed import embed_queries
+
+    s = _state()
+    assert s.retriever is not None
+    r = s.retriever
+    r._ensure_fp16_current()
+
+    rows = s.conn().execute(
+        "SELECT chunk_id, vector_row, anchor_start, char_start, anchor_end, char_end, "
+        "       section_anchor, kind, substr(text,1,160) AS preview "
+        "FROM chunks WHERE arxiv_id=? AND vector_row IS NOT NULL ORDER BY ordinal",
+        (req.arxiv_id,),
+    ).fetchall()
+    rows = [x for x in rows if 0 <= x["vector_row"] < r.fp16.shape[0]]
+    if not rows:
+        return JSONResponse({"mode": req.mode, "chunks": []})
+
+    if req.mode == "answer" and req.anchor_chunk_id is not None:
+        ref_row = s.conn().execute(
+            "SELECT vector_row FROM chunks WHERE chunk_id=?", (req.anchor_chunk_id,)
+        ).fetchone()
+        if ref_row is None or ref_row["vector_row"] is None:
+            return JSONResponse({"mode": req.mode, "chunks": [], "error": "anchor has no vector"})
+        ref = np.asarray(r.fp16[ref_row["vector_row"]], dtype=np.float32)
+    else:
+        if not (req.query or "").strip():
+            return JSONResponse({"mode": req.mode, "chunks": []})
+        ref = embed_queries(r.embedder, [req.query])[0]
+    ref = ref / max(float(np.linalg.norm(ref)), 1e-12)
+
+    idx = np.fromiter((x["vector_row"] for x in rows), dtype=np.int64, count=len(rows))
+    scores = np.asarray(r.fp16[idx], dtype=np.float32) @ ref
+    k = max(1, min(req.k, 25))
+    top = np.argsort(-scores)[:k]
+
+    return JSONResponse({
+        "mode": req.mode,
+        "chunks": [
+            {
+                "chunk_id": rows[i]["chunk_id"], "anchor": rows[i]["anchor_start"],
+                "char_start": rows[i]["char_start"], "char_end": rows[i]["char_end"],
+                "anchor_end": rows[i]["anchor_end"], "section": rows[i]["section_anchor"],
+                "kind": rows[i]["kind"], "preview": rows[i]["preview"],
+                "score": round(float(scores[i]), 4), "rank": int(rank) + 1,
+            }
+            for rank, i in enumerate(top)
+        ],
+    })
+
+
 @app.get("/api/models")
 def models() -> JSONResponse:
     """Generators available from the HF cache (R6, R7)."""

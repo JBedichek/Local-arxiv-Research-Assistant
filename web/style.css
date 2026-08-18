@@ -282,8 +282,13 @@ label.breadth #breadth-val em { font-style: normal; color: var(--dim); }
   animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-/* A collapsed pane keeps its splitter grabbable so it can be dragged back open. */
-#graph-pane.collapsed, #chat-pane.collapsed { display: none; }
+/* A collapsed pane keeps its splitter grabbable so it can be dragged back open.
+   NOT display:none — a grid item set to display:none is removed from the grid, so every
+   later pane shifts one column left into a 6px splitter slot and the paper pane ends up
+   6px wide. Its column is already 0px, so clipping the overflow is all that is needed. */
+#graph-pane.collapsed, #chat-pane.collapsed {
+  overflow: hidden; border: 0; min-width: 0; padding: 0;
+}
 .splitter { min-width: 6px; }
 .splitter::after { content: ""; position: absolute; width: 14px; height: 100%;
   transform: translateX(-4px); }
@@ -306,3 +311,33 @@ label.breadth #breadth-val em { font-style: normal; color: var(--dim); }
 .grounding.has-weak { color: var(--warn); }
 .grounding .weak { margin-top: 4px; padding-left: 8px;
   border-left: 2px solid var(--warn); color: var(--text); opacity: .85; }
+
+/* advanced settings popover */
+#adv-btn { background: var(--panel-2); color: var(--dim); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 9px; font-size: 14px; cursor: pointer; line-height: 1; }
+#adv-btn:hover, #adv-btn.on { color: var(--accent); border-color: var(--accent); }
+#advanced { position: absolute; right: 12px; top: 46px; z-index: 40; width: 320px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 9px;
+  padding: 12px 14px; box-shadow: 0 10px 34px rgba(0,0,0,.42);
+  display: flex; flex-direction: column; gap: 10px; }
+#advanced h4 { margin: 0; font-size: 11px; text-transform: uppercase;
+  letter-spacing: .08em; color: var(--dim); }
+label.adv { display: flex; align-items: center; gap: 7px; font-size: 12px;
+  color: var(--dim); flex-wrap: wrap; }
+label.adv select { flex: 1 1 100%; }
+.adv-note { margin: -4px 0 0; font-size: 11px; color: var(--dim); opacity: .85; line-height: 1.45; }
+
+/* passage heatmap: five bands, warm = most relevant. Kept distinct from the citation
+   highlight so a followed citation stays identifiable inside the shading. */
+::highlight(lara-heat-1) { background: rgba(222, 78, 62, .30); }
+::highlight(lara-heat-2) { background: rgba(226, 138, 66, .26); }
+::highlight(lara-heat-3) { background: rgba(188, 190, 96, .22); }
+::highlight(lara-heat-4) { background: rgba(64, 166, 156, .18); }
+::highlight(lara-heat-5) { background: rgba(52, 118, 160, .15); }
+#heat-legend { display: flex; align-items: center; gap: 6px; font-size: 11px;
+  color: var(--dim); margin: 6px 0 0; flex-wrap: wrap; }
+#heat-legend .ramp { width: 74px; height: 9px; border-radius: 3px; display: inline-block;
+  background: linear-gradient(90deg, rgba(52,118,160,.6), rgba(64,166,156,.7),
+    rgba(188,190,96,.8), rgba(226,138,66,.85), rgba(222,78,62,.9)); }
+#heat-legend button { background: none; border: 0; color: var(--accent);
+  cursor: pointer; font-size: 11px; padding: 0 2px; }
