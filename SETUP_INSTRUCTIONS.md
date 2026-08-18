@@ -13,14 +13,14 @@ trimmed), and which model to generate with.
 
 ## The short version
 
-```bash
+```zsh
 git clone https://github.com/JBedichek/Local-arxiv-Research-Assistant.git
 cd Local-arxiv-Research-Assistant
 
 python3 -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -e '.[mac]'                                 # or '.[cuda]' / '.[cpu]' — see step 2
+pip install -e '.[mac]'                                 # keep the quotes — see step 2
 
-lara dataset pull --tiers core                          # ~51 GB, resumable, no account
+lara dataset pull --tiers core                          # ~50 GB, resumable, no account
 lara setup                                              # interactive; writes config.local.yaml
 lara serve                                              # reader on http://127.0.0.1:8080
 ```
@@ -32,7 +32,7 @@ Everything below is detail.
 ## 1. Requirements
 
 - **Python 3.12+**
-- **Disk**: 51 GB for `core`, 96 GB with `full`. Check with `df -h .` before starting.
+- **Disk**: 50 GB for `core`, 95 GB with `full`. Check with `df -h .` before starting.
 - **RAM**: 8 GB works with a trimmed corpus; 32 GB+ runs everything untouched. Step 4
   measures your machine and tells you which case you are in.
 - **A GPU is optional.** Search runs fine on CPU (~12 ms). Only *building* an index from
@@ -50,11 +50,16 @@ python3 -m venv .venv && source .venv/bin/activate
 
 Pick exactly one platform extra:
 
-```bash
+```zsh
 pip install -e '.[mac]'      # Apple Silicon — adds faiss-cpu and mlx-lm
 pip install -e '.[cuda]'     # NVIDIA, CUDA 12
 pip install -e '.[cpu]'      # Linux/Windows with no GPU
 ```
+
+> **On macOS, the quotes are load-bearing.** zsh has been the default shell since Catalina,
+> and it expands `[...]` as a glob before pip ever sees it. Unquoted, `pip install -e .[mac]`
+> dies with `zsh: no matches found: .[mac]` — where bash would have passed the string
+> through untouched. Quote every extra on this page, and the command works in both shells.
 
 **Linux/Windows without a GPU: install torch from the CPU index first.** PyPI's default
 torch wheel drags in **~5.4 GB of CUDA runtime libraries** that a machine with no NVIDIA
@@ -95,7 +100,7 @@ why Apple Silicon gets two purpose-built options instead.
 **On a Mac, try both.** MLX uses unified memory directly and is often faster; llama.cpp is
 more mature and has richer KV-cache options. Compare them on your own hardware:
 
-```bash
+```zsh
 lara backends                            # what is installed, and what would be used
 lara serve-llm --backend mlx             # then, in another shell:
 lara bench-generate                      # median TTFT and tok/s
