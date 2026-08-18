@@ -103,7 +103,26 @@ def check_disks(cfg: Config) -> list[Check]:
 
 
 def check_gpu() -> list[Check]:
-    """NVML must agree with the loaded kernel module or nothing CUDA will start."""
+    """Report the accelerator, and fail only on a *broken* one.
+
+    Having no GPU is not a failure — retrieval runs on CPU (~7 ms at 96 % recall) and
+    generation can point at any OpenAI-compatible endpoint, so a CPU-only machine is a
+    supported configuration, not a misconfigured one. What *is* a failure is a CUDA stack
+    that is present but non-functional: an NVML/kernel-module mismatch leaves
+    ``nvidia-smi`` failing while the config still asks for ``cuda:0``, and every job dies
+    at model-load time with a far less obvious error.
+    """
+    from lara import device as dev
+
+    backend = dev.backend()
+    if backend == "mps":
+        return [Check("gpu", True, "Apple Silicon GPU via MPS (unified memory). "
+                                   "vLLM has no Metal backend — see serving notes.")]
+    if backend == "cpu" and not shutil.which("nvidia-smi"):
+        return [Check("gpu", True, "no accelerator — CPU only. Retrieval works; "
+                                   "embedding is ~50x slower and generation needs an "
+                                   "external endpoint.")]
+
     try:
         r = subprocess.run(
             ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
@@ -123,6 +142,16 @@ def check_gpu() -> list[Check]:
         return [Check("gpu", False, (err[0] if err else "nvidia-smi failed") + hint)]
 
     gpus = [line.strip() for line in r.stdout.splitlines() if line.strip()]
+    if gpus and backend != "cuda":
+        # The driver is healthy but torch cannot reach the cards — a CPU-only torch build,
+        # or CUDA_VISIBLE_DEVICES emptied in the environment. Everything would silently
+        # run on CPU at ~50x the cost, which reads as a hang rather than an error.
+        return [Check(
+            "gpu", False,
+            f"nvidia-smi sees {len(gpus)} GPU(s) but torch reports '{backend}'. "
+            f"Check CUDA_VISIBLE_DEVICES and that torch was built with CUDA "
+            f"(torch.cuda.is_available() is False).",
+        )]
     return [Check("gpu", bool(gpus), f"{len(gpus)} visible: " + "; ".join(gpus))]
 
 

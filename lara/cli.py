@@ -324,6 +324,7 @@ def search(
     no_rerank: bool = typer.Option(False, "--no-rerank", help="Skip the cross-encoder"),
     no_bm25: bool = typer.Option(False, "--no-bm25", help="Dense only"),
     paper: str = typer.Option(None, help="Restrict to one arXiv id"),
+    device: str = typer.Option(None, help="Override device; default auto-detects"),
 ) -> None:
     """Retrieve chunks for a query and show anchored citations with timings."""
     from lara.index import embed as emb
@@ -338,7 +339,7 @@ def search(
         cfg.get_path("paths.vectors_fp16"), cfg.get_path("paths.vectors_int8"),
         dim_full=int(ecfg["dim_full"]), dim_trunc=int(ecfg["dim_truncated"]),
     )
-    edev = ldev.resolve((ecfg.get("devices") or [None])[0])
+    edev = ldev.resolve(device if device else (ecfg.get("devices") or [None])[0])
     console.print(f"loading index ({store.rows():,} vectors) and embedder on {edev}…")
     embedder = emb.load_model(ecfg["model"], device=edev,
                               max_seq_length=int(ecfg["max_seq_len"]))
