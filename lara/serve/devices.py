@@ -61,10 +61,34 @@ class Device:
 
 
 def _total_ram_gb() -> float:
+    # AttributeError matters as much as OSError here: Windows has no `os.sysconf` at all,
+    # so the lookup fails before the call does. Catching only (ValueError, OSError) let
+    # that escape and took `lara setup` down with it on every Windows machine.
     try:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / 1e9
-    except (ValueError, OSError):
+    except (AttributeError, ValueError, OSError):
         pass
+    if platform.system() == "Windows":
+        try:
+            import ctypes
+
+            class _MemoryStatusEx(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+            status = _MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(status)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return status.ullTotalPhys / 1e9
+        except Exception:
+            pass
     try:  # macOS
         out = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True,
                              text=True, timeout=5).stdout.strip()
