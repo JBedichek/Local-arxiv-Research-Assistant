@@ -13,17 +13,71 @@ trimmed), and which model to generate with.
 
 ## The short version
 
+Pick your platform. Only the first two lines differ — everything from `lara dataset pull`
+onward is identical everywhere.
+
+**macOS — zsh**
+
 ```zsh
 git clone https://github.com/JBedichek/Local-arxiv-Research-Assistant.git
 cd Local-arxiv-Research-Assistant
 
-python3 -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -e '.[mac]'                                 # keep the quotes — see step 2
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e '.[mac]'                     # quotes required — zsh globs [...]
 
-lara dataset pull --tiers core                          # ~50 GB, resumable, no account
-lara setup                                              # interactive; writes config.local.yaml
-lara serve                                              # reader on http://127.0.0.1:8080
+lara dataset pull --tiers core              # ~50 GB, resumable, no account
+lara setup                                  # interactive; writes config.local.yaml
+lara serve                                  # reader on http://127.0.0.1:8080
 ```
+
+**Linux — bash**
+
+```bash
+git clone https://github.com/JBedichek/Local-arxiv-Research-Assistant.git
+cd Local-arxiv-Research-Assistant
+
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e '.[cuda]'                    # NVIDIA. No GPU? use the CPU install in step 2
+
+lara dataset pull --tiers core              # ~50 GB, resumable, no account
+lara setup                                  # interactive; writes config.local.yaml
+lara serve                                  # reader on http://127.0.0.1:8080
+```
+
+**Windows — PowerShell**
+
+```powershell
+git clone https://github.com/JBedichek/Local-arxiv-Research-Assistant.git
+cd Local-arxiv-Research-Assistant
+
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1                # blocked? see the note below
+pip install -e '.[cpu]'                     # yes, even with an NVIDIA card — see the note
+
+lara dataset pull --tiers core              # ~50 GB, resumable, no account
+lara setup                                  # interactive; writes config.local.yaml
+lara serve                                  # reader on http://127.0.0.1:8080
+```
+
+> **Three things only Windows users hit.**
+>
+> 1. **`Activate.ps1` refuses to run.** That is PowerShell's execution policy, not a broken
+>    venv. `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` lifts it for the
+>    current session and nothing wider.
+> 2. **`'.[cpu]'` is right even on an NVIDIA machine** — but on its own it leaves you on the
+>    CPU. The `cuda` extra exists only to add `faiss-gpu-cu12`, which ships Linux wheels
+>    alone, and skipping faiss costs nothing because the default search backend is torch and
+>    faiss is opt-in everywhere. The catch is torch itself: **PyPI's default wheel is
+>    CPU-only on Windows**, where on Linux it bundles CUDA. To use your GPU, install torch
+>    from PyTorch's CUDA index *before* the extra — the selector at
+>    <https://pytorch.org/get-started/locally/> gives the exact URL for your driver:
+>    ```powershell
+>    pip install torch --index-url https://download.pytorch.org/whl/cu124
+>    pip install -e '.[cpu]'
+>    ```
+> 3. **Generation is the real gap.** vLLM is Linux-only and MLX is Apple-only, so nothing
+>    autostarts. Run Ollama or LM Studio yourself and `lara setup` adopts whichever is
+>    already answering.
 
 Everything below is detail.
 
@@ -32,7 +86,8 @@ Everything below is detail.
 ## 1. Requirements
 
 - **Python 3.12+**
-- **Disk**: 50 GB for `core`, 95 GB with `full`. Check with `df -h .` before starting.
+- **Disk**: 50 GB for `core`, 95 GB with `full`. Check with `df -h .`, or
+  `Get-PSDrive C` in PowerShell, before starting.
 - **RAM**: 8 GB works with a trimmed corpus; 32 GB+ runs everything untouched. Step 4
   measures your machine and tells you which case you are in.
 - **A GPU is optional.** Search runs fine on CPU (~12 ms). Only *building* an index from
@@ -53,7 +108,7 @@ Pick exactly one platform extra:
 ```zsh
 pip install -e '.[mac]'      # Apple Silicon — adds faiss-cpu and mlx-lm
 pip install -e '.[cuda]'     # NVIDIA, CUDA 12
-pip install -e '.[cpu]'      # Linux/Windows with no GPU
+pip install -e '.[cpu]'      # Linux with no GPU, and all Windows — see the note above
 ```
 
 > **On macOS, the quotes are load-bearing.** zsh has been the default shell since Catalina,
