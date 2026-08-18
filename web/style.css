@@ -1,15 +1,68 @@
-:root {
+/* ── themes ────────────────────────────────────────────────────────────────────────
+   Tokens only. Every theme defines the same names, so nothing downstream branches on
+   which theme is active. `auto` follows the OS; the rest are explicit choices stamped on
+   <html data-theme>, which must win over the media query in BOTH directions — hence the
+   :not() guard on the auto-dark block. */
+
+:root,
+:root[data-theme="light"] {
+  --bg: #f6f7fa; --panel: #fff; --panel-2: #f0f2f7; --line: #dde2ea;
+  --text: #1b2130; --dim: #63708a; --accent: #1d6fd0; --warn: #b3492c;
+  --hl: rgba(255, 205, 60, .45);
+  --paper-bg: #ffffff; --paper-text: #14181f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not([data-theme="sepia"]):not([data-theme="contrast"]) {
+    --bg: #12151c; --panel: #171b24; --panel-2: #1d222d; --line: #2a3140;
+    --text: #dfe4ee; --dim: #8f9aae; --accent: #6fb3ff; --warn: #e07a5f;
+    --hl: rgba(255, 214, 102, .34);
+    --paper-bg: #12151c; --paper-text: #dfe4ee;
+  }
+}
+
+:root[data-theme="dark"] {
   --bg: #12151c; --panel: #171b24; --panel-2: #1d222d; --line: #2a3140;
   --text: #dfe4ee; --dim: #8f9aae; --accent: #6fb3ff; --warn: #e07a5f;
   --hl: rgba(255, 214, 102, .34);
-  font-synthesis-weight: none;
+  --paper-bg: #12151c; --paper-text: #dfe4ee;
 }
-@media (prefers-color-scheme: light) {
-  :root:not([data-theme="dark"]) {
-    --bg: #f6f7fa; --panel: #fff; --panel-2: #f0f2f7; --line: #dde2ea;
-    --text: #1b2130; --dim: #63708a; --accent: #1d6fd0; --warn: #b3492c;
-    --hl: rgba(255, 205, 60, .45);
-  }
+
+/* Sepia: warm and low-contrast, the e-reader convention for long sessions. The paper
+   surface is deliberately warmer than the chrome so the text column reads as a page. */
+:root[data-theme="sepia"] {
+  --bg: #ece3d2; --panel: #f3ece0; --panel-2: #e6dcc8; --line: #d6c9ae;
+  --text: #3b3227; --dim: #7a6a55; --accent: #8a5a2b; --warn: #a4462a;
+  --hl: rgba(214, 160, 60, .40);
+  --paper-bg: #f7f1e3; --paper-text: #33291d;
+}
+
+/* High contrast for low vision: pure black on white, saturated accent, heavier rules.
+   Not merely "light with bigger text" — the contrast ratio is the point. */
+:root[data-theme="contrast"] {
+  --bg: #ffffff; --panel: #ffffff; --panel-2: #f2f2f2; --line: #000000;
+  --text: #000000; --dim: #3a3a3a; --accent: #0033cc; --warn: #b00000;
+  --hl: rgba(255, 230, 0, .70);
+  --paper-bg: #ffffff; --paper-text: #000000;
+}
+:root[data-theme="contrast"] #bar,
+:root[data-theme="contrast"] main > section { border-color: #000; }
+:root[data-theme="contrast"] a.cite,
+:root[data-theme="contrast"] a.glabel:hover { text-decoration: underline; }
+
+/* ── reading typography ───────────────────────────────────────────────────────────
+   Reading preferences are personal and none of these has a right answer, so all of them
+   are exposed rather than chosen. Web faces are loaded opportunistically: if the network
+   is unavailable the stack falls through to a system face and nothing breaks. */
+:root {
+  --font-system: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-inter: Inter, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-charter: Charter, "Bitstream Charter", "Source Serif 4", Cambria, Georgia, serif;
+  --font-literata: Literata, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  --font-times: "Times New Roman", Times, "Liberation Serif", serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+  --font-wide: Verdana, Tahoma, "DejaVu Sans", sans-serif;
+  --font-atkinson: "Atkinson Hyperlegible", Verdana, Tahoma, sans-serif;
 }
 
 * { box-sizing: border-box; }
@@ -19,7 +72,8 @@
    .hidden = true updated the property but changed nothing on screen, which is why its
    dismiss button appeared to do nothing and an empty chip sat above the Ask button. */
 [hidden] { display: none !important; }
-html, body { height: 100%; }
+html, body { height: 100%; overflow: hidden; }
+/* The chrome must never scroll away; only the panes scroll. */
 body {
   margin: 0; background: var(--bg); color: var(--text);
   font: 15px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
@@ -92,15 +146,12 @@ main > section { min-width: 0; min-height: 0; display: flex; flex-direction: col
   flex: 1; overflow-y: auto; padding: 14px 28px 60vh; max-width: var(--measure, 860px);
   font-family: var(--paper-font, inherit);
   font-size: var(--paper-size, 16px);
+  line-height: var(--paper-leading, 1.6);
+  text-align: var(--paper-align, start);
+  hyphens: var(--paper-hyphens, manual);
+  color: var(--paper-text, var(--text));
 }
-/* Reading typography is a per-reader preference, not a design decision: line length,
-   family and size all change how tiring a long paper is, and nobody agrees on them. */
-:root {
-  --font-serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  --font-wide: Verdana, Tahoma, "DejaVu Sans", sans-serif;
-}
+#paper-pane { background: var(--paper-bg, transparent); }
 #paper .placeholder { color: var(--dim); }
 #paper img, #paper svg { max-width: 100%; height: auto; }
 #paper table { display: block; overflow-x: auto; max-width: 100%; border-collapse: collapse; }
@@ -366,3 +417,11 @@ label.adv select { flex: 1 1 100%; }
 #dl-progress .bar { height: 7px; background: var(--panel-2); border-radius: 4px; overflow: hidden; }
 #dl-progress .bar span { display: block; height: 100%; width: 0; background: var(--accent);
   transition: width .4s; }
+
+/* justified text needs hyphenation to avoid rivers; equations and tables must never be
+   stretched, so they opt out */
+#paper .ltx_equation, #paper table, #paper pre, #paper figure { text-align: start; }
+#paper .ltx_para p { text-align: inherit; }
+label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px; }
+#advanced h4 { margin-top: 4px; }
+#advanced h4:first-child { margin-top: 0; }

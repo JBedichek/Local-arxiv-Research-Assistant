@@ -112,7 +112,7 @@ function scrollToAnchor(fragment) {
   const [anchor, range] = raw.split(":");
   const el = document.getElementById(anchor);
   if (!el) return false;
-  el.scrollIntoView({ behavior: "smooth", block: "center" });
+  scrollIntoPane(el, $("#paper"));
   if (range) {
     const [s, e] = range.split("-").map(Number);
     if (Number.isFinite(s) && Number.isFinite(e)) paintRange(el, s, e);
@@ -120,6 +120,32 @@ function scrollToAnchor(fragment) {
     paintRange(el, 0, el.textContent.length);
   }
   return true;
+}
+
+/* Scroll ONE container, never the document.
+ *
+ * scrollIntoView walks up and scrolls every scrollable ancestor it finds. `body` is
+ * overflow:hidden here, which stops a user scrolling but not a programmatic scroll — so
+ * following a citation moved the paper pane AND slid the whole document up, taking the
+ * top bar with it (measured: bar top 0 -> -124px). Computing the offset and setting
+ * scrollTop on the pane alone has no such side effect. */
+function stickToBottom() {
+  // Same hazard as scrollIntoPane: scrollIntoView inside the chat pane would also scroll
+  // the document and carry the top bar off screen.
+  const m = $("#messages");
+  m.scrollTop = m.scrollHeight;
+  const se = document.scrollingElement;
+  if (se && se.scrollTop) se.scrollTop = 0;
+}
+
+function scrollIntoPane(el, pane) {
+  const p = pane.getBoundingClientRect();
+  const e = el.getBoundingClientRect();
+  const delta = (e.top - p.top) - (p.height / 2 - e.height / 2);
+  pane.scrollTo({ top: pane.scrollTop + delta, behavior: "smooth" });
+  // Undo any document scroll a previous action left behind.
+  const se = document.scrollingElement;
+  if (se && se.scrollTop) se.scrollTop = 0;
 }
 
 /* Map character offsets within an element onto a DOM Range across its text nodes. */
@@ -362,7 +388,7 @@ function addMessage(role, text, selection) {
     (selection ? `<blockquote>${escapeHtml(selection.slice(0, 300))}</blockquote>` : "") +
     `<div class="text">${escapeHtml(text)}</div><div class="cites"></div>`;
   $("#messages").append(div);
-  div.scrollIntoView({ block: "end" });
+  stickToBottom();
   return div;
 }
 
@@ -720,24 +746,102 @@ function makeSplitter(el, varName, prefKey, edge) {
   });
 }
 
-const FONTS = { serif: "var(--font-serif)", sans: "var(--font-sans)",
-                mono: "var(--font-mono)", dyslexic: "var(--font-wide)" };
+/* ---------- reading style ---------- */
 
-function applyTypography() {
-  const fam = prefs.get("font", "sans");
-  const size = prefs.get("fontsize", "16");
-  document.documentElement.style.setProperty("--paper-font", FONTS[fam] || FONTS.sans);
-  document.documentElement.style.setProperty("--paper-size", size + "px");
-  // Hold the measure near 70 characters as size changes; long lines at large type are
-  // what actually makes reading tiring, not the type size itself.
-  document.documentElement.style.setProperty("--measure", Math.round(size * 54) + "px");
-  $("#font").value = fam;
-  $("#fontsize").value = size;
-  $("#fontsize-val").textContent = size;
+/* Presets bundle theme, face, size, leading and measure, because those five interact:
+ * a serif at 17px wants more leading and a wider column than a 14px sans, and setting one
+ * without the others usually makes reading worse rather than better. Touching any
+ * individual control switches the preset to "custom" instead of silently disagreeing with
+ * the label. */
+
+const FONTS = {
+  system: "var(--font-system)", inter: "var(--font-inter)",
+  charter: "var(--font-charter)", literata: "var(--font-literata)",
+  times: "var(--font-times)", mono: "var(--font-mono)",
+  wide: "var(--font-wide)", atkinson: "var(--font-atkinson)",
+};
+
+const PRESETS = {
+  default:  { theme: "auto",     font: "system",   size: 16, leading: 1.60, measure: 54, justify: false },
+  // Warm page, serif, generous measure — closest to a printed journal.
+  paper:    { theme: "light",    font: "charter",  size: 17, leading: 1.65, measure: 62, justify: true  },
+  night:    { theme: "dark",     font: "system",   size: 16, leading: 1.72, measure: 58, justify: false },
+  sepia:    { theme: "sepia",    font: "literata", size: 17, leading: 1.70, measure: 60, justify: true  },
+  // More text per screen for skimming, at the cost of comfort over long sessions.
+  compact:  { theme: "auto",     font: "system",   size: 14, leading: 1.45, measure: 78, justify: false },
+  // Accessibility: Atkinson Hyperlegible was designed to disambiguate similar glyphs.
+  contrast: { theme: "contrast", font: "atkinson", size: 19, leading: 1.85, measure: 50, justify: false },
+};
+
+function currentStyle() {
+  return {
+    theme:   prefs.get("theme", "auto"),
+    font:    prefs.get("font", "system"),
+    size:    Number(prefs.get("fontsize", "16")),
+    leading: Number(prefs.get("leading", "1.6")),
+    measure: Number(prefs.get("measure", "54")),
+    justify: prefs.get("justify", "0") === "1",
+  };
 }
 
-$("#font").addEventListener("change", (e) => { prefs.set("font", e.target.value); applyTypography(); });
-$("#fontsize").addEventListener("input", (e) => { prefs.set("fontsize", e.target.value); applyTypography(); });
+function applyTypography() {
+  const st = currentStyle();
+  const root = document.documentElement;
+  if (st.theme === "auto") root.removeAttribute("data-theme");
+  else root.setAttribute("data-theme", st.theme);
+
+  root.style.setProperty("--paper-font", FONTS[st.font] || FONTS.system);
+  root.style.setProperty("--paper-size", st.size + "px");
+  root.style.setProperty("--paper-leading", String(st.leading));
+  // Measure is in characters, converted at roughly half the font size per character —
+  // the conventional approximation for average glyph advance in running text.
+  root.style.setProperty("--measure", Math.round(st.size * st.measure * 0.5) + "px");
+  root.style.setProperty("--paper-align", st.justify ? "justify" : "start");
+  root.style.setProperty("--paper-hyphens", st.justify ? "auto" : "manual");
+
+  $("#theme").value = st.theme;
+  $("#font").value = st.font;
+  $("#fontsize").value = String(st.size);
+  $("#fontsize-val").textContent = String(st.size);
+  $("#leading").value = String(st.leading);
+  $("#leading-val").textContent = st.leading.toFixed(2);
+  $("#measure").value = String(st.measure);
+  $("#measure-val").textContent = String(st.measure);
+  $("#justify").checked = st.justify;
+  $("#preset").value = prefs.get("preset", "default");
+  drawSearchGraph();
+}
+
+function applyPreset(name) {
+  const p = PRESETS[name];
+  if (!p) return;
+  prefs.set("preset", name);
+  prefs.set("theme", p.theme);
+  prefs.set("font", p.font);
+  prefs.set("fontsize", String(p.size));
+  prefs.set("leading", String(p.leading));
+  prefs.set("measure", String(p.measure));
+  prefs.set("justify", p.justify ? "1" : "0");
+  applyTypography();
+}
+
+$("#preset").addEventListener("change", (e) => {
+  if (e.target.value === "custom") { prefs.set("preset", "custom"); return; }
+  applyPreset(e.target.value);
+});
+
+// Any manual change means the active preset no longer describes the state.
+function markCustom() {
+  prefs.set("preset", "custom");
+  $("#preset").value = "custom";
+}
+
+$("#theme").addEventListener("change", (e) => { prefs.set("theme", e.target.value); markCustom(); applyTypography(); });
+$("#font").addEventListener("change", (e) => { prefs.set("font", e.target.value); markCustom(); applyTypography(); });
+$("#fontsize").addEventListener("input", (e) => { prefs.set("fontsize", e.target.value); markCustom(); applyTypography(); });
+$("#leading").addEventListener("input", (e) => { prefs.set("leading", e.target.value); markCustom(); applyTypography(); });
+$("#measure").addEventListener("input", (e) => { prefs.set("measure", e.target.value); markCustom(); applyTypography(); });
+$("#justify").addEventListener("change", (e) => { prefs.set("justify", e.target.checked ? "1" : "0"); markCustom(); applyTypography(); });
 
 /* depth dial */
 let BREADTH = [];
@@ -778,7 +882,7 @@ function addStep(msgEl, kind, detail) {
   row.className = `step ${kind} active`;
   row.innerHTML = `<span class="dot"></span><span>${escapeHtml(detail)}</span>`;
   host.append(row);
-  row.scrollIntoView({ block: "nearest" });
+  stickToBottom();
 }
 
 function finishSteps(msgEl) {
