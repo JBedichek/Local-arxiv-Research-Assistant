@@ -418,8 +418,17 @@ document.addEventListener("click", (ev) => {
   const a = ev.target.closest("a.cite, a.chip");
   if (!a) return;
   ev.preventDefault();
-  const hit = state.hits[Number(a.dataset.i)];
+  const idx = Number(a.dataset.i);
+  const hit = state.hits[idx];
   if (!hit) return;
+  // A followed citation is the one relevance signal here that no model produced. Fire and
+  // forget — training telemetry must never delay or break navigation.
+  if (state.lastAsk) {
+    fetch("/api/click", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: state.lastAsk, chunk_id: hit.chunk_id, rank: idx + 1 }),
+    }).catch(() => {});
+  }
   if (hit.arxiv_id !== state.paper) {
     openPaper(hit.arxiv_id, `#${hit.anchor}:${hit.char_start}-${hit.char_end}`, true);
   } else {

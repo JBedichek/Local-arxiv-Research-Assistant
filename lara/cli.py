@@ -469,6 +469,107 @@ def explore(
     conn.close()
 
 
+@app.command("fit-check")
+def fit_check(
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    mode: str = typer.Option("overfit", help="overfit | kfold"),
+    k: int = typer.Option(5, help="Folds, for kfold mode"),
+    n: int = typer.Option(400, help="Triples to use in overfit mode"),
+    epochs: int = typer.Option(3),
+    batch_size: int = typer.Option(64),
+    lr_muon: float = typer.Option(5e-5),
+    device: str = typer.Option("cuda:0"),
+) -> None:
+    """Can the embedder fit the harvested judgements at all?
+
+    `overfit` trains and evaluates on the same triples: a working setup drives pairwise
+    accuracy toward 1.0. Failing that, the recipe is broken and more data cannot help.
+    `kfold` splits by query to measure whether it generalises within-distribution.
+    """
+    from lara.finetune import kfold as KF
+    from lara.store import db
+
+    cfg = config_mod.load(config)
+    conn = db.connect(cfg.get_path("paths.metadata_db"))
+    triples = KF.make_triples(conn)
+    console.print(f"[bold]{len(triples):,}[/bold] triples from "
+                  f"{len({t.query_hash for t in triples}):,} queries")
+    if len(triples) < batch_size * 2:
+        console.print("[red]not enough triples[/red] — run `lara explore` first")
+        raise typer.Exit(1)
+
+    rec = KF.Recipe(lr_muon=lr_muon, batch_size=batch_size, epochs=epochs)
+    console.print(f"recipe: muon lr {rec.lr_muon:.1e} · adam lr {rec.lr_adam:.1e} · "
+                  f"batch {rec.batch_size} · {rec.epochs} epochs")
+    model_name = cfg.get_in("embedding.model")
+
+    def reporter():
+        while True:
+            s = yield
+            console.print(f"    step {s['step']:>4}/{s['steps']}  loss {s['loss']:8.4f}  "
+                          f"lr {s['lr']:.2e}")
+
+    if mode == "overfit":
+        sub = triples[:n]
+        console.print(f"\n[bold]overfit check[/bold] on {len(sub)} triples "
+                      "(train == eval; this measures capacity, not generalisation)")
+        from lara.index.embed import load_model
+        base = load_model(model_name, device=device, max_seq_length=rec.max_seq_length)
+        before = KF.evaluate(base, sub, device)
+        console.print(f"  before: pair_acc {before['pair_acc']:.3f}  "
+                      f"margin_mae {before['margin_mae']:.3f}  spearman {before['spearman']}")
+        del base
+        __import__("torch").cuda.empty_cache()
+
+        p = reporter(); next(p)
+        model = KF.train_on(list(sub), model_name, device, rec, progress=p)
+        after = KF.evaluate(model, sub, device)
+        console.print(f"  after : pair_acc {after['pair_acc']:.3f}  "
+                      f"margin_mae {after['margin_mae']:.3f}  spearman {after['spearman']}")
+        gain = after["pair_acc"] - before["pair_acc"]
+        if after["pair_acc"] > 0.9:
+            console.print("[green]  the setup can fit its data[/green] — recipe is sane; "
+                          "generalisation is the next question")
+        elif gain > 0.05:
+            console.print("[yellow]  learning, but not fitting[/yellow] — try more epochs "
+                          "or a higher LR before adding data")
+        else:
+            console.print("[red]  cannot fit even the training set[/red] — the loss, "
+                          "optimiser or LR is wrong; more data will not help")
+        conn.close()
+        return
+
+    folds = KF.split_by_query(triples, k, seed=rec.seed)
+    console.print(f"\n[bold]{k}-fold CV[/bold], split by query "
+                  f"(sizes {[len(f) for f in folds]})")
+    results = []
+    for i in range(k):
+        val_idx = set(folds[i])
+        train = [t for j, t in enumerate(triples) if j not in val_idx]
+        val = [triples[j] for j in folds[i]]
+        console.print(f"\n  fold {i+1}/{k}: train {len(train):,} · val {len(val):,}")
+        from lara.index.embed import load_model
+        base = load_model(model_name, device=device, max_seq_length=rec.max_seq_length)
+        before = KF.evaluate(base, val, device)
+        del base
+        __import__("torch").cuda.empty_cache()
+        p = reporter(); next(p)
+        model = KF.train_on(list(train), model_name, device, rec, progress=p)
+        after = KF.evaluate(model, val, device)
+        del model
+        __import__("torch").cuda.empty_cache()
+        console.print(f"    pair_acc {before['pair_acc']:.3f} -> {after['pair_acc']:.3f}   "
+                      f"spearman {before['spearman']} -> {after['spearman']}")
+        results.append((before, after))
+
+    import statistics as st
+    for key in ("pair_acc", "spearman", "margin_mae"):
+        b = [r[0][key] for r in results]; a = [r[1][key] for r in results]
+        console.print(f"  {key:12} {st.mean(b):.4f} ± {st.pstdev(b):.4f}  ->  "
+                      f"{st.mean(a):.4f} ± {st.pstdev(a):.4f}")
+    conn.close()
+
+
 @app.command()
 def finetune(
     config: str = typer.Option(None, help="Path to config.yaml"),

@@ -57,8 +57,19 @@ a passage they are already looking at.
 - Never write "the passage", "this paper", "the authors", "Figure 2", "above" or "below".
 - Do not quote more than two consecutive words from the passage."""
 
-_META = re.compile(r"\b(this (paper|passage|work|section)|the (passage|authors|above|below)"
-                   r"|figure \d|table \d)\b", re.I)
+# Self-referential questions are unanswerable once the passage is gone: "what do the
+# authors mean here" has no referent in a search box. Widened after a run where ~1 in 40
+# still slipped through — deixis takes many forms ("aforementioned", "the former",
+# "as described", bare "it").
+_META = re.compile(
+    r"\b("
+    r"this (paper|passage|work|section|study|article|excerpt|text|figure|table|method)"
+    r"|these (results|authors|findings|experiments)"
+    r"|the (passage|authors|above|below|former|latter|aforementioned|preceding|following)"
+    r"|(figure|table|equation|section|eq\.?)\s*\d"
+    r"|as (described|shown|discussed|mentioned|stated) (above|below|here|earlier)"
+    r"|(here|herein)\b.*\?$"
+    r")\b", re.I)
 
 
 @dataclass
@@ -134,7 +145,10 @@ async def run_cycles(cfg, conn, retriever, cross_encoder, *, n: int = 50,
     for row in rows:
         if stats["questions"] >= n:
             break
-        style, instruction = rng.choice(QUESTION_STYLES)
+        # Round-robin, not random choice: sampling uniformly at random leaves some
+        # styles under-represented in a short run, and query-TYPE diversity matters more
+        # to the trained model than the number of examples.
+        style, instruction = QUESTION_STYLES[stats["questions"] % len(QUESTION_STYLES)]
         buf = ""
         try:
             async for tok in stream_answer(

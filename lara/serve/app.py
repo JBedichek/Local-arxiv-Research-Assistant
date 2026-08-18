@@ -206,6 +206,36 @@ def retrieve(req: RetrieveRequest) -> JSONResponse:
     })
 
 
+class ClickRequest(BaseModel):
+    query: str
+    chunk_id: int
+    rank: int | None = None
+
+
+@app.post("/api/click")
+def record_click(req: ClickRequest) -> JSONResponse:
+    """A citation the reader actually followed.
+
+    The only relevance signal here that no model produced. It is rare — one click per
+    answer at best — but it is the only label that can contradict the teacher rather than
+    echo it, which makes it the natural held-out set for checking whether distillation is
+    learning relevance or learning the reranker.
+    """
+    from lara.finetune import judgements as J
+    from lara.store import db
+
+    s = _state()
+    conn = db.connect(s.db_path)
+    try:
+        n = J.record(conn, [J.Judgement(
+            query=req.query, chunk_id=req.chunk_id, score=1.0, label=1,
+            teacher="user_click", rank=req.rank, source="click",
+        )])
+    finally:
+        conn.close()
+    return JSONResponse({"stored": n})
+
+
 @app.get("/api/graph/{arxiv_id:path}")
 def graph(arxiv_id: str, query: str = Query(default=""), limit: int = 60) -> JSONResponse:
     """Ego network with similarity shading (R8, R9)."""

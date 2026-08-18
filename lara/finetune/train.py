@@ -90,6 +90,25 @@ def mil_nce(src: torch.Tensor, dst: torch.Tensor, temperature: float,
     return 0.5 * (F.cross_entropy(logits, target) + F.cross_entropy(logits.T, target))
 
 
+def margin_mse(q: torch.Tensor, pos: torch.Tensor, neg: torch.Tensor,
+               teacher_margin: torch.Tensor, scale: float = 10.0) -> torch.Tensor:
+    """Distil the teacher's MARGIN, not its verdict.
+
+    The cross-encoder does not merely say relevant/irrelevant; it says how much. Rounding
+    that to a binary label throws away most of the supervision — a pair at 0.95 vs 0.05
+    and a pair at 0.55 vs 0.45 become identical training signal despite meaning very
+    different things.
+
+    MarginMSE asks the student to reproduce the teacher's gap rather than to classify,
+    which also avoids the pathology of pushing every positive to cosine 1.0 and collapsing
+    the representation.
+    """
+    qn = F.normalize(q, dim=-1)
+    student_margin = (qn * F.normalize(pos, dim=-1)).sum(-1) \
+                   - (qn * F.normalize(neg, dim=-1)).sum(-1)
+    return F.mse_loss(student_margin * scale, teacher_margin * scale)
+
+
 def sample_bag(bag, m: int, rng: random.Random) -> tuple[list[str], list[str]]:
     """m chunks from each side, sampled fresh every epoch so a bag is not memorised."""
     src = rng.sample(bag.src_chunks, min(m, len(bag.src_chunks)))
