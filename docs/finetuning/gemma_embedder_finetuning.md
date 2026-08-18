@@ -215,6 +215,41 @@ Then `--mode kfold` for whether it generalises, and finally `lara finetune`, whi
 only one that reports the metrics you actually care about: retrieval quality against
 **human** citation judgements.
 
+### What k-fold actually said (2026-08-18)
+
+5 folds split by query, 3,520 triples from 440 queries, on the full harvested set:
+
+| | before | after | |
+|---|---|---|---|
+| pairwise accuracy | 0.8219 ± 0.0328 | 0.8196 ± 0.0296 | unchanged |
+| **rank correlation** | **0.7289 ± 0.0287** | **0.6617 ± 0.0512** | **worse** |
+| margin error | 0.6068 ± 0.0114 | 0.5166 ± 0.0143 | better |
+
+**This is a negative result, and the shape of it is the informative part.** Margin error is
+the quantity MarginMSE directly optimises, and it improved. The two metrics that were *not*
+optimised did not: pairwise accuracy moved within noise (up in 3 folds, down in 2), and
+rank correlation fell **in all five folds** — a consistency that rules out chance.
+
+So the student is learning to reproduce the *magnitude* of the teacher's score gap while
+getting slightly worse at the thing retrieval actually needs, which is ordering. Fitting
+the loss is not the same as learning the task.
+
+**Do not adopt a model on these numbers.** The overfit check passing (pairwise accuracy
+1.000) established only that the training loop works; k-fold is what answers whether
+anything transfers to unseen queries, and here it does not.
+
+Three plausible causes, in the order worth testing:
+
+1. **The objective rewards the wrong thing.** MarginMSE is a regression on score gaps. A
+   ranking loss — InfoNCE over in-batch negatives, or a listwise objective — optimises
+   order directly, which is what rank correlation measures.
+2. **Not enough signal.** 2,816 training triples per fold against a 300 M-parameter encoder
+   that already scores 0.82 is a thin prior to move honestly.
+3. **Exposure bias in the labels.** Positives are drawn from what retrieval already
+   returned, so the data mostly describes orderings the base model already produces. The
+   `explore` run's source-recall misses (~45 %) are the part that carries genuinely new
+   information, and they are a small fraction of the total.
+
 ---
 
 ## 6. Guarding against fooling yourself
