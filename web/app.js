@@ -1228,29 +1228,7 @@ async function boot() {
     applyBreadth();
   } catch { /* fall back to the server default */ }
 
-  try {
-    const m = await api("/api/models");
-    state.models = m.models;
-    // Any model in the cache can be listed, but only the one vLLM has loaded can answer;
-    // selecting another would 404 at generation time. Default to the live one and mark
-    // the rest as needing a restart.
-    // Prefer what vLLM actually has loaded; if it is down, fall back to the configured
-    // default rather than whichever repo happens to sort first (which was Mixtral, purely
-    // because it is the largest file on disk).
-    const live = new Set(m.loaded?.length ? m.loaded : [m.configured_default].filter(Boolean));
-    const opts = m.models.map((x) =>
-      `<option value="${x.repo}"${live.has(x.repo) ? " selected" : ""}>` +
-      `${x.repo} (${x.size_gb}GB)${live.has(x.repo) ? " — loaded" : " — not loaded"}</option>`);
-    $("#model").innerHTML = opts.join("") || `<option value="">none servable</option>`;
-    if (m.loaded?.length && ![...$("#model").options].some((o) => o.selected && live.has(o.value))) {
-      // The served model is not in the cache scan (e.g. a repo the filter rejects);
-      // offer it explicitly so the UI still points at something that works.
-      $("#model").insertAdjacentHTML("afterbegin",
-        `<option value="${m.loaded[0]}" selected>${m.loaded[0]} — loaded</option>`);
-    }
-    syncQuant();
-    $("#model").addEventListener("change", syncQuant);
-  } catch { /* models are optional for browsing */ }
+  await loadModels();
 
   const path = location.pathname.match(/^\/p\/(.+?)(?:v(\d+))?$/);
   const q0 = new URLSearchParams(location.search).get("q");
@@ -1264,3 +1242,137 @@ queueMicrotask(() => boot().catch((e) => {
   console.error('boot failed', e);
   setStatus('startup error: ' + (e?.message || e), 'error');
 }));
+
+/* ================= download a model from Hugging Face ================= */
+
+/* Resolve before downloading. A checkpoint is tens of gigabytes, so the dialog reports
+ * what the repo actually is — parameters, architecture, quantisation, size, and whether it
+ * fits this machine's memory — before a byte is written. Committing to a download because
+ * the name looked plausible is an expensive way to discover it was a 70B model. */
+
+let dlResolved = null;
+let dlPoll = null;
+
+function openDownloadModal() {
+  $("#dl-modal").hidden = false;
+  $("#dl-info").innerHTML = "";
+  $("#dl-start").hidden = true;
+  $("#dl-progress").hidden = true;
+  $("#dl-repo").value = "";
+  $("#dl-repo").focus();
+  api("/api/device").then((d) => {
+    const where = d.unified_memory ? "unified RAM" : "VRAM";
+    $("#dl-device").textContent =
+      `${d.system}/${d.machine} · ${d.accelerator.toUpperCase()} · ${d.budget_gb} GB ${where}`
+      + ` · backend: ${d.backend}`;
+  }).catch(() => {});
+}
+
+$("#dl-close").addEventListener("click", () => {
+  $("#dl-modal").hidden = true;
+  clearInterval(dlPoll);
+});
+
+$("#dl-form").addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const q = $("#dl-repo").value.trim();
+  if (!q) return;
+  $("#dl-info").innerHTML = `<span class="dim">looking up…</span>`;
+  $("#dl-start").hidden = true;
+  try {
+    const r = await api("/api/model/resolve", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: q }),
+    });
+    dlResolved = r;
+    if (!r.exists || r.error) {
+      $("#dl-info").innerHTML = `<span class="bad">${escapeHtml(r.error || "not found")}</span>`;
+      return;
+    }
+    const row = (k, v, cls = "") =>
+      `<div class="row"><span class="k">${k}</span><span class="v ${cls}">${v}</span></div>`;
+    const fit = r.fit;
+    let html = row("repo", escapeHtml(r.repo));
+    if (r.params) html += row("parameters", (r.params / 1e9).toFixed(1) + "B");
+    if (r.arch) html += row("architecture", escapeHtml(r.arch));
+    if (r.quantization) html += row("quantization", escapeHtml(r.quantization));
+    html += row("download size",
+      r.size_gb ? `~${r.size_gb} GB`
+                : (r.n_gguf ? "varies by quantisation" : "unknown"));
+    if (fit) {
+      html += row("fits here",
+        fit.fits ? `yes — needs ~${fit.needed_gb} GB of ${fit.budget_gb} GB ${fit.where}`
+                 : `no — needs ~${fit.needed_gb} GB but only ${fit.budget_gb} GB ${fit.where}`,
+        fit.fits ? "ok" : "bad");
+    }
+    if (r.already_cached) html += row("status", "already in your cache", "ok");
+    if (r.warning) html += `<div class="row"><span class="k"></span><span class="v warn">${escapeHtml(r.warning)}</span></div>`;
+    $("#dl-info").innerHTML = html;
+    // Offered even when it does not fit: the estimate is conservative and the machine is
+    // the user's to judge.
+    $("#dl-start").hidden = r.already_cached;
+  } catch (err) {
+    $("#dl-info").innerHTML = `<span class="bad">${escapeHtml(String(err.message || err))}</span>`;
+  }
+});
+
+$("#dl-start").addEventListener("click", async () => {
+  if (!dlResolved) return;
+  $("#dl-start").hidden = true;
+  $("#dl-progress").hidden = false;
+  try {
+    await api("/api/model/download", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repo: dlResolved.repo, size_gb: dlResolved.size_gb }),
+    });
+  } catch (err) {
+    $("#dl-progress-text").innerHTML = `<span class="bad">${escapeHtml(String(err.message || err))}</span>`;
+    return;
+  }
+  clearInterval(dlPoll);
+  dlPoll = setInterval(async () => {
+    try {
+      const j = await api(`/api/model/download/${dlResolved.repo}`);
+      $("#dl-progress .bar span").style.width = `${j.pct}%`;
+      $("#dl-progress-text").textContent =
+        `${j.status} · ${j.downloaded_gb} / ${j.total_gb || "?"} GB (${j.pct}%) · ${j.elapsed_s}s`;
+      if (j.status === "done") {
+        clearInterval(dlPoll);
+        $("#dl-progress-text").innerHTML =
+          `<span class="ok">downloaded.</span> Restart the generator to serve it: ` +
+          `<code>lara serve-llm --model ${escapeHtml(j.repo)}</code>`;
+        loadModels();
+      } else if (j.status === "error") {
+        clearInterval(dlPoll);
+        $("#dl-progress-text").innerHTML = `<span class="bad">${escapeHtml(j.error || "failed")}</span>`;
+      }
+    } catch { clearInterval(dlPoll); }
+  }, 1500);
+});
+
+/* The picker doubles as the entry point: a sentinel option opens the dialog, so there is
+ * no separate button competing for space in the top bar. */
+const DL_SENTINEL = "__download__";
+
+async function loadModels() {
+  try {
+    const m = await api("/api/models");
+    const live = new Set(m.loaded?.length ? m.loaded : [m.configured_default].filter(Boolean));
+    const opts = m.models.map((x) =>
+      `<option value="${x.repo}"${live.has(x.repo) ? " selected" : ""}>` +
+      `${x.repo} (${x.size_gb}GB)${live.has(x.repo) ? " — loaded" : " — not loaded"}</option>`);
+    opts.push(`<option value="${DL_SENTINEL}">＋ Download new model…</option>`);
+    state.models = m.models;
+    $("#model").innerHTML = opts.join("");
+    syncQuant();
+  } catch { /* picker is optional for browsing */ }
+}
+
+$("#model").addEventListener("change", (ev) => {
+  if (ev.target.value === DL_SENTINEL) {
+    // Restore the previous selection so the sentinel never becomes the active model.
+    ev.target.value = state.models.find((x) => x.loaded)?.repo || state.models[0]?.repo || "";
+    openDownloadModal();
+  }
+  syncQuant();
+});

@@ -23,6 +23,27 @@
   <label>model <select id="model"><option value="">(loading)</option></select></label>
   <label>quant <select id="quant"></select></label>
   <button type="button" id="adv-btn" title="Advanced settings">⚙</button>
+  <div id="dl-modal" hidden>
+    <div class="dl-box">
+      <h4>Download a model from Hugging Face</h4>
+      <p class="adv-note" id="dl-device"></p>
+      <form id="dl-form">
+        <input id="dl-repo" type="text" spellcheck="false" autocomplete="off"
+               placeholder="owner/name — e.g. Qwen/Qwen3-8B, or paste a HF URL">
+        <button type="submit" id="dl-check">Check</button>
+      </form>
+      <div id="dl-info"></div>
+      <div id="dl-progress" hidden>
+        <div class="bar"><span></span></div>
+        <p class="adv-note" id="dl-progress-text"></p>
+      </div>
+      <div class="dl-actions">
+        <button type="button" id="dl-start" hidden>Download</button>
+        <button type="button" id="dl-close">Close</button>
+      </div>
+    </div>
+  </div>
+
   <div id="advanced" hidden>
     <h4>Advanced</h4>
     <label class="adv">passage heatmap
