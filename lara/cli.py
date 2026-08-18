@@ -779,6 +779,241 @@ def embed_papers(
         conn.close()
 
 
+def _probe_generators(timeout: float = 0.6) -> list[tuple[str, str]]:
+    """Look for an already-running OpenAI-compatible server.
+
+    Many people already have Ollama or LM Studio going, and asking them to re-download a
+    model they have is the fastest way to lose them. Probed in the order a local setup is
+    most likely to be using.
+    """
+    import httpx
+
+    found = []
+    for name, url in (("vLLM", "http://127.0.0.1:8000/v1"),
+                      ("Ollama", "http://127.0.0.1:11434/v1"),
+                      ("LM Studio", "http://127.0.0.1:1234/v1"),
+                      ("llama.cpp", "http://127.0.0.1:8080/v1")):
+        try:
+            r = httpx.get(f"{url}/models", timeout=timeout)
+            if r.status_code == 200:
+                ids = [m.get("id", "?") for m in (r.json().get("data") or [])]
+                found.append((f"{name} ({', '.join(ids[:2]) or 'no models listed'})",
+                              url, ids[0] if ids else None))
+        except Exception:
+            continue
+    return found
+
+
+@app.command()
+def setup(
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    non_interactive: bool = typer.Option(False, "--non-interactive",
+                                         help="Accept every recommendation"),
+    prefer: str = typer.Option("balanced", help="balanced | speed | memory"),
+    show: bool = typer.Option(False, "--show", help="Print the plan without writing"),
+) -> None:
+    """Configure this machine and write config.local.yaml.
+
+    Detects the hardware, plans a tier-1 index that fits it, lets you pick a generator,
+    and saves the result. The server reads that file on every start.
+    """
+    from lara import setup as SU
+    from lara.index.vectors import VectorStore
+    from lara.serve import devices as DV
+
+    cfg = config_mod.load(config)
+    device = DV.detect()
+    ecfg = cfg.get_in("embedding")
+
+    # ── 1. what is this machine ────────────────────────────────────────────────
+    console.print("\n[bold]1. Hardware[/bold]")
+    t = Table(show_header=False, box=None, padding=(0, 2))
+    t.add_row("platform", f"{device.system} / {device.machine}")
+    t.add_row("accelerator", f"{device.accelerator}"
+                             + (f" — {', '.join(g['name'] for g in device.gpus)}"
+                                if device.gpus else ""))
+    t.add_row("memory", f"{device.total_ram_gb:.0f} GB RAM"
+                        + (f", {device.total_vram_gb:.0f} GB VRAM" if device.total_vram_gb
+                           else " (unified)" if device.unified_memory else ""))
+    t.add_row("index budget", f"{device.single_device_gb:.0f} GB"
+                          + (f" (largest of {len(device.gpus)} GPUs; the index is not sharded)"
+                             if len(device.gpus) > 1 else ""))
+    t.add_row("generator budget", f"{device.budget_gb:.0f} GB"
+                              + (" across all GPUs" if len(device.gpus) > 1 else ""))
+    t.add_row("generator backend", f"{device.backend} — {device.backend_reason}")
+    console.print(t)
+    for n in device.notes:
+        console.print(f"  [dim]{n}[/dim]")
+
+    # ── 2. corpus ──────────────────────────────────────────────────────────────
+    store = VectorStore(
+        cfg.get_path("paths.vectors_fp16"), cfg.get_path("paths.vectors_int8"),
+        dim_full=int(ecfg["dim_full"]), dim_trunc=int(ecfg["dim_truncated"]),
+    )
+    have = store.rows()
+    n_chunks = have or SU.REFERENCE_CHUNKS
+    console.print("\n[bold]2. Corpus[/bold]")
+    if have:
+        console.print(f"  {have:,} vectors present")
+    else:
+        console.print(f"  [yellow]no vectors yet[/yellow] — planning against the published "
+                      f"corpus ({SU.REFERENCE_CHUNKS:,} chunks). "
+                      f"Fetch it with `lara dataset fetch`.")
+
+    # ── 3. retrieval ───────────────────────────────────────────────────────────
+    plan = SU.plan_index(
+        device, n_chunks, int(ecfg["dim_truncated"]),
+        hot_tier_bytes=int(cfg.get_in("hot_tier.max_bytes", 2_000_000_000)),
+        cross_encoder=bool(cfg.get_in("index.rerank.cross_encoder.enabled", True)),
+        prefer=prefer,
+    )
+    console.print("\n[bold]3. Retrieval backend[/bold]")
+    t = Table(show_header=True, header_style="bold")
+    for c, j in (("", "left"), ("option", "left"), ("index", "right"), ("+models", "right"),
+                 ("p50", "right"), ("recall", "right"), ("note", "left")):
+        t.add_column(c, justify=j, overflow="fold")
+    for opt, total, ok in plan.alternatives:
+        mark = "→" if opt.key == plan.option.key else ("" if ok else "✗")
+        style = "green" if opt.key == plan.option.key else ("" if ok else "dim")
+        t.add_row(mark, f"[{style}]{opt.label}[/{style}]" if style else opt.label,
+                  f"{opt.index_gb(n_chunks, plan.dim):.1f} GB", f"{total:.1f} GB",
+                  f"{opt.p50_ms:.1f}ms", f"{opt.recall:.3f}", opt.note)
+    console.print(t)
+    console.print(f"  [dim]✗ = does not fit the {plan.budget_gb:.0f} GB budget. "
+                  f"Measured with `lara bench-index`.[/dim]")
+
+    chosen = plan.option
+    if not non_interactive and not show:
+        keys = [o.key for o, _, _ in plan.alternatives]
+        pick = typer.prompt(f"\n  backend [{'/'.join(keys)}]", default=plan.option.key)
+        chosen = SU.OPTIONS_BY_KEY.get(pick, plan.option)
+        plan.option = chosen
+
+    # ── 4. scoping ─────────────────────────────────────────────────────────────
+    console.print("\n[bold]4. Corpus residency[/bold]")
+    for r in plan.reasons:
+        console.print(f"  {r}")
+    topics: list[str] = []
+    if plan.scope == "unnecessary":
+        console.print("  [green]Topic scoping not needed[/green] — keeping the whole "
+                      "corpus resident.")
+    else:
+        colour = "red" if plan.scope == "required" else "yellow"
+        console.print(
+            f"  [{colour}]Topic scoping {plan.scope}[/{colour}]. Keeping the top "
+            f"{plan.scope_keep:.0%} of papers by relevance to your interests would use "
+            f"[bold]{plan.scoped_index_gb:.1f} GB[/bold] instead of {plan.index_gb:.1f} GB "
+            f"({plan.scoped_chunks:,} chunks).")
+        console.print("  [dim]Nothing is deleted: dropped papers stay searchable through "
+                      "BM25 and open normally. Only their dense vectors leave RAM.[/dim]")
+        if not non_interactive and not show:
+            while True:
+                topic = typer.prompt("  topic to keep (blank when done)", default="",
+                                     show_default=False)
+                if not topic.strip():
+                    break
+                topics.append(topic.strip())
+
+    # ── 5. generator ───────────────────────────────────────────────────────────
+    console.print("\n[bold]5. Generator[/bold]")
+    running = _probe_generators()
+    for label, url, _ in running:
+        console.print(f"  [green]found running[/green] {label} at {url}")
+
+    model = quant = base_url = None
+    if running and not non_interactive and not show:
+        if typer.confirm(f"  use {running[0][0]}?", default=True):
+            base_url, model = running[0][1], running[0][2]
+    elif running:
+        # --show previews what --non-interactive would do, so it must make the same choice.
+        base_url, model = running[0][1], running[0][2]
+        console.print(f"  [dim]would use {base_url}"
+                      + (f" serving {model}" if model else "") + "[/dim]")
+
+    if not base_url:
+        cached = [m for m in models_mod.scan(cfg.get_path("huggingface.home")) if m.servable]
+        fitting = [m for m in cached if DV.fits(m.size_gb, device)["fits"]]
+        if not cached:
+            console.print("  [yellow]no servable model in the HF cache[/yellow] — "
+                          "download one from the reader UI, or run Ollama / LM Studio "
+                          "and re-run setup.")
+        else:
+            t = Table(show_header=True, header_style="bold")
+            t.add_column("GB", justify="right"); t.add_column("repo")
+            t.add_column("fits?", justify="left")
+            for m in sorted(cached, key=lambda m: m.size_gb)[:12]:
+                f = DV.fits(m.size_gb, device)
+                t.add_row(f"{m.size_gb:.1f}", m.repo,
+                          f"[green]yes[/green] ({f['margin_gb']:.0f} GB spare)" if f["fits"]
+                          else f"[red]no[/red] (needs {f['needed_gb']:.0f} of "
+                               f"{f['budget_gb']:.0f} GB {f['where']})")
+            console.print(t)
+            if fitting and not non_interactive and not show:
+                model = typer.prompt("  model repo (blank to skip)",
+                                     default=fitting[-1].repo, show_default=True) or None
+            elif fitting and non_interactive:
+                model = fitting[-1].repo
+            if model:
+                m = next((x for x in cached if x.repo == model), None)
+                if m and m.runtime_quant_options():
+                    quant = m.runtime_quant_options()[0]
+
+    # ── 6. write ───────────────────────────────────────────────────────────────
+    overrides = SU.overrides_for(
+        plan, model=model, quantization=quant, base_url=base_url,
+        disk_root=str(cfg.get_path("disk.root")),
+        devices=[int(g) for g in range(len(device.gpus))] if device.gpus else "auto",
+    )
+    # Pin the filesystem the corpus actually lives on. Detectable, and the check that
+    # catches a symlink quietly redirecting 30 GB onto the wrong disk.
+    backing = preflight_mod._device_for(cfg.get_path("disk.root"))
+    if backing and backing != "unknown":
+        overrides.setdefault("disk", {})["required_device"] = backing
+
+    # Carry over anything the wizard does not manage — notably hand-written disk safety
+    # pins, which it cannot derive and must not silently drop.
+    import yaml as _yaml
+    existing = {}
+    if config_mod.LOCAL_CONFIG.exists():
+        existing = _yaml.safe_load(config_mod.LOCAL_CONFIG.read_text()) or {}
+
+    if show:
+        console.print("\n[bold]config.local.yaml would be:[/bold]\n")
+        console.print(SU.render(config_mod.deep_merge(existing, overrides), device, plan))
+        kept = SU.carry_forward(existing, overrides)
+        if kept:
+            console.print(f"[dim]({', '.join(kept)} carried over from the existing "
+                          f"file)[/dim]")
+        return
+
+    path, backup, kept = SU.write_local(config_mod.LOCAL_CONFIG, overrides, device, plan,
+                                        existing=existing)
+    console.print(f"\n[green]wrote[/green] {path}")
+    if backup:
+        console.print(f"  [dim]previous version saved as {backup.name}[/dim]")
+    if kept:
+        console.print(f"  [dim]kept your existing {', '.join(kept)}[/dim]")
+
+    checks, ok = preflight_mod.run(config_mod.load())
+    bad = [c for c in checks if not c.ok]
+    console.print(f"\npreflight: [{'green' if ok else 'red'}]"
+                  f"{'passed' if ok else 'FAILED'}[/{'green' if ok else 'red'}]")
+    for c in bad:
+        console.print(f"  [red]{c.name}[/red]: {c.detail}")
+
+    console.print("\n[bold]next[/bold]")
+    if not have:
+        console.print("  lara dataset fetch <source>        # get the corpus")
+    if topics:
+        args = " ".join(f'-t \"{t}\"' for t in topics)
+        console.print(f"  lara corpus scope {args} --keep {plan.scope_keep} --preview")
+        console.print("  [dim]…then re-run with --apply once the cut looks right[/dim]")
+    elif plan.scope != "unnecessary":
+        console.print('  lara corpus scope -t "<your topic>" '
+                      f'--keep {plan.scope_keep} --preview')
+    console.print("  lara serve                         # start the reader")
+
+
 @app.command("bench-index")
 def bench_index(
     config: str = typer.Option(None, help="Path to config.yaml"),

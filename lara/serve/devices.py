@@ -38,9 +38,26 @@ class Device:
 
     @property
     def budget_gb(self) -> float:
-        """Memory a generator may use: VRAM on discrete GPUs, shared RAM if unified."""
+        """Memory a generator may use: VRAM on discrete GPUs, shared RAM if unified.
+
+        This is the *aggregate*, which is right for a generator — vLLM can shard one model
+        across cards with tensor parallelism. It is wrong for anything that lives on a
+        single device; use :attr:`single_device_gb` for that.
+        """
         return self.total_vram_gb if (self.total_vram_gb and not self.unified_memory) \
             else self.usable_ram_gb
+
+    @property
+    def single_device_gb(self) -> float:
+        """Memory available to one device — the budget for the tier-1 index.
+
+        The index is a single tensor on a single card; it is not sharded. Planning it
+        against the sum of three GPUs would report 287 GB of headroom on a machine where
+        no individual card has more than 96 GB.
+        """
+        if self.gpus and not self.unified_memory:
+            return max(g["vram_gb"] for g in self.gpus)
+        return self.usable_ram_gb
 
 
 def _total_ram_gb() -> float:
