@@ -140,10 +140,19 @@ def embed_queries(model, queries: list[str], dim_trunc: int | None = None) -> np
     return vecs
 
 
-def pending_chunks(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
-    """Chunks with no vector yet, joined to the context their prefix needs."""
+def pending_chunks(
+    conn: sqlite3.Connection, limit: int, only_paper: str | None = None
+) -> list[sqlite3.Row]:
+    """Chunks with no vector yet, joined to the context their prefix needs.
+
+    ``only_paper`` restricts to one paper. The on-demand fetch path needs it: without a
+    filter it drains the entire backlog — a single paper's 62 chunks became a two-minute
+    request because 1.5M crawled chunks were queued behind them.
+    """
+    where = "c.vector_row IS NULL" + (" AND c.arxiv_id = ?" if only_paper else "")
+    params: tuple = (only_paper, limit) if only_paper else (limit,)
     return conn.execute(
-        """
+        f"""
         SELECT c.chunk_id, c.text, p.title AS paper_title, s.title AS section_title
         FROM chunks c
         JOIN papers p ON p.arxiv_id = c.arxiv_id
@@ -151,11 +160,11 @@ def pending_chunks(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
                ON s.arxiv_id = c.arxiv_id
               AND s.version  = c.version
               AND s.anchor   = c.section_anchor
-        WHERE c.vector_row IS NULL
+        WHERE {where}
         ORDER BY c.chunk_id
         LIMIT ?
         """,
-        (limit,),
+        params,
     ).fetchall()
 
 
@@ -168,6 +177,7 @@ def run(
     slice_size: int = 8192,
     limit: int = 0,
     progress: Iterator | None = None,
+    only_paper: str | None = None,
 ) -> dict[str, int | float]:
     """Embed all pending chunks. Resumable; each slice is durable before the next starts."""
     stats: dict[str, int | float] = {"chunks": 0, "slices": 0, "seconds": 0.0}
@@ -176,7 +186,7 @@ def run(
     while True:
         if limit and stats["chunks"] >= limit:
             break
-        rows = pending_chunks(conn, slice_size)
+        rows = pending_chunks(conn, slice_size, only_paper)
         if not rows:
             break
         if limit:

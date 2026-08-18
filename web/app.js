@@ -56,9 +56,14 @@ async function openPaper(id, fragment, push = true) {
     if (data.html) {
       $("#paper").innerHTML = data.html;
     } else {
+      // Most of the corpus has not been crawled yet, so opening such a paper used to
+      // show a near-empty pane and look broken. Fetch it now and show the abstract in
+      // the meantime.
       $("#paper").innerHTML =
-        `<p class="placeholder">Full text not fetched yet (status: ${data.fulltext_status}).</p>
-         <h3>Abstract</h3><p>${escapeHtml(data.abstract || "")}</p>`;
+        `<div class="fetching"><span class="spin"></span>
+           Fetching full text from arXiv…</div>
+         <h3>Abstract</h3><p>${escapeHtml(data.abstract || "(no abstract)")}</p>`;
+      fetchFullText(data.arxiv_id);
     }
     // pushState, not replaceState: the previous version overwrote the current entry, so
     // Back never had anywhere to go. Papers and searches are both real destinations.
@@ -71,6 +76,30 @@ async function openPaper(id, fragment, push = true) {
     if (fragment) scrollToAnchor(fragment);
   } catch (err) {
     setStatus(String(err.message || err), "error");
+  }
+}
+
+async function fetchFullText(id) {
+  try {
+    const r = await fetch(`/api/fetch/${encodeURIComponent(id)}`, { method: "POST" });
+    const d = await r.json();
+    if (d.status === "ok") {
+      const fresh = await api(`/api/paper/${encodeURIComponent(id)}`);
+      if (state.paper === id && fresh.html) {
+        $("#paper").innerHTML = fresh.html;
+        setStatus(`fetched ${d.chunks || fresh.n_chunks} chunks via ${d.source || "cache"}`);
+      }
+    } else if (d.status === "in_progress") {
+      setTimeout(() => fetchFullText(id), 2500);
+    } else {
+      const el = $("#paper").querySelector(".fetching");
+      if (el) el.innerHTML =
+        `Full text unavailable (${escapeHtml(d.status || "failed")}). ` +
+        `<a href="https://arxiv.org/abs/${id}" target="_blank" rel="noopener">Open on arXiv</a>`;
+    }
+  } catch (err) {
+    const el = $("#paper").querySelector(".fetching");
+    if (el) el.textContent = "Could not fetch full text.";
   }
 }
 
@@ -756,20 +785,25 @@ function graphHeight(n) {
 function layoutSearchGraph(width) {
   const nodes = searchData.results;
   if (!nodes.length) return [];
-  const times = nodes.map((n) => Date.parse(n.submitted || "") || 0).filter(Boolean);
-  const tMin = Math.min(...times), tMax = Math.max(...times);
-  const span = Math.max(tMax - tMin, 1);
-  // Reserve the right half for labels; dates compress into the left.
+  // Even spacing by chronological RANK, not proportional to elapsed time. Real corpora
+  // bunch heavily — a topic can have fifteen papers in one month and one from four years
+  // earlier — and a proportional axis collapses the cluster into an unreadable smear at
+  // one edge. Rank spacing keeps order and adjacency truthful while guaranteeing every
+  // node is separated. The year ticks still label absolute time.
+  const order = [...nodes]
+    .map((n, i) => ({ i, t: Date.parse(n.submitted || "") || 0 }))
+    .sort((a, b) => a.t - b.t);
+  const xRank = new Array(nodes.length);
+  order.forEach((o, rank) => { xRank[o.i] = rank; });
+
   const plotW = Math.max(120, width * 0.42 - PAD_L);
-  return nodes.map((n, i) => {
-    const t = Date.parse(n.submitted || "") || tMin;
-    return {
-      ...n,
-      x: PAD_L + ((t - tMin) / span) * plotW,
-      y: PAD_T + i * ROW_H + ROW_H / 2,
-      radius: 4.5 + Math.min(n.in_degree, 6) * 1.5,
-    };
-  });
+  const denom = Math.max(nodes.length - 1, 1);
+  return nodes.map((n, i) => ({
+    ...n,
+    x: PAD_L + (xRank[i] / denom) * plotW,
+    y: PAD_T + i * ROW_H + ROW_H / 2,
+    radius: 4.5 + Math.min(n.in_degree, 6) * 1.5,
+  }));
 }
 
 function drawSearchGraph() {

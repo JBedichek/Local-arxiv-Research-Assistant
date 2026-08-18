@@ -80,7 +80,8 @@ ingest:
     # Q6: Semantic Scholar, unauthenticated to start. Verified working 2026-08-17.
     provider: semanticscholar
     batch_endpoint: https://api.semanticscholar.org/graph/v1/paper/batch
-    batch_size: 500                      # 330k papers ≈ 660 requests
+    batch_size: 500                      # 377k papers ≈ 755 requests
+    min_interval_sec: 1.1                # unauthenticated tier is a shared pool
     api_key_env: S2_API_KEY              # optional; set it if we ever get throttled
     fallback: openalex
 

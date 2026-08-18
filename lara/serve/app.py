@@ -303,6 +303,84 @@ def search_papers(req: SearchRequest) -> JSONResponse:
     })
 
 
+_fetching: set[str] = set()
+
+
+@app.post("/api/fetch/{arxiv_id:path}")
+async def fetch_fulltext(arxiv_id: str) -> JSONResponse:
+    """Crawl, parse and index one paper on demand (D2's lazy fetch).
+
+    The plan always said full text would be fetched when a paper is opened; until now it
+    only ever arrived via the background crawler, so opening any of the ~84% not yet
+    crawled showed an all-but-empty pane. Roughly a third of search results are in that
+    state, including top hits.
+
+    New chunks are embedded immediately, so the paper becomes searchable in the same
+    breath — otherwise it would sit unretrievable until the next bulk embed run.
+    """
+    import asyncio
+
+    from lara.index import embed as emb
+    from lara.ingest import fulltext as ft
+    from lara.store import db
+
+    s = _state()
+    row = s.paper(arxiv_id)
+    if row is None:
+        raise HTTPException(404, f"{arxiv_id} not in corpus")
+    if row["fulltext_status"] == "ok":
+        return JSONResponse({"status": "ok", "cached": True})
+    if arxiv_id in _fetching:
+        # Opening the same paper twice must not start two crawls of it.
+        return JSONResponse({"status": "in_progress"})
+
+    _fetching.add(arxiv_id)
+    try:
+        fcfg = s.cfg.get_in("ingest.fulltext")
+        fetcher = ft.FullTextFetcher(
+            user_agent=fcfg["user_agent"], rate_per_sec=float(fcfg.get("rate_per_sec", 3)),
+            max_concurrency=3, raw_root=s.cfg.get_path("paths.raw_cache"),
+        )
+        try:
+            version = row["latest_version"] or 1
+            result = await fetcher.fetch(arxiv_id, version, list(fcfg.get("sources", [])))
+        finally:
+            await fetcher.close()
+
+        if result.status != "ok" or result.parsed is None:
+            def mark():
+                conn = db.connect(s.db_path)
+                try:
+                    ft.persist(conn, result)
+                finally:
+                    conn.close()
+            await run_in_threadpool(mark)
+            return JSONResponse({"status": result.status, "error": result.error}, status_code=502)
+
+        def store_and_embed() -> int:
+            conn = db.connect(s.db_path)
+            try:
+                if result.raw and result.source:
+                    fetcher.write_raw(arxiv_id, result.source, result.raw)
+                n = ft.persist(conn, result)
+                # Just this paper's chunks — an unfiltered run would drain the whole
+                # crawl backlog and turn one click into a multi-minute request.
+                emb.run(conn, s.store, s.retriever.embedder, batch_size=128,
+                        slice_size=4096, only_paper=arxiv_id)
+                return n
+            finally:
+                conn.close()
+
+        n_chunks = await run_in_threadpool(store_and_embed)
+        await run_in_threadpool(s.retriever.refresh_row_map)
+        papers_mod.render.cache_clear()
+        return JSONResponse({
+            "status": "ok", "cached": False, "chunks": n_chunks, "source": result.source,
+        })
+    finally:
+        _fetching.discard(arxiv_id)
+
+
 @app.post("/api/reload")
 def reload_index() -> JSONResponse:
     """Pick up vectors added since startup.

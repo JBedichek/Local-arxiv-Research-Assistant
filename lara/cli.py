@@ -376,6 +376,43 @@ def search(
     conn.close()
 
 
+@app.command()
+def citations(
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    limit: int = typer.Option(0, help="Stop after N papers (0 = drain)"),
+) -> None:
+    """Enrich the citation graph from Semantic Scholar. Resumable per batch."""
+    from lara.ingest import citations as cit
+    from lara.store import db
+
+    cfg = config_mod.load(config)
+    conn = db.connect(cfg.get_path("paths.metadata_db"))
+    todo = conn.execute(
+        "SELECT COUNT(*) FROM papers WHERE in_scope=1 AND deleted=0 AND s2_status='pending'"
+    ).fetchone()[0]
+    have = conn.execute("SELECT COUNT(*) FROM citations").fetchone()[0]
+    console.print(f"[bold]{todo:,}[/bold] papers pending · {have:,} edges already")
+
+    def reporter():
+        while True:
+            s = yield
+            console.print(
+                f"  batch {s.batches:>5}  papers {s.papers:,}  +{s.edges:,} edges  "
+                f"missing {s.missing:,}  retries {s.retries}  errors {s.errors}"
+            )
+
+    p = reporter()
+    next(p)
+    try:
+        stats = cit.run(conn, cfg, limit=limit, progress=p)
+        console.print(
+            f"[green]enriched {stats.papers:,} papers[/green], "
+            f"{stats.edges:,} new edges, {stats.missing:,} unknown to S2"
+        )
+    finally:
+        conn.close()
+
+
 @app.command("embed-papers")
 def embed_papers(
     config: str = typer.Option(None, help="Path to config.yaml"),

@@ -267,3 +267,11 @@ label.breadth { flex-direction: column; align-items: flex-start !important; gap:
 label.breadth .cap { font-size: 10px; text-transform: uppercase; letter-spacing: .07em; opacity: .8; }
 label.breadth #breadth-val { font-size: 11.5px; min-width: 150px; color: var(--text); }
 label.breadth #breadth-val em { font-style: normal; color: var(--dim); }
+
+.fetching { display: flex; align-items: center; gap: 8px; color: var(--dim);
+  font-size: 13px; padding: 8px 0 12px; }
+.fetching a { color: var(--accent); }
+.spin { width: 12px; height: 12px; border-radius: 50%; flex: none;
+  border: 2px solid var(--line); border-top-color: var(--accent);
+  animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
