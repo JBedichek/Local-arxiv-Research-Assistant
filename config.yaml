@@ -200,6 +200,33 @@ serving:
   # with auth in front. Note vLLM already binds 0.0.0.0:8000 by default.
   host: 127.0.0.1
   port: 8080
+  # Which inference server generates answers, and whether `lara serve` starts it for you.
+  #
+  #   backend: auto    vllm on CUDA, mlx then llama.cpp on Apple Silicon, llama.cpp on CPU
+  #            vllm      HF safetensors. Fastest with a real GPU. No Metal backend.
+  #            llamacpp  GGUF. Runs everywhere, most mature. `brew install llama.cpp`
+  #            mlx       MLX format, Apple Silicon only. `pip install mlx-lm`
+  #            external  you start it yourself; lara only uses base_url
+  #
+  # The three formats are NOT interchangeable, so each backend has its own `model`.
+  # Pointing llama.cpp at a safetensors repo fails at load time.
+  generator:
+    backend: auto
+    autostart: true             # start the server with the reader, stop it on exit
+    startup_timeout_sec: 300
+    llamacpp:
+      model: null               # GGUF, e.g. "Qwen/Qwen3-8B-GGUF:Q4_K_M", or a .gguf path
+      ctx_size: 32768
+      n_gpu_layers: 999         # offload everything; ignored on CPU-only builds
+      parallel: 2
+      flash_attn: true
+      cache_reuse: 256          # prefix reuse — what keeps follow-ups on one paper fast
+      cache_type_k: null        # e.g. q8_0 to shrink the KV cache
+      cache_type_v: null
+      extra_args: []
+    mlx:
+      model: null               # e.g. "mlx-community/Qwen3-8B-4bit"
+      extra_args: []
   vllm:
     # D4: GGUF ignored, vLLM only. Q4: rare switching — one model resident at a time.
     base_url: http://127.0.0.1:8000/v1

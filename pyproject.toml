@@ -12,42 +12,60 @@ license = { text = "MIT" }
 authors = [{ name = "J. Bedichek" }]
 
 dependencies = [
+  # Base = what it takes to SEARCH and READ a corpus that already exists. Anything only
+  # needed to BUILD one lives in the `ingest` extra, and anything platform-specific in
+  # `mac` / `cuda` / `cpu`. Most people download the corpus and never build one.
+  #
+  # Five packages were declared here and imported nowhere: pyarrow (159 MB), openai,
+  # tenacity, pydantic-settings and sse-starlette. Removed rather than left to age.
+  #
   # config / CLI
   "pydantic>=2.9",
-  "pydantic-settings>=2.5",
   "pyyaml>=6.0",
   "typer>=0.12",
   "rich>=13.9",
-  # ingest
+  # http — the reader talks to the generator over plain OpenAI-compatible HTTP
   "httpx[http2]>=0.27",
-  "aiolimiter>=1.1",
-  "tenacity>=9.0",
+  # reading papers: lxml renders the cached LaTeXML, zstandard decompresses it
   "lxml>=5.3",
-  "pymupdf>=1.24",          # PDF fallback when no LaTeXML rendering exists
-  # storage
-  "numpy>=2.1",
-  "pyarrow>=17.0",
   "zstandard>=0.23",
-  # embedding
-  "huggingface-hub>=0.26",   # dataset pull; also a transitive dep of the two below
+  # embedding and search
+  "numpy>=2.1",
+  "huggingface-hub>=0.26",
   "sentence-transformers>=5.0",
   "transformers>=4.55",
   "torch>=2.7",
   # serving
   "fastapi>=0.115",
   "uvicorn[standard]>=0.32",
-  "sse-starlette>=2.1",
-  "openai>=1.54",           # client for vLLM's OpenAI-compatible server
 ]
 
 [project.optional-dependencies]
-# ANN index. Pick exactly one to match your CUDA situation.
-#   faiss-cpu       — works anywhere, fine for the warm tier at our scale
-#   faiss-gpu-cu12  — what is already in the Learned-Data-Selection venv
+# ── pick ONE platform extra ───────────────────────────────────────────────────
+# Apple Silicon. mlx-lm is the fastest generator on this hardware and is marked so it
+# cannot be pulled onto a machine that has no Metal to run it on.
+mac = [
+  "faiss-cpu>=1.9",
+  "mlx-lm>=0.20; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+# NVIDIA. faiss-gpu-cu12 carries its own CUDA runtime, so only install it if you have one.
+cuda = ["faiss-gpu-cu12>=1.9"]
+# Linux/Windows without a GPU.
+#
+# NOTE: `pip install torch` from PyPI drags in ~5.4 GB of CUDA runtime wheels even on a
+# machine with no NVIDIA card. To avoid that, install torch from the CPU index first:
+#     pip install torch --index-url https://download.pytorch.org/whl/cpu
+#     pip install -e '.[cpu]'
+# macOS is unaffected: the arm64 wheels have no CUDA payload.
 cpu = ["faiss-cpu>=1.9"]
-gpu = ["faiss-gpu-cu12>=1.9"]
-# vLLM is heavy and CUDA-version-sensitive; install separately in most setups.
-serve = ["vllm>=0.10"]
+
+# ── optional capabilities ─────────────────────────────────────────────────────
+# Building a corpus from scratch: crawling, PDF fallback, rate limiting. Not needed if
+# you downloaded one with `lara dataset pull`.
+ingest = ["aiolimiter>=1.1", "pymupdf>=1.24"]
+# Generation backends. llama.cpp is a binary, not a package — `brew install llama.cpp`.
+vllm = ["vllm>=0.10; sys_platform == 'linux'"]
+serve = ["vllm>=0.10; sys_platform == 'linux'"]   # legacy alias for `vllm`
 dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.7", "mypy>=1.13"]
 
 [project.scripts]

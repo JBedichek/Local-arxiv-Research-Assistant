@@ -18,7 +18,7 @@ git clone https://github.com/JBedichek/Local-arxiv-Research-Assistant.git
 cd Local-arxiv-Research-Assistant
 
 python3 -m venv .venv && source .venv/bin/activate      # Windows: .venv\Scripts\activate
-pip install -e '.[cpu]'                                 # see step 2 for the GPU variant
+pip install -e '.[mac]'                                 # or '.[cuda]' / '.[cpu]' — see step 2
 
 lara dataset pull --tiers core                          # ~51 GB, resumable, no account
 lara setup                                              # interactive; writes config.local.yaml
@@ -48,40 +48,67 @@ cd Local-arxiv-Research-Assistant
 python3 -m venv .venv && source .venv/bin/activate
 ```
 
-Pick the extra that matches your hardware:
+Pick exactly one platform extra:
 
 ```bash
-pip install -e '.[cpu]'      # macOS, or any machine without an NVIDIA GPU
-pip install -e '.[gpu]'      # NVIDIA, CUDA 12
+pip install -e '.[mac]'      # Apple Silicon — adds faiss-cpu and mlx-lm
+pip install -e '.[cuda]'     # NVIDIA, CUDA 12
+pip install -e '.[cpu]'      # Linux/Windows with no GPU
 ```
 
-The only difference is which faiss build comes along. **Both work everywhere** — the default
-search backend is a plain torch matmul, and faiss is an opt-in alternative (step 4). If you
-are unsure, `[cpu]` is the safe choice.
+**Linux/Windows without a GPU: install torch from the CPU index first.** PyPI's default
+torch wheel drags in **~5.4 GB of CUDA runtime libraries** that a machine with no NVIDIA
+card can never use:
+
+```bash
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install -e '.[cpu]'
+```
+
+macOS is unaffected — the arm64 wheels carry no CUDA payload.
+
+Optional extras, only if you need them:
+
+```bash
+pip install -e '.[ingest]'   # crawling and PDF parsing — only to BUILD a corpus
+pip install -e '.[vllm]'     # NVIDIA generation backend; large and CUDA-version-sensitive
+```
+
+The base install is deliberately just what it takes to **search and read** a corpus that
+already exists, which is what most people do.
 
 ### Generating answers
 
-Retrieval works immediately after step 3. To get written answers you also need a local LLM
-server. This is the one place the platform matters:
+Retrieval works immediately after step 3. Written answers need an inference server, and
+**`lara serve` starts and stops it for you** — you do not run it by hand.
 
-**NVIDIA** — vLLM, installed separately because it is large and CUDA-version-sensitive:
+| backend | platform | model format | install |
+|---|---|---|---|
+| **vLLM** | NVIDIA | HF safetensors | `pip install -e '.[vllm]'` |
+| **MLX** | Apple Silicon only | `mlx-community/*` | comes with `'.[mac]'` |
+| **llama.cpp** | anywhere | GGUF | `brew install llama.cpp` |
+| external | anywhere | whatever it serves | run Ollama/LM Studio yourself |
+
+**vLLM has no Metal backend** — on a Mac it runs CPU-only and leaves the GPU idle. That is
+why Apple Silicon gets two purpose-built options instead.
+
+**On a Mac, try both.** MLX uses unified memory directly and is often faster; llama.cpp is
+more mature and has richer KV-cache options. Compare them on your own hardware:
 
 ```bash
-pip install vllm
-lara serve-llm                       # reads your configured model
+lara backends                            # what is installed, and what would be used
+lara serve-llm --backend mlx             # then, in another shell:
+lara bench-generate                      # median TTFT and tok/s
+lara serve-llm --backend llamacpp
+lara bench-generate
 ```
 
-**Apple Silicon** — vLLM has no Metal backend; on a Mac it would run CPU-only and leave the
-GPU idle. Use any Metal-accelerated runtime that speaks the OpenAI API:
+> **The three formats are not interchangeable.** A repo vLLM serves is not a GGUF file and
+> is not MLX-converted, so each backend has its own `model` setting in `config.local.yaml`.
+> Pointing llama.cpp at a safetensors repo fails at load time.
 
-```bash
-brew install llama.cpp
-llama-server -hf Qwen/Qwen3-8B-GGUF --port 8000
-```
-
-Ollama and LM Studio work equally well. **You do not need to configure this** — step 4 probes
-the usual ports and adopts whatever it finds. Prefer GGUF builds on a Mac; that is what the
-Metal kernels are tuned for.
+If you already run Ollama or LM Studio, do nothing: the wizard probes the usual ports and
+adopts whatever is already answering. A server lara did not start is never stopped by it.
 
 ---
 
@@ -195,9 +222,14 @@ it, and keeps the whole corpus.
 ## 5. Start
 
 ```bash
-lara serve                        # http://127.0.0.1:8080
+lara serve                        # starts the generator too, then the reader on :8080
+lara serve --no-llm               # retrieval only; skip the generator
 lara serve --host 0.0.0.0         # reachable from your network — read the warning below
 ```
+
+The generation server starts alongside the reader and is shut down with it. If one is
+already running, lara adopts it and leaves it alone on exit — it may be shared with
+something else, and that is not the reader's call to make.
 
 Open a paper by arXiv id, or type anything else to search. Highlight a passage and click
 **Ask about this** for the core interaction.

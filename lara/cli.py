@@ -1429,8 +1429,14 @@ def serve(
     config: str = typer.Option(None, help="Path to config.yaml"),
     host: str = typer.Option(None),
     port: int = typer.Option(None),
+    no_llm: bool = typer.Option(False, "--no-llm",
+                                help="Do not start a generator; retrieval only"),
 ) -> None:
-    """Run the reader server. Models load once at startup, before the first request."""
+    """Run the reader server, starting the generation backend alongside it.
+
+    The generator is stopped when the reader exits, unless it was already running, in
+    which case it is adopted and left alone.
+    """
     import os
 
     import uvicorn
@@ -1440,61 +1446,199 @@ def serve(
         os.environ["LARA_CONFIG"] = config
     host = host or cfg.get_in("serving.host", "127.0.0.1")
     port = port or int(cfg.get_in("serving.port", 8080))
+
+    gen = None
+    if not no_llm and cfg.get_in("serving.generator.autostart", True):
+        from lara.serve import devices as DV
+        from lara.serve import generator as GEN
+
+        gen = GEN.from_config(cfg, DV.detect().accelerator)
+        if gen is None:
+            console.print("[yellow]no generator configured[/yellow] — retrieval will work, "
+                          "answers will not. Run `lara setup` to pick one.")
+        else:
+            gen.start()
+            if gen.adopted:
+                console.print(f"[dim]using the {gen.backend.label} already serving at "
+                              f"{gen.base_url}[/dim]")
+            elif not gen.backend.available():
+                console.print(f"[yellow]{gen.backend.label} is not installed[/yellow] — "
+                              f"{gen.backend.install_hint}. Retrieval works; answers will "
+                              f"not until a generator is running.")
+            elif gen.proc is None:
+                console.print(f"[yellow]{gen.backend.label} is configured but nothing is "
+                              f"running at {gen.base_url}[/yellow]")
+            else:
+                budget = int(cfg.get_in("serving.generator.startup_timeout_sec", 300))
+                console.print(f"starting {gen.backend.label} with {gen.model} "
+                              f"[dim](up to {budget}s; log: {gen.log_path})[/dim]")
+                if gen.wait_ready(timeout=budget):
+                    console.print(f"[green]{gen.backend.label} ready[/green]")
+                else:
+                    console.print(f"[red]{gen.backend.label} did not come up[/red] — "
+                                  f"see {gen.log_path}. Retrieval still works.")
+
     console.print(f"[bold]http://{host}:{port}[/bold]  (warming models — first start is slow)")
-    # One worker: the GPU index, embedder and reranker are process-local and would be
-    # duplicated per worker, tripling VRAM for no throughput gain on a single-user tool.
-    uvicorn.run("lara.serve.app:app", host=host, port=port, workers=1, log_level="info")
+    try:
+        # One worker: the GPU index, embedder and reranker are process-local and would be
+        # duplicated per worker, tripling VRAM for no throughput gain on a single-user tool.
+        uvicorn.run("lara.serve.app:app", host=host, port=port, workers=1, log_level="info")
+    finally:
+        # Only stops what we started. A server that was already running is left alone --
+        # it may be shared with something else, and killing it is not this process's call.
+        if gen is not None and gen.proc is not None:
+            console.print(f"stopping {gen.backend.label}…")
+            gen.stop()
 
 
 @app.command("serve-llm")
 def serve_llm(
     config: str = typer.Option(None, help="Path to config.yaml"),
-    model: str = typer.Option(None, help="Override the model repo"),
+    model: str = typer.Option(None, help="Override the model"),
+    backend: str = typer.Option(None, help="vllm | llamacpp | mlx | external"),
     show: bool = typer.Option(False, "--show", help="Print the command instead of running"),
 ) -> None:
-    """Start vLLM for the selected generator (D4: one model resident at a time)."""
-    import os
-    import subprocess
+    """Start the generation server on its own.
+
+    `lara serve` does this for you; this command exists for running the generator on a
+    different machine, or keeping it up across reader restarts (model loads are slow).
+    """
+    from lara.serve import devices as DV
+    from lara.serve import generator as GEN
 
     cfg = config_mod.load(config)
-    v = cfg.get_in("serving.vllm")
-    repo = model or v["default_model"]
-    port = v["base_url"].rstrip("/").rsplit(":", 1)[-1].split("/")[0]
+    accel = DV.detect().accelerator
+    chosen = GEN.choose(accel, backend or cfg.get_in("serving.generator.backend"))
+    serving = cfg.get_in("serving") or {}
+    merged = {**(serving.get("generator") or {}), "vllm": serving.get("vllm") or {}}
+    repo = model or GEN.model_for(chosen.name, merged)
 
-    # vLLM lives in its own venv. The reader's environment is pinned to torch 2.9.1 /
-    # transformers 4.57 by other projects that share it, which is far too old for recent
-    # checkpoints (Qwen3.8 needs a `qwen3_5` implementation that vLLM 0.14 does not
-    # have). Since vLLM is a separate process reached over HTTP, isolating it costs
-    # nothing and leaves the shared environment untouched.
-    from pathlib import Path as _Path
+    if chosen.name == "external":
+        console.print("backend is [bold]external[/bold] — nothing to start. "
+                      f"lara will use {serving.get('vllm', {}).get('base_url')}")
+        return
+    if not repo:
+        console.print(f"[red]no model configured for {chosen.label}[/red] "
+                      f"({chosen.model_format}). Set serving.generator.{chosen.name}.model "
+                      f"or run `lara setup`.")
+        raise typer.Exit(1)
+    if not chosen.available():
+        console.print(f"[red]{chosen.label} is not installed[/red] — {chosen.install_hint}")
+        raise typer.Exit(1)
 
-    isolated = _Path(__file__).resolve().parent.parent / ".venv-vllm" / "bin" / "vllm"
-    vllm_bin = str(isolated) if isolated.exists() else "vllm"
-
-    cmd = [
-        vllm_bin, "serve", repo,
-        "--port", str(port),
-        "--served-model-name", repo,
-        "--gpu-memory-utilization", str(v.get("gpu_memory_utilization", 0.5)),
-        "--max-model-len", str(v.get("max_model_len", 32768)),
-        "--kv-cache-dtype", str(v.get("kv_cache_dtype", "auto")),
-        "--max-num-seqs", str(v.get("max_num_seqs", 64)),
-    ]
-    if v.get("enable_prefix_caching", True):
-        cmd.append("--enable-prefix-caching")
-
-    env = dict(os.environ)
-    devices = v.get("gpu_devices") or [0]
-    env["CUDA_VISIBLE_DEVICES"] = ",".join(str(d) for d in devices)
-    # The three cards are not identical — 0 and 1 are Max-Q, 2 is the full Workstation
-    # Edition — and CUDA's default ordering is by compute capability, not slot. Without
-    # this, "device 1" here and "device 1" in the reader can be different cards.
-    env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-
-    console.print(f"[dim]CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}[/dim] {' '.join(cmd)}")
+    port = GEN.port_of((serving.get("vllm") or {}).get("base_url", "http://127.0.0.1:8000/v1"))
+    cmd = chosen.command(repo, port, merged)
+    env = chosen.env(merged)
+    if "CUDA_VISIBLE_DEVICES" in env and chosen.name == "vllm":
+        console.print(f"[dim]CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}[/dim]")
+    console.print(" ".join(cmd))
     if show:
         return
+    import subprocess
     subprocess.run(cmd, env=env, check=False)
+
+
+@app.command("backends")
+def list_backends(config: str = typer.Option(None, help="Path to config.yaml")) -> None:
+    """Show the generation backends, which are installed, and which one would be used."""
+    from lara.serve import devices as DV
+    from lara.serve import generator as GEN
+
+    cfg = config_mod.load(config)
+    dev_info = DV.detect()
+    serving = cfg.get_in("serving") or {}
+    merged = {**(serving.get("generator") or {}), "vllm": serving.get("vllm") or {}}
+    active = GEN.choose(dev_info.accelerator, cfg.get_in("serving.generator.backend"))
+
+    table = Table(show_header=True, header_style="bold")
+    for c in ("", "backend", "format", "installed", "model", "notes"):
+        table.add_column(c, overflow="fold")
+    for b in GEN.BACKENDS.values():
+        fit = dev_info.accelerator in b.platforms or b.name == "external"
+        table.add_row(
+            "→" if b.name == active.name else "",
+            b.label if fit else f"[dim]{b.label}[/dim]",
+            b.model_format,
+            "[green]yes[/green]" if b.available() else f"[dim]no — {b.install_hint}[/dim]",
+            str(GEN.model_for(b.name, merged) or "-"),
+            b.notes.split(". ")[0] + ".",      # full text lives in the module docstring
+        )
+    console.print(table)
+    console.print(f"\ndetected [bold]{dev_info.accelerator}[/bold]; "
+                  f"→ marks what `lara serve` would start")
+    base = (serving.get("vllm") or {}).get("base_url", "http://127.0.0.1:8000/v1")
+    ids = GEN.probe(base)
+    console.print(f"already running at {base}: "
+                  + (f"[green]yes[/green] — {', '.join(ids) or 'no models listed'}"
+                     if ids is not None else "[dim]no[/dim]"))
+
+
+@app.command("bench-generate")
+def bench_generate(
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    prompt: str = typer.Option("Explain the role of the KV cache in transformer inference.",
+                               help="Prompt to time"),
+    max_tokens: int = typer.Option(256),
+    runs: int = typer.Option(3, help="Timed runs after one warm-up"),
+) -> None:
+    """Measure time-to-first-token and throughput against the running generator.
+
+    Backend-agnostic on purpose: it speaks the same OpenAI-compatible API the reader uses,
+    so llama.cpp and MLX can be compared on one machine by pointing this at each in turn.
+    """
+    import json
+    import time
+
+    import httpx
+
+    from lara.serve import generator as GEN
+
+    cfg = config_mod.load(config)
+    base = (cfg.get_in("serving.vllm.base_url") or "http://127.0.0.1:8000/v1").rstrip("/")
+    ids = GEN.probe(base)
+    if ids is None:
+        console.print(f"[red]nothing answering at {base}[/red] — start one with "
+                      f"`lara serve-llm`")
+        raise typer.Exit(1)
+    model = ids[0]
+    console.print(f"benchmarking [bold]{model}[/bold] at {base}\n")
+
+    def once() -> tuple[float, float, int]:
+        body = {"model": model, "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens, "temperature": 0.0, "stream": True}
+        t0 = time.time()
+        ttft = None
+        n = 0
+        with httpx.stream("POST", f"{base}/chat/completions", json=body, timeout=300) as r:
+            for line in r.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    delta = json.loads(payload)["choices"][0].get("delta", {})
+                except Exception:
+                    continue
+                if delta.get("content"):
+                    if ttft is None:
+                        ttft = time.time() - t0
+                    n += 1
+        return (ttft or 0.0), time.time() - t0, n
+
+    once()                                    # warm the prefix cache and the kernels
+    rows = [once() for _ in range(runs)]
+    table = Table(show_header=True, header_style="bold")
+    for c in ("run", "TTFT", "total", "tokens", "tok/s"):
+        table.add_column(c, justify="right")
+    for i, (ttft, total, n) in enumerate(rows, 1):
+        rate = (n - 1) / (total - ttft) if n > 1 and total > ttft else 0.0
+        table.add_row(str(i), f"{ttft * 1000:.0f}ms", f"{total:.2f}s", str(n), f"{rate:.1f}")
+    console.print(table)
+    med = sorted(r[0] for r in rows)[len(rows) // 2]
+    rates = sorted((n - 1) / (t - f) for f, t, n in rows if n > 1 and t > f)
+    console.print(f"\nmedian TTFT [bold]{med * 1000:.0f}ms[/bold]"
+                  + (f", median [bold]{rates[len(rates) // 2]:.1f} tok/s[/bold]" if rates else ""))
 
 
 @app.command()
