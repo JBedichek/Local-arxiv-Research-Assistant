@@ -23,9 +23,10 @@
   <label>model <select id="model"><option value="">(loading)</option></select></label>
   <label>quant <select id="quant"></select></label>
   <label>temp <input id="temp" type="range" min="0" max="1.5" step="0.05" value="0.2"><span id="temp-val">0.20</span></label>
-  <label class="breadth">depth
+  <label class="breadth" id="breadth-label">
+    <span class="cap">answer depth</span>
     <input id="breadth" type="range" min="0" max="4" step="1" value="2">
-    <span id="breadth-val">Balanced <em>~3s</em></span>
+    <span id="breadth-val"></span>
   </label>
   <label>font
     <select id="font">
@@ -55,12 +56,21 @@
     <article id="paper"><p class="placeholder">Enter an arXiv id to open a paper, or type a question to search the corpus.</p></article>
     <div id="results" hidden>
       <div id="results-head"></div>
-      <div id="results-toggle">
-        <button type="button" data-view="graph" class="on">Citation graph</button>
-        <button type="button" data-view="list">List</button>
+      <div id="results-controls">
+        <div id="results-toggle">
+          <button type="button" data-view="graph" class="on">Citation graph</button>
+          <button type="button" data-view="list">List</button>
+        </div>
+        <label>show top
+          <input id="topk" type="range" min="5" max="60" step="5" value="20">
+          <span id="topk-val">20</span> papers
+        </label>
       </div>
-      <canvas id="results-graph"></canvas>
-      <div id="results-tip" hidden></div>
+      <div id="graph-wrap">
+        <canvas id="results-graph"></canvas>
+        <div id="results-labels"></div>
+        <div id="results-tip" hidden></div>
+      </div>
       <ol id="results-list" hidden></ol>
     </div>
   </section>

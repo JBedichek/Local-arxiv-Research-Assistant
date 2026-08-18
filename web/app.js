@@ -37,7 +37,7 @@ async function api(path, opts) {
 
 /* ---------- paper ---------- */
 
-async function openPaper(id, fragment) {
+async function openPaper(id, fragment, push = true) {
   setStatus("loading paper…");
   try {
     const data = await api(`/api/paper/${encodeURIComponent(id)}`);
@@ -60,7 +60,12 @@ async function openPaper(id, fragment) {
         `<p class="placeholder">Full text not fetched yet (status: ${data.fulltext_status}).</p>
          <h3>Abstract</h3><p>${escapeHtml(data.abstract || "")}</p>`;
     }
-    history.replaceState(null, "", `/p/${data.arxiv_id}v${data.version}`);
+    // pushState, not replaceState: the previous version overwrote the current entry, so
+    // Back never had anywhere to go. Papers and searches are both real destinations.
+    const url = `/p/${data.arxiv_id}v${data.version}${fragment || ""}`;
+    const entry = { view: "paper", id: data.arxiv_id, fragment: fragment || null };
+    if (push && location.pathname + location.hash !== url) history.pushState(entry, "", url);
+    else history.replaceState(entry, "", url);
     setStatus("");
     loadGraph();
     if (fragment) scrollToAnchor(fragment);
@@ -330,7 +335,7 @@ document.addEventListener("click", (ev) => {
   const hit = state.hits[Number(a.dataset.i)];
   if (!hit) return;
   if (hit.arxiv_id !== state.paper) {
-    openPaper(hit.arxiv_id, `#${hit.anchor}:${hit.char_start}-${hit.char_end}`);
+    openPaper(hit.arxiv_id, `#${hit.anchor}:${hit.char_start}-${hit.char_end}`, true);
   } else {
     scrollToAnchor(`#${hit.anchor}:${hit.char_start}-${hit.char_end}`);
   }
@@ -420,6 +425,23 @@ $("#graph").addEventListener("click", (ev) => {
   if (hit && hit.in_corpus) openPaper(hit.id);
 });
 
+window.addEventListener("popstate", (ev) => {
+  const st = ev.state;
+  if (st?.view === "search") {
+    $("#arxiv-input").value = st.query || "";
+    searchPapers(st.query, false);
+  } else if (st?.view === "paper") {
+    hideResults();
+    openPaper(st.id, st.fragment, false);
+  } else {
+    // Entry predates this handler (or a fresh load): fall back to reading the URL.
+    const m = location.pathname.match(/^\/p\/(.+?)(?:v(\d+))?$/);
+    const q = new URLSearchParams(location.search).get("q");
+    if (m) { hideResults(); openPaper(m[1], location.hash, false); }
+    else if (q) searchPapers(q, false);
+  }
+});
+
 /* ---------- chrome ---------- */
 
 /* The one box does both. An arXiv id is unambiguous — 4 digits, a dot, 4-5 digits, or
@@ -440,8 +462,13 @@ $("#open-form").addEventListener("submit", (ev) => {
   }
 });
 
-async function searchPapers(query) {
+async function searchPapers(query, push = true) {
   setStatus("searching…");
+  const surl = `/?q=${encodeURIComponent(query)}`;
+  const sentry = { view: "search", query };
+  if (push && location.search !== `?q=${encodeURIComponent(query)}`) history.pushState(sentry, "", surl);
+  else history.replaceState(sentry, "", surl);
+  state.lastQuery = query;
   const list = $("#results-list");
   $("#results").hidden = false;
   $("#paper").hidden = true;
@@ -452,7 +479,7 @@ async function searchPapers(query) {
     const data = await api("/api/search", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query, limit: 25 }),
+      body: JSON.stringify({ query, limit: Number($("#topk").value) || 20 }),
     });
     const ms = Math.round(performance.now() - t0);
     searchData = data;
@@ -480,8 +507,9 @@ async function searchPapers(query) {
           <p class="evidence">score ${r.score.toFixed(3)} ${ev}</p>
         </div></li>`;
     }).join("") || `<li class="placeholder">No matches.</li>`;
-    $("#results-graph").hidden = searchView !== "graph";
+    $("#graph-wrap").hidden = searchView !== "graph";
     $("#results-list").hidden = searchView !== "list";
+    $("#results-head").insertAdjacentHTML("beforeend", LEGEND_HTML);
     drawSearchGraph();
     setStatus("");
   } catch (err) {
@@ -527,6 +555,9 @@ function escapeHtml(s) {
 (async function boot() {
   applyLayout();
   applyTypography();
+  document.documentElement.style.setProperty("--graph-h", prefs.get("graphH", "460px"));
+  $("#topk").value = prefs.get("topk", "20");
+  $("#topk-val").textContent = $("#topk").value;
   makeSplitter($("#split-left"), "--col-left", "colLeft", "left");
   makeSplitter($("#split-right"), "--col-right", "colRight", "right");
   bindSearchGraph();
@@ -551,7 +582,9 @@ function escapeHtml(s) {
   } catch { /* models are optional for browsing */ }
 
   const path = location.pathname.match(/^\/p\/(.+?)(?:v(\d+))?$/);
-  if (path) openPaper(path[1], location.hash);
+  const q0 = new URLSearchParams(location.search).get("q");
+  if (path) openPaper(path[1], location.hash, false);
+  else if (q0) { $("#arxiv-input").value = q0; searchPapers(q0, false); }
 
   const h = await api("/api/health").catch(() => null);
   if (h) setStatus(`${h.vectors.toLocaleString()} chunks indexed`);
@@ -643,12 +676,15 @@ function applyBreadth() {
   if (!b) return;
   state.breadth = b.name;
   prefs.set("breadth", String(i));
+  const bits = [`${b.max_rounds} search round${b.max_rounds > 1 ? "s" : ""}`, `${b.k} excerpts`];
+  if (b.expand_context) bits.push("reads around excerpts");
+  if (b.allow_clarify) bits.push("may ask you to narrow");
   $("#breadth-val").innerHTML =
-    `${escapeHtml(b.label)} <em>${escapeHtml(b.estimate)}</em>`;
-  const bits = [`${b.max_rounds} search round${b.max_rounds > 1 ? "s" : ""}`, `top ${b.k}`];
-  if (b.expand_context) bits.push("context expansion");
-  if (b.allow_clarify) bits.push("may ask to clarify");
-  $("#breadth").title = bits.join(" · ") + ` — estimated ${b.estimate}`;
+    `<strong>${escapeHtml(b.label)}</strong> · ${escapeHtml(b.estimate)}<br>
+     <em>${escapeHtml(bits.join(" · "))}</em>`;
+  $("#breadth").title =
+    `${b.label}: ${bits.join(", ")}. Typical total time ${b.estimate}. ` +
+    `Deeper settings search more and take longer; generation itself is a fixed ~3s.`;
 }
 $("#breadth").addEventListener("input", applyBreadth);
 
@@ -697,141 +733,197 @@ function renderClarify(msgEl, payload) {
 
 /* ================= search results as a citation graph ================= */
 
-/* Laid out chronologically, not force-directed. A citation graph is a DAG ordered by
- * time: a paper can only cite work that already existed. Putting the date on the x axis
- * makes every edge point leftward, so lineage is readable at a glance — which paper
- * started a line of work, which are extensions, which are contemporaries that never cite
- * each other. A force layout throws that information away and produces a hairball. */
+/* Layout: one row per paper, ordered by relevance rank (most relevant at top); x is the
+ * submission date. Two variables, no collisions.
+ *
+ * The earlier version packed nodes into shared lanes to look compact, and labels drawn
+ * beside them overlapped into mush. A dedicated row per paper costs vertical space and
+ * buys guaranteed legibility, which is the right trade for 20-25 results.
+ *
+ * Labels are real <a> elements positioned over the canvas rather than canvas text, so
+ * they are selectable, keyboard-focusable, and support middle-click and "copy link" like
+ * any other link. Canvas draws only what HTML cannot: the edges. */
 
 let searchData = null;
 let searchView = "graph";
 
-function layoutSearchGraph(canvas) {
+const ROW_H = 26, PAD_L = 54, PAD_T = 16, PAD_B = 26, NODE_LABEL_GAP = 10;
+
+function graphHeight(n) {
+  return Math.max(160, PAD_T + n * ROW_H + PAD_B);
+}
+
+function layoutSearchGraph(width) {
   const nodes = searchData.results;
   if (!nodes.length) return [];
-  const dpr = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth, h = canvas.clientHeight;
-  canvas.width = w * dpr; canvas.height = h * dpr;
-
   const times = nodes.map((n) => Date.parse(n.submitted || "") || 0).filter(Boolean);
   const tMin = Math.min(...times), tMax = Math.max(...times);
-  const padL = 46, padR = 150, padT = 22, padB = 30;
   const span = Math.max(tMax - tMin, 1);
-
-  // Lay out by date, then push apart vertically within date-neighbourhoods so labels
-  // do not collide. Rank breaks ties so the most relevant paper sits highest.
-  const placed = nodes.map((n) => {
+  // Reserve the right half for labels; dates compress into the left.
+  const plotW = Math.max(120, width * 0.42 - PAD_L);
+  return nodes.map((n, i) => {
     const t = Date.parse(n.submitted || "") || tMin;
-    return { ...n, x: padL + ((t - tMin) / span) * (w - padL - padR), y: 0 };
+    return {
+      ...n,
+      x: PAD_L + ((t - tMin) / span) * plotW,
+      y: PAD_T + i * ROW_H + ROW_H / 2,
+      radius: 4.5 + Math.min(n.in_degree, 6) * 1.5,
+    };
   });
-  placed.sort((a, b) => a.x - b.x);
-  const lanes = [];
-  const rowH = Math.max(22, Math.min(40, (h - padT - padB) / Math.max(placed.length, 1) * 1.6));
-  for (const n of placed) {
-    let lane = 0;
-    while (lanes[lane] !== undefined && n.x - lanes[lane] < 130) lane++;
-    lanes[lane] = n.x;
-    n.y = padT + lane * rowH + rowH / 2;
-    if (n.y > h - padB) n.y = padT + ((lane % Math.max(1, Math.floor((h - padT - padB) / rowH))) * rowH) + rowH / 2;
-  }
-  return placed;
 }
 
 function drawSearchGraph() {
   const canvas = $("#results-graph");
-  if (!searchData || searchView !== "graph") return;
-  const placed = layoutSearchGraph(canvas);
-  const ctx = canvas.getContext("2d");
+  const overlay = $("#results-labels");
+  if (!searchData || searchView !== "graph" || !canvas) return;
+
+  const width = canvas.parentElement.clientWidth;
+  const placed = layoutSearchGraph(width);
+  const height = graphHeight(placed.length);
   const dpr = window.devicePixelRatio || 1;
+  canvas.style.width = width + "px";
+  canvas.style.height = height + "px";
+  canvas.width = width * dpr;
+  canvas.height = height * dpr;
+  overlay.style.height = height + "px";
+
+  const ctx = canvas.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  const w = canvas.clientWidth, h = canvas.clientHeight;
-  ctx.clearRect(0, 0, w, h);
+  ctx.clearRect(0, 0, width, height);
   const byId = Object.fromEntries(placed.map((n) => [n.arxiv_id, n]));
 
-  // year gridlines give the time axis meaning
-  const years = [...new Set(placed.map((n) => (n.submitted || "").slice(0, 4)))].filter(Boolean).sort();
+  // year ticks along the bottom
+  const years = [...new Set(placed.map((n) => (n.submitted || "").slice(0, 4)))]
+    .filter(Boolean).sort();
   ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
   for (const y of years) {
     const same = placed.filter((n) => (n.submitted || "").startsWith(y));
     const x = same.reduce((a, n) => a + n.x, 0) / same.length;
-    ctx.strokeStyle = "rgba(140,150,170,.13)";
-    ctx.beginPath(); ctx.moveTo(x, 12); ctx.lineTo(x, h - 18); ctx.stroke();
-    ctx.fillStyle = "rgba(140,150,170,.7)";
-    ctx.fillText(y, x - 12, h - 6);
+    ctx.strokeStyle = "rgba(140,150,170,.12)";
+    ctx.beginPath(); ctx.moveTo(x, PAD_T - 6); ctx.lineTo(x, height - PAD_B + 4); ctx.stroke();
+    ctx.fillStyle = "rgba(140,150,170,.75)";
+    ctx.fillText(y, x - 11, height - PAD_B + 16);
   }
 
-  // edges: cited paper <- citing paper, so arrows point back in time
+  // edges: citing -> cited, so they point back in time (leftward)
   for (const e of searchData.edges || []) {
-    const a = byId[e.src], b = byId[e.dst];
-    if (!a || !b) continue;
-    ctx.strokeStyle = "rgba(140,160,200,.42)";
-    ctx.lineWidth = 1.1;
+    const from = byId[e.src], to = byId[e.dst];
+    if (!from || !to) continue;
+    ctx.strokeStyle = "rgba(150,170,215,.55)";
+    ctx.lineWidth = 1.2;
     ctx.beginPath();
-    const mx = (a.x + b.x) / 2;
-    ctx.moveTo(a.x, a.y);
-    ctx.bezierCurveTo(mx, a.y, mx, b.y, b.x, b.y);
+    const dx = Math.max(26, Math.abs(from.x - to.x) * 0.55);
+    ctx.moveTo(from.x, from.y);
+    ctx.bezierCurveTo(from.x - dx, from.y, to.x + dx, to.y, to.x, to.y);
     ctx.stroke();
-    // arrowhead at the cited end
-    const ang = Math.atan2(b.y - a.y, b.x - mx);
-    ctx.fillStyle = "rgba(140,160,200,.62)";
+    const ang = Math.atan2(to.y - from.y, -dx);
+    ctx.fillStyle = "rgba(150,170,215,.85)";
     ctx.beginPath();
-    ctx.moveTo(b.x, b.y);
-    ctx.lineTo(b.x - 7 * Math.cos(ang - 0.4), b.y - 7 * Math.sin(ang - 0.4));
-    ctx.lineTo(b.x - 7 * Math.cos(ang + 0.4), b.y - 7 * Math.sin(ang + 0.4));
+    ctx.moveTo(to.x + to.radius + 1, to.y);
+    ctx.lineTo(to.x + to.radius + 8, to.y - 3.6);
+    ctx.lineTo(to.x + to.radius + 8, to.y + 3.6);
     ctx.closePath(); ctx.fill();
+    void ang;
   }
 
   const scores = placed.map((n) => n.score);
   const lo = Math.min(...scores), hi = Math.max(...scores);
   for (const n of placed) {
     const t = hi > lo ? (n.score - lo) / (hi - lo) : 1;
-    // size by how much the *result set* cites it: the local hub is the foundational work
-    const r = 5 + Math.min(n.in_degree, 8) * 1.6;
-    ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+    ctx.beginPath(); ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
     ctx.fillStyle = heatColor(t); ctx.fill();
-    if (n.in_degree > 0) { ctx.strokeStyle = "rgba(255,255,255,.5)"; ctx.lineWidth = 1; ctx.stroke(); }
-    ctx.fillStyle = "rgba(190,200,215,.92)";
-    ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
-    const label = (n.title || n.arxiv_id).slice(0, 30) + ((n.title || "").length > 30 ? "…" : "");
-    ctx.fillText(`${n.rank}. ${label}`, n.x + r + 5, n.y + 3.5);
+    if (n.in_degree > 0) {
+      ctx.strokeStyle = "rgba(255,255,255,.55)"; ctx.lineWidth = 1.2; ctx.stroke();
+    }
   }
+
+  // labels as real links
+  overlay.innerHTML = placed.map((n) => {
+    const left = Math.round(n.x + n.radius + NODE_LABEL_GAP);
+    const cites = n.in_degree
+      ? `<span class="deg" title="cited by ${n.in_degree} of these results">↩${n.in_degree}</span>` : "";
+    return `<a class="glabel" href="/p/${n.arxiv_id}v${n.version}" data-id="${n.arxiv_id}"
+       style="left:${left}px; top:${Math.round(n.y - ROW_H / 2)}px; height:${ROW_H}px"
+       title="${escapeHtml(n.title)}">
+       <span class="rk">${n.rank}</span>${cites}
+       <span class="ttl">${escapeHtml(n.title)}</span>
+       <span class="yr">${escapeHtml((n.submitted || "").slice(0, 7))}</span></a>`;
+  }).join("");
   canvas._nodes = placed;
 }
 
+const LEGEND_HTML = `
+  <div class="legend">
+    <span><i class="swatch grad"></i> colour = relevance to your query (dim → bright)</span>
+    <span><i class="swatch size"></i> size = how many of these results cite it</span>
+    <span><i class="swatch edge"></i> arrow points from citing paper → paper it cites</span>
+    <span><i class="swatch axis"></i> left→right = submission date</span>
+  </div>`;
+
 function bindSearchGraph() {
-  const canvas = $("#results-graph"), tip = $("#results-tip");
-  const at = (ev) => {
-    const rect = canvas.getBoundingClientRect();
-    const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
-    return (canvas._nodes || []).find((n) => (n.x - x) ** 2 + (n.y - y) ** 2 < 160);
-  };
-  canvas.addEventListener("mousemove", (ev) => {
-    const n = at(ev);
-    if (!n) { tip.hidden = true; return; }
-    const rect = canvas.getBoundingClientRect();
+  const overlay = $("#results-labels");
+  const canvas = $("#results-graph");
+  const tip = $("#results-tip");
+
+  overlay.addEventListener("click", (ev) => {
+    const a = ev.target.closest("a.glabel");
+    // Let ctrl/cmd/middle-click behave like a normal link and open a new tab.
+    if (!a || ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.button !== 0) return;
+    ev.preventDefault();
+    hideResults();
+    openPaper(a.dataset.id, null, true);
+  });
+  overlay.addEventListener("mousemove", (ev) => {
+    const a = ev.target.closest("a.glabel");
+    if (!a) { tip.hidden = true; return; }
+    const n = (canvas._nodes || []).find((x) => x.arxiv_id === a.dataset.id);
+    if (!n) return;
+    const host = canvas.parentElement.getBoundingClientRect();
     tip.hidden = false;
-    tip.style.left = `${ev.clientX - rect.left + 14}px`;
-    tip.style.top = `${ev.clientY - rect.top + 14 + canvas.offsetTop}px`;
+    tip.style.left = `${Math.min(ev.clientX - host.left + 16, host.width - 350)}px`;
+    tip.style.top = `${ev.clientY - host.top + 16}px`;
     tip.innerHTML =
       `<b>${escapeHtml(n.title)}</b>
-       <span class="dim">${n.arxiv_id} · ${escapeHtml(n.submitted)} ·
-       score ${n.score.toFixed(3)} · cited by ${n.in_degree} of these results</span>
-       <p style="margin:5px 0 0">${escapeHtml((n.abstract || "").slice(0, 180))}…</p>`;
+       <span class="dim">${n.arxiv_id} · ${escapeHtml(n.submitted)} · score ${n.score.toFixed(3)}
+       · cited by ${n.in_degree} of these results · cites ${n.out_degree} of them</span>
+       <p>${escapeHtml((n.abstract || "").slice(0, 200))}…</p>`;
   });
-  canvas.addEventListener("mouseleave", () => { tip.hidden = true; });
-  canvas.addEventListener("click", (ev) => {
-    const n = at(ev);
-    if (n) { hideResults(); openPaper(n.arxiv_id); }
-  });
+  overlay.addEventListener("mouseleave", () => { tip.hidden = true; });
+
   $("#results-toggle").addEventListener("click", (ev) => {
     const b = ev.target.closest("button");
     if (!b) return;
     searchView = b.dataset.view;
     $("#results-toggle").querySelectorAll("button")
       .forEach((x) => x.classList.toggle("on", x.dataset.view === searchView));
-    $("#results-graph").hidden = searchView !== "graph";
+    $("#graph-wrap").hidden = searchView !== "graph";
     $("#results-list").hidden = searchView !== "list";
     if (searchView === "graph") drawSearchGraph();
   });
+
   window.addEventListener("resize", () => drawSearchGraph());
 }
+
+/* top-k: re-run the search so the induced subgraph is recomputed over the new set —
+ * trimming client-side would show edges to papers no longer displayed. */
+$("#topk").addEventListener("input", (e) => {
+  $("#topk-val").textContent = e.target.value;
+  prefs.set("topk", e.target.value);
+});
+$("#topk").addEventListener("change", () => {
+  if (state.lastQuery) searchPapers(state.lastQuery, false);
+});
+
+/* persist the graph pane height set via the native resize grabber */
+(function watchGraphHeight() {
+  const wrap = $("#graph-wrap");
+  if (!wrap || !window.ResizeObserver) return;
+  let t = null;
+  new ResizeObserver(() => {
+    clearTimeout(t);
+    t = setTimeout(() => {
+      const h = Math.round(wrap.getBoundingClientRect().height);
+      if (h > 100) prefs.set("graphH", h + "px");
+    }, 250);
+  }).observe(wrap);
+})();

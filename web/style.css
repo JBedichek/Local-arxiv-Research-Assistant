@@ -217,3 +217,53 @@ li.placeholder { color: var(--dim); padding: 12px; }
   border-radius: 7px; padding: 7px 10px; font-size: 12px; max-width: 340px;
   pointer-events: none; z-index: 30; box-shadow: 0 6px 20px rgba(0,0,0,.35); }
 #results-tip b { display: block; margin-bottom: 3px; font-size: 12.5px; }
+
+/* --- search graph, v2 --- */
+#results-controls { display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  margin: 0 0 8px; }
+#results-controls label { display: flex; align-items: center; gap: 6px;
+  color: var(--dim); font-size: 11.5px; }
+#results-controls input[type=range] { width: 110px; accent-color: var(--accent); }
+#topk-val { min-width: 18px; text-align: right; font-variant-numeric: tabular-nums;
+  color: var(--text); }
+
+/* Height is user-set and persisted; `resize: vertical` gives a native grabber without
+   a bespoke drag implementation. */
+#graph-wrap { position: relative; border: 1px solid var(--line); border-radius: 8px;
+  background: var(--panel); overflow: auto; resize: vertical;
+  height: var(--graph-h, 460px); min-height: 160px; }
+#results-graph { display: block; }
+#results-labels { position: absolute; inset: 0; pointer-events: none; }
+a.glabel { position: absolute; display: flex; align-items: center; gap: 7px;
+  pointer-events: auto; text-decoration: none; color: var(--text);
+  padding: 0 7px; border-radius: 5px; max-width: 54%; font-size: 12px; }
+a.glabel:hover { background: var(--panel-2); outline: 1px solid var(--accent); }
+a.glabel .rk { color: var(--dim); font-size: 10.5px; min-width: 15px;
+  font-variant-numeric: tabular-nums; }
+a.glabel .deg { color: var(--accent); font-size: 10px; }
+a.glabel .ttl { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+a.glabel .yr { color: var(--dim); font-size: 10.5px; flex: none; }
+#results-tip p { margin: 5px 0 0; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 14px; margin: 7px 0 0;
+  color: var(--dim); font-size: 11px; align-items: center; }
+.legend span { display: flex; align-items: center; gap: 5px; }
+.legend .swatch { width: 26px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
+.legend .grad { background: linear-gradient(90deg,
+  rgb(58,74,104), rgb(52,118,160), rgb(64,166,156), rgb(188,190,96), rgb(226,138,66), rgb(222,78,62)); }
+.legend .size { background: none; position: relative; }
+.legend .size::before, .legend .size::after { content: ""; position: absolute; top: 50%;
+  border-radius: 50%; background: var(--dim); transform: translateY(-50%); }
+.legend .size::before { left: 1px; width: 5px; height: 5px; }
+.legend .size::after { left: 11px; width: 11px; height: 11px; }
+.legend .edge { background: none; border-top: 1.5px solid rgba(150,170,215,.85);
+  height: 0; position: relative; }
+.legend .edge::after { content: "◀"; position: absolute; left: -3px; top: -7px;
+  color: rgba(150,170,215,.9); font-size: 9px; }
+.legend .axis { background: linear-gradient(90deg, transparent, var(--line));
+  border-bottom: 1px solid var(--line); }
+
+label.breadth { flex-direction: column; align-items: flex-start !important; gap: 1px !important; }
+label.breadth .cap { font-size: 10px; text-transform: uppercase; letter-spacing: .07em; opacity: .8; }
+label.breadth #breadth-val { font-size: 11.5px; min-width: 150px; color: var(--text); }
+label.breadth #breadth-val em { font-style: normal; color: var(--dim); }
