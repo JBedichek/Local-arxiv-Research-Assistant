@@ -40,7 +40,7 @@ class AppState:
         icfg = self.cfg.get_in("index")
         # Config expresses devices as CUDA ordinals; lara.device maps that intent onto
         # whatever is actually here (see lara/device.py). On a Mac this becomes "mps".
-        self.device = dev.resolve((ecfg.get("devices") or [None])[0])
+        self.device = dev.first(ecfg.get("devices"))
 
         self.store = VectorStore(
             self.cfg.get_path("paths.vectors_fp16"),

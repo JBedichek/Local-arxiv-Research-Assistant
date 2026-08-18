@@ -111,16 +111,24 @@ The flag beats the config. Omitting it auto-detects. There is deliberately no gl
 environment variable for this — `CUDA_VISIBLE_DEVICES` already exists and works, and a
 second overlapping mechanism is a debugging trap.
 
-To change the default for every run, edit `config.yaml`:
+To change the default for every run, put it in **`config.local.yaml`** — the gitignored
+machine-specific layer that deep-merges over `config.yaml`. Editing the tracked defaults
+works too, but it makes every `git status` dirty and travels to machines the settings do
+not describe:
 
 ```yaml
+# config.local.yaml
 embedding:
-  devices: [0, 1, 2]        # or `auto`, or ["cpu"]
+  devices: [0, 1, 2]        # or `auto` (the default), or ["cpu"]
 index:
   rerank:
     cross_encoder:
       device: 1
 ```
+
+`auto` uses every accelerator found. A list of CUDA ordinals pins specific cards, which is
+what you want when one is reserved for the generator; extra entries collapse harmlessly on
+smaller machines. `lara preflight` prints which config layers it loaded.
 
 ---
 

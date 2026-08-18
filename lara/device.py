@@ -109,21 +109,33 @@ def resolve(spec: str | int | None = None) -> str:
     return f"{kind}:0" if kind == "cuda" else kind
 
 
-def resolve_all(specs: list[str | int] | None) -> list[str]:
+def resolve_all(specs: "list[str | int] | str | int | None") -> list[str]:
     """Resolve a device list, de-duplicated and order-preserving.
 
-    ``devices: [0, 1, 2]`` on a one-GPU box collapses to ``["cuda:0"]`` rather than
-    resolving to the same card three times, which would start three worker processes
-    contending for one device.
+    Accepts what config files actually contain: a list (``[0, 1, 2]``), the string
+    ``"auto"``, a bare scalar, or nothing. A scalar is *not* iterated — ``"auto"[0]`` is
+    ``"a"``, and silently resolving that would land on a fallback device with a confusing
+    warning instead of using every card.
+
+    ``[0, 1, 2]`` on a one-GPU box collapses to ``["cuda:0"]`` rather than resolving to the
+    same card three times, which would start three worker processes contending for one
+    device.
     """
-    if not specs:
-        return [resolve(None)]
+    if specs is None or specs == "auto" or specs == "" or specs == []:
+        return available()
+    if not isinstance(specs, (list, tuple)):
+        specs = [specs]
     out: list[str] = []
     for s in specs:
         d = resolve(s)
         if d not in out:
             out.append(d)
     return out
+
+
+def first(specs: "list[str | int] | str | int | None") -> str:
+    """The single device to use for a config field that may name several."""
+    return resolve_all(specs)[0]
 
 
 def empty_cache(device: str | None = None) -> None:

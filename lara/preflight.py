@@ -55,6 +55,22 @@ def _free_gb(path: Path) -> float:
     return shutil.disk_usage(probe).free / 1e9
 
 
+def check_config(cfg: Config) -> list[Check]:
+    """Report which config layers are in play (D16).
+
+    Never fails. Running on defaults alone is a legitimate state — it is what a fresh
+    clone looks like — but it is worth saying out loud, because the defaults deliberately
+    pin nothing to this machine and someone debugging a path or a device wants to know
+    whether their overrides were picked up at all.
+    """
+    names = ", ".join(p.name for p in getattr(cfg, "sources", []) or ["config.yaml"])
+    if getattr(cfg, "has_local", False):
+        return [Check("config", True, f"{names}")]
+    return [Check("config", True,
+                  f"{names} only — no config.local.yaml, using portable defaults. "
+                  f"Run `lara setup` to pin this machine's disks, devices and model.")]
+
+
 def check_disks(cfg: Config) -> list[Check]:
     checks: list[Check] = []
     required = cfg.get_in("disk.required_device")
@@ -157,5 +173,5 @@ def check_gpu() -> list[Check]:
 
 def run(cfg: Config | None = None) -> tuple[list[Check], bool]:
     cfg = cfg or load()
-    checks = check_disks(cfg) + check_gpu()
+    checks = check_config(cfg) + check_disks(cfg) + check_gpu()
     return checks, all(c.ok for c in checks)

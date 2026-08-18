@@ -1144,11 +1144,11 @@ if the keep-set is larger than expected. And the cut line is genuinely fuzzy: at
 ============  =======================================================  ==========================
 phase         work                                                     unlocks
 ============  =======================================================  ==========================
-1             `lara/device.py`; purge hardcoded `cuda:`                 runs on Mac / CPU at all
+1             `lara/device.py`; purge hardcoded `cuda:`  **[done]**      runs on Mac / CPU at all
 2             config layering (D16), portable defaults, advisory        a fresh clone starts
-              preflight
+              preflight  **[done]**
 3             int8-resident index (D19), memory planner (D20)           16 GB machines viable
-4             topic-scoped residency (D22)                              laptop-scale installs
+4             topic-scoped residency (D22)  **[done, see 13.6.1]**       laptop-scale installs
 5             wizard UI, `lara setup` (D17, D18)                        the requested feature
 6             endpoint probing, benchmark step, fingerprint (D21)       accessibility polish
 ============  =======================================================  ==========================

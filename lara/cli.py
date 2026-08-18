@@ -264,7 +264,7 @@ def embed(
         conn.close()
         return
 
-    devices = ldev.resolve_all([device] if device else ecfg.get("devices"))
+    devices = ldev.resolve_all(device if device else ecfg.get("devices"))
     mode = None if no_compile else ecfg.get("compile")
     console.print(
         f"loading {ecfg['model']} on {', '.join(devices)} (compile={mode or 'off'})…"
@@ -339,7 +339,7 @@ def search(
         cfg.get_path("paths.vectors_fp16"), cfg.get_path("paths.vectors_int8"),
         dim_full=int(ecfg["dim_full"]), dim_trunc=int(ecfg["dim_truncated"]),
     )
-    edev = ldev.resolve(device if device else (ecfg.get("devices") or [None])[0])
+    edev = ldev.resolve(device) if device else ldev.first(ecfg.get("devices"))
     console.print(f"loading index ({store.rows():,} vectors) and embedder on {edev}…")
     embedder = emb.load_model(ecfg["model"], device=edev,
                               max_seq_length=int(ecfg["max_seq_len"]))
@@ -722,7 +722,7 @@ def embed_papers(
         conn.close()
         return
 
-    devices = ldev.resolve_all([device] if device else ecfg.get("devices"))
+    devices = ldev.resolve_all(device if device else ecfg.get("devices"))
     model = emb.load_model(
         ecfg["model"], device=devices[0], max_seq_length=int(ecfg["max_seq_len"]),
         compile_mode=ecfg.get("compile"), compile_dynamic=True,
@@ -775,7 +775,7 @@ def _scope_inputs(cfg, topics: list[str], device: str | None):
         console.print("[red]no paper-level vectors[/red] — run `lara embed-papers` first")
         raise typer.Exit(1)
 
-    edev = ldev.resolve(device if device else (ecfg.get("devices") or [None])[0])
+    edev = ldev.resolve(device) if device else ldev.first(ecfg.get("devices"))
     model = emb.load_model(ecfg["model"], device=edev,
                            max_seq_length=int(ecfg["max_seq_len"]))
     vecs = emb.embed_queries(model, topics, dim_trunc=int(ecfg["dim_truncated"]))

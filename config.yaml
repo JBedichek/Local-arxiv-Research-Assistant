@@ -1,27 +1,27 @@
-# Local arXiv Research Assistant — runtime configuration
+# Local arXiv Research Assistant — PORTABLE DEFAULTS
 #
-# ── DISK SAFETY ────────────────────────────────────────────────────────────────
-# This machine has three filesystems and only ONE of them is usable:
+# This file is tracked in git and must run on any machine. Anything specific to one
+# computer — which disk is real, how many GPUs it has, which model is downloaded — belongs
+# in `config.local.yaml`, which deep-merges over this file and is gitignored.
 #
-#   /                        nvme0n1p5   949G, 245G free   <-- everything goes here
-#   /data                    nvme0n1p3   883G,   0G free   <-- FULL, do not use
-#   /media/user/Extreme SSD  sda1        3.7T,  31G free   <-- nearly full, external
+# `lara setup` writes that file for you. You can also write it by hand; see
+# docs/setup/device_detection.md and PLAN.md D16.
 #
-# Every path below is checked by `lara preflight`, which resolves symlinks with
-# realpath and refuses to run if any path lands off the root filesystem or if free
-# space is below `disk.min_free_gb`. Do not replace these with relative paths that
-# could be resolved from a different cwd.
+# Every path here is checked by `lara preflight`, which resolves symlinks with realpath
+# and refuses to run if a path lands somewhere it should not or if free space is below
+# `disk.min_free_gb`.
 # ───────────────────────────────────────────────────────────────────────────────
 
 disk:
-  # Absolute, symlink-free. Resolved and validated at startup.
-  root: /home/user/Desktop/Local-arxiv-Research-Assistant/data
-  required_device: /dev/nvme0n1p5
-  min_free_gb: 60            # projected need is ~35 GB; refuse to start below this
-  forbid_paths:              # hard-blocked prefixes, even if something points there
-    - /data
-    - /media/user/Extreme SSD
-    - /media/user/ExtremeSSD
+  # Relative paths resolve against THIS FILE's directory, not the working directory, so
+  # `./data` means the same thing however lara is invoked. Override in config.local.yaml
+  # to put the corpus on a different disk.
+  root: ./data
+  # Pin the backing device (e.g. /dev/nvme0n1p5) in config.local.yaml if the machine has
+  # more than one filesystem and only some are usable. null means "wherever it resolves".
+  required_device: null
+  min_free_gb: 20            # a full ML corpus needs ~120 GB; raise this once you know
+  forbid_paths: []           # hard-blocked prefixes, even if something points there
 
 paths:
   metadata_db:  ${disk.root}/meta.sqlite       # papers, sections, chunks, FTS5
@@ -35,11 +35,11 @@ paths:
   raw_cache:    ${disk.root}/raw/              # transient fetched HTML, prunable
   logs:         ${disk.root}/logs/
 
-# Hugging Face cache — verified to be a real directory on /, NOT a symlink.
-# Pinned explicitly so a stray HF_HOME in the environment cannot redirect 100 GB
-# of downloads onto a full disk.
+# Hugging Face cache. Pinned explicitly so a stray HF_HOME in the environment cannot
+# redirect 100 GB of downloads onto a disk with no room. Override if your cache lives
+# elsewhere — check it is a real directory and not a symlink onto a full filesystem.
 huggingface:
-  home: /home/user/.cache/huggingface
+  home: ~/.cache/huggingface
   offline: false
 
 corpus:
@@ -97,14 +97,14 @@ embedding:
   dim_truncated: 256                     # MRL truncation for the warm tier
   batch_size: 512
   max_seq_len: 512
-  # GPU plan — 3x RTX PRO 6000 Blackwell, 102 GB each, sm_120 (verified via torch;
-  # nvidia-smi's NVML is broken but CUDA itself is fine).
-  #   bulk indexing: embedder uses cards 0+1, vLLM is not running
-  #   serving:       embedder card 0, reranker card 1, vLLM card 2
-  # All three cards during bulk indexing; vLLM reclaims card 2 at serve time. Fanned out
-  # via one worker pool with a single parent writer -- separate processes per GPU would
-  # race on the append-only vector files.
-  devices: [0, 1, 2]
+  # `auto` uses every accelerator it finds. A list of CUDA ordinals ([0, 1, 2]) pins
+  # specific cards and is what you want when a GPU is reserved for the generator; extra
+  # entries collapse harmlessly on smaller machines, and non-CUDA hardware maps onto its
+  # single device. See lara/device.py.
+  #
+  # Multi-GPU fans out through one worker pool with a single parent writer -- separate
+  # processes per GPU would race on the append-only vector files.
+  devices: auto
   # torch.compile. dynamic=true is important: sentence-transformers sorts by length and
   # pads per batch, so the encoder sees many shapes; static compilation would re-autotune
   # on each one and lose more than it gains. See lara/index/embed.py.
@@ -182,24 +182,20 @@ serving:
     base_url: http://127.0.0.1:8000/v1
     policy: single_resident              # stop the running server before starting another
     startup_timeout_sec: 300
-    # Card 1 alongside the reranker, which uses only ~1 GB of 102 GB. Cards are big
-    # enough that co-tenancy is free; card 2 stays clear for bulk embedding.
-    gpu_devices: [1]
-    gpu_memory_utilization: 0.5          # ~51 GB: 28 GB weights + ~23 GB KV cache
+    # null lets vLLM use whatever CUDA_VISIBLE_DEVICES exposes. Pin a card in
+    # config.local.yaml when the embedder or reranker needs one kept clear.
+    gpu_devices: null
+    gpu_memory_utilization: 0.5
     enable_prefix_caching: true
     kv_cache_dtype: auto
     max_model_len: 32768
-    # Qwen3.5 is a hybrid attention/Mamba architecture: every decode sequence needs its
-    # own Mamba cache block, and vLLM's default max_num_seqs of 1024 exceeds the ~280
-    # blocks that fit, which aborts CUDA graph capture. This is a single-user reader, so
-    # 64 concurrent sequences is already generous.
     max_num_seqs: 64
-    # D15: Qwen3.8-27B-FP8 — the checkpoint is natively FP8 (F8_E4M3), which Blackwell
-    # sm_120 runs on hardware tensor cores. Supersedes base Mixtral: it is instruction
-    # tuned, so the few-shot scaffolding D3 required for a base model is no longer
-    # load-bearing (it stays in the cached prefix, where it costs nothing).
-    default_model: Qwen/Qwen3.8-27B-FP8
-    default_quantization: fp8
+    # No portable default: the right generator depends entirely on how much memory the
+    # machine has, and silently trying to load a 27B checkpoint on a laptop is a worse
+    # failure than saying nothing is configured. `lara setup` picks one, the UI's model
+    # menu changes it, and `lara serve-llm --model ...` overrides it per run.
+    default_model: null
+    default_quantization: null
   sampling:
     temperature: 0.2
     top_p: 0.9
