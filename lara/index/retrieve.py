@@ -119,8 +119,13 @@ class Retriever:
         except RuntimeError:
             return                      # torn write between the two files; try later
         if on_disk > self.fp16.shape[0]:
+            # Re-map only. Rebuilding the row map here scans all 11M chunk rows and took
+            # ~5 s, and because the embedder grows the file continuously it fired on
+            # EVERY request while indexing was running — turning a 40 ms retrieval into a
+            # 5 s one. It is also unnecessary: rows added since startup are not in the
+            # GPU tier-1 index, so dense search cannot return them until /api/reload
+            # rebuilds both together.
             self.fp16 = self.store.open_fp16()
-            self._row_to_chunk = self._load_row_map()
 
     def _tier2_rescore(self, rows: np.ndarray, query_full: np.ndarray) -> np.ndarray:
         """Exact fp16 768-d scores for shortlisted rows, read from the mmap."""

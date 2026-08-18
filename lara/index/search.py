@@ -85,13 +85,23 @@ def reciprocal_rank_fusion(
 class DenseIndex:
     """Whole-corpus exact search as a GPU matmul. No ANN structure, no build step."""
 
-    def __init__(self, int8_matrix: np.ndarray, device: str = "cuda:0") -> None:
+    def __init__(self, int8_matrix: np.ndarray, device: str = "cuda:0",
+                 block: int = 1_000_000) -> None:
         self.device = device
-        mat = torch.from_numpy(int8_matrix.astype(np.float16))
-        # int8 rows are quantized from unit vectors; renormalize after the cast so the
-        # inner product is a true cosine.
-        mat = torch.nn.functional.normalize(mat.float(), dim=1).half()
-        self.matrix = mat.to(device)
+        n, dim = int8_matrix.shape
+        # Built block-wise straight into the destination tensor. Converting the whole
+        # matrix at once needs a full float32 copy — 11.4 GB at 11M vectors — which the
+        # caching allocator then holds, so cuda:0 reported 24.7 GB for 6.5 GB of resident
+        # data. Blocks keep the transient at ~1 GB regardless of corpus size.
+        self.matrix = torch.empty((n, dim), dtype=torch.float16, device=device)
+        for start in range(0, n, block):
+            stop = min(start + block, n)
+            part = torch.from_numpy(int8_matrix[start:stop]).to(device).float()
+            # int8 rows are quantized from unit vectors; renormalize after the cast so the
+            # inner product is a true cosine.
+            self.matrix[start:stop] = torch.nn.functional.normalize(part, dim=1).half()
+            del part
+        torch.cuda.empty_cache()
         self.n, self.dim = self.matrix.shape
 
     def vram_bytes(self) -> int:
@@ -234,8 +244,16 @@ def plan_query(
     scored = [(t, freq[t]) for t in tokens if freq.get(t, 0) > 0]
     scored.sort(key=lambda kv: kv[1])
     keep = [t for t, df in scored if df <= ceiling][:max_terms]
-    if not keep:                      # every term is common; fall back to the rarest few
-        keep = [t for t, _ in scored[:max_terms]]
+    if not keep:
+        # Every term is common. Falling back to "the rarest few" still ORs several
+        # enormous posting lists: a query of only common words measured 704 ms this way.
+        # Take just the single rarest, and if even that appears in a large slice of the
+        # corpus, skip BM25 entirely — a term that common carries almost no BM25 signal,
+        # so the only thing the scan buys is latency. Dense retrieval covers the query.
+        rarest_df = scored[0][1] if scored else 0
+        if rarest_df > corpus_size * 0.05:
+            return ""
+        keep = [scored[0][0]]
     return " OR ".join(f'"{t}"' for t in keep)
 
 
