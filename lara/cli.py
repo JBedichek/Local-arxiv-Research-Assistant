@@ -1289,6 +1289,78 @@ def dataset_publish(
     )
 
 
+@dataset_app.command("pull")
+def dataset_pull(
+    repo: str = typer.Option(None, help="Hugging Face dataset repo (default: the published corpus)"),
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    tiers: str = typer.Option("core", help="core | full | archive (comma-separated)"),
+    revision: str = typer.Option(None, help="Branch, tag or commit to pin"),
+    list_only: bool = typer.Option(False, "--list", help="Show what is in the repo and exit"),
+    workers: int = typer.Option(8, help="Parallel download workers"),
+) -> None:
+    """Download the corpus from Hugging Face. No account needed; resumes if interrupted.
+
+    Tiers: `core` gives working search and answers, `full` adds the fp16 vectors for exact
+    rescoring, `archive` adds the raw crawled HTML (only useful if you intend to re-parse).
+    """
+    from huggingface_hub import list_repo_files, snapshot_download
+    from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
+
+    from lara.serve import dataset as DS
+
+    cfg = config_mod.load(config)
+    root = cfg.get_path("disk.root")
+    repo = repo or DS.HF_REPO
+    want = tuple(t.strip() for t in tiers.split(",") if t.strip())
+    unknown = [t for t in want if t not in DS.HF_TIER_PREFIXES]
+    if unknown:
+        console.print(f"[red]unknown tier(s)[/red] {', '.join(unknown)}; "
+                      f"choose from {', '.join(DS.HF_TIER_PREFIXES)}")
+        raise typer.Exit(1)
+
+    try:
+        files = list_repo_files(repo, repo_type="dataset", revision=revision)
+    except RepositoryNotFoundError:
+        console.print(f"[red]{repo} not found[/red] as a dataset repo. Check the name, and "
+                      f"note the Hub returns the same error for private repos as for "
+                      f"missing ones.")
+        raise typer.Exit(1) from None
+    except GatedRepoError:
+        console.print(f"[red]{repo} is gated[/red] — accept its terms on the Hub, then "
+                      f"`huggingface-cli login`.")
+        raise typer.Exit(1) from None
+
+    patterns = DS.hf_patterns(want)
+    import fnmatch
+    chosen = [f for f in files if any(fnmatch.fnmatch(f, p) for p in patterns)]
+
+    if list_only or not chosen:
+        table = Table(show_header=True, header_style="bold")
+        table.add_column("file"); table.add_column("tier")
+        for f in sorted(files):
+            tier = next((t for t, ps in DS.HF_TIER_PREFIXES.items()
+                         if any(f.startswith(p) for p in ps)), "-")
+            table.add_row(f, tier)
+        console.print(table)
+        console.print(f"\n{len(files)} files in [bold]{repo}[/bold]")
+        if not chosen and not list_only:
+            console.print(f"[yellow]nothing matches tier(s) {', '.join(want)}[/yellow] — "
+                          f"the upload may still be in progress.")
+        return
+
+    console.print(f"pulling [bold]{len(chosen)}[/bold] file(s) from {repo} "
+                  f"(tiers: {', '.join(want)}) into {root}")
+    console.print("[dim]Resumable: re-run after an interruption and it continues. "
+                  "Hub downloads are checksummed on arrival.[/dim]\n")
+    root.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=repo, repo_type="dataset", revision=revision,
+        local_dir=str(root), allow_patterns=patterns, max_workers=int(workers),
+    )
+    console.print(f"\n[green]done[/green] — {root}")
+    console.print("next: [bold]lara setup[/bold], then [bold]lara serve[/bold]")
+
+
 @dataset_app.command("fetch")
 def dataset_fetch(
     base_url: str = typer.Argument(..., help="http://host:8080 of the publishing node"),

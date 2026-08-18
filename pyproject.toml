@@ -29,6 +29,7 @@ dependencies = [
   "pyarrow>=17.0",
   "zstandard>=0.23",
   # embedding
+  "huggingface-hub>=0.26",   # dataset pull; also a transitive dep of the two below
   "sentence-transformers>=5.0",
   "transformers>=4.55",
   "torch>=2.7",

@@ -35,6 +35,34 @@ TIERS = {
 }
 MANIFEST_NAME = "dataset_manifest.json"
 
+#: Published corpus on the Hub. A dataset repo, so `repo_type="dataset"` is required —
+#: the default model-repo lookup 404s against it.
+HF_REPO = "JamesBedichek/lara-corpus-ML-08-17-26"
+
+#: Which repo paths belong to which tier. Matched as prefixes so the sharding inside
+#: `vectors/` or `raw/` does not have to be known ahead of time.
+HF_TIER_PREFIXES = {
+    "core": ("meta.sqlite", "vectors/int8.bin", "vectors/papers_"),
+    "full": ("vectors/fp16.bin",),
+    "archive": ("raw/",),
+}
+
+
+def hf_patterns(tiers: tuple[str, ...]) -> list[str]:
+    """`allow_patterns` for the requested tiers.
+
+    Prefixes become globs so a file that was uploaded in parts (``vectors/fp16.bin.001``)
+    is still matched. Downloading the whole repo when someone asked for `core` would mean
+    an unwanted 38 GB of raw HTML.
+    """
+    out: list[str] = []
+    for tier in tiers:
+        for prefix in HF_TIER_PREFIXES.get(tier, ()):
+            out.append(prefix if prefix.endswith("/") else f"{prefix}*")
+            if prefix.endswith("/"):
+                out[-1] = f"{prefix}**"
+    return out
+
 
 @dataclass
 class Entry:
