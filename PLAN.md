@@ -851,6 +851,62 @@ Three defects found by measuring rather than by reading:
 Also fixed: ``chunks_fts`` had drifted to 957 k rows against 2.38 M chunks, because
 external-content FTS5 does not track its content table. Triggers now maintain it.
 
+- **D16 — Config layering: portable defaults + generated local override.** `config.yaml`
+  today is git-tracked *and* machine-specific — it pins `required_device:
+  /dev/nvme0n1p5`, `forbid_paths: [/data, /media/user/Extreme SSD]` and `devices: [0,1,2]`,
+  none of which exist on anyone else's machine. A fresh clone therefore fails `lara
+  preflight` before it reaches anything else. Split it: `config.yaml` keeps portable
+  defaults and stays tracked; `config.local.yaml` is written by setup, gitignored, and
+  deep-merged over it. Machine facts (backing device, GPU list, disk root) are *derived*
+  at setup time, never shipped. Rejected: environment variables (invisible, unversioned,
+  and a stray `HF_HOME` has already redirected downloads once) and mutating `config.yaml`
+  in place (turns every setup run into a spurious diff).
+- **D17 — First-run setup wizard, browser-first with a headless equivalent.** `lara setup`
+  serves a wizard on the reader's port, then hands off to the full server. Steps: detect →
+  probe for a running generator → retrieval profile → model → optional benchmark → write
+  and launch. Corpus acquisition is deliberately **out of scope** and stays in the CLI:
+  it is a multi-hour operation with its own resumable state, and burying it in a wizard
+  invites someone to close the tab on a half-built index. `--non-interactive --profile
+  balanced` covers servers and CI through the same code path, so the wizard is not the
+  only way in.
+- **D18 — Fit guarding is three-state, not a boolean.** Block only what is *certain* to
+  fail (model exceeds total RAM, index exceeds device memory); warn and require an
+  explicit recorded override when headroom is under 15%; recommend otherwise. A hard block
+  that is wrong is worse than a warning — the user may be about to close other
+  applications, and `usable_ram_gb` is an estimate with a fixed 4–6 GB reserve, not a
+  measurement. Overrides are persisted to `config.local.yaml` so a later OOM is
+  diagnosable rather than mysterious.
+- **D19 — Tier-1 index resident as int8, dequantized inside the matmul.** `DenseIndex`
+  currently converts the int8 file to **fp16 on device**, so the resident cost is
+  `n_chunks x dim_truncated x 2` — **12.2 GB at 23.9 M chunks, 14.7 GB at full corpus**.
+  On a 16 GB Mac (`usable_ram_gb` = 10) the index alone does not fit, before the embedder
+  (1.2 GB), the reranker (1.2 GB) or any generator. Keeping the matrix int8 halves it at
+  negligible cost, because tier 2 already re-scores every survivor at exact fp16-768 —
+  the first pass only has to be good enough to shortlist. This is the single change that
+  makes small machines viable:
+
+  ============================  ==============  ==============
+  configuration                 23.9 M chunks   28.7 M chunks
+  ============================  ==============  ==============
+  fp16, dim 256  (as built)     12.2 GB         14.7 GB
+  fp16, dim 128                  6.1 GB          7.3 GB
+  int8, dim 256  (D19)           6.1 GB          7.3 GB
+  int8, dim 128                  3.1 GB          3.7 GB
+  ============================  ==============  ==============
+
+- **D20 — Profiles are solved for, not hardcoded.** Given `budget_gb` and the live chunk
+  count, derive the largest `(dim_truncated, index_dtype, cross_encoder, tier2_candidates)`
+  combination that fits, and show the user what each dial costs. Three presets — Minimal /
+  Balanced / Maximum — but each displays its *computed* numbers, so "Balanced" on a 96 GB
+  box and on a 16 GB box are genuinely different configurations rather than the same guess
+  with a different label. A table of fixed presets would be stale the moment the corpus
+  grows, and this corpus grows continuously.
+- **D21 — Hardware changes are detected, never silently accommodated.** Setup records the
+  machine fingerprint it configured against. If the GPU count, VRAM or `dim_truncated`
+  no longer matches what the vectors were built with, refuse to start and say so. Silent
+  reconfiguration is how an index ends up mismatched with the vectors it indexes, and that
+  failure is invisible until search quality quietly degrades.
+
 ### 12.1 Still open
 
 Nothing blocking. Deferred until there is a corpus to measure against:
@@ -871,3 +927,114 @@ with the fix:
 sudo rmmod nvidia_uvm nvidia_drm nvidia_modeset nvidia && sudo modprobe nvidia
 # or reboot if the modules are held by a display server
 ```
+
+*(Resolved 2026-08-17 by reboot.)*
+
+---
+
+## 13. Portability and first-run setup (D16–D21)
+
+Everything measured so far assumes this machine: three RTX PRO 6000s, 250 GB of RAM, and a
+disk layout hardcoded into a tracked config file. The goal of this section is that someone
+with a 16 GB MacBook can clone the repo and reach a working reader without editing YAML.
+
+### 13.1 The two blockers
+
+**The repo does not currently run on non-CUDA hardware at all.** This is not a missing
+feature in the wizard — it is a hard failure underneath it:
+
+- Device strings are constructed as `f"cuda:{n}"` in eight places: `serve/state.py:39,115`,
+  `cli.py:274,340,349,435,727`, `index/embed.py:118`.
+- `torch.cuda.empty_cache()` is called unconditionally in `index/search.py:104` and
+  `cli.py:522,555,560,608`. On MPS this raises.
+- `torch.autocast(device_type="cuda")` is hardcoded in `finetune/train.py:242` and
+  `finetune/kfold.py:227`.
+- `config.yaml` is tracked and machine-specific (D16).
+
+**The binding memory constraint is the index, not the model** (D19). This inverts the
+obvious design: a wizard that only checks whether the *generator* fits would happily
+configure a machine that then OOMs building the search index, which is the part that has no
+graceful degradation path.
+
+### 13.2 Device abstraction
+
+A single `lara/device.py` resolver replacing every hardcoded string:
+
+- `resolve(spec)` maps `None | 0 | "cuda:1" | "auto"` onto a concrete torch device, honouring
+  what is actually present rather than what the config requests.
+- `empty_cache(device)` dispatches to `torch.cuda` / `torch.mps` / no-op.
+- `autocast_dtype(device)` — bf16 on CUDA, fp16 on MPS (MPS bf16 support is uneven), fp32
+  on CPU.
+- Config gains `embedding.devices: auto` as the default, resolving to every visible
+  accelerator, with an explicit list still honoured.
+
+Multi-GPU fan-out (`MultiGPUEncoder`) stays CUDA-only — `start_multi_process_pool` across
+MPS devices is meaningless, since there is one GPU and it shares the RAM.
+
+### 13.3 The memory planner
+
+One function, `plan(device, n_chunks, corpus_bytes) -> Profile`, is the single source of
+truth for both the wizard and `lara preflight`. Components it accounts for:
+
+============================  ==================================================
+component                     cost
+============================  ==================================================
+tier-1 index                  `n_chunks x dim_truncated x (1 if int8 else 2)`
+embedder                      ~1.2 GB (EmbeddingGemma-300m)
+cross-encoder                 ~1.2 GB fp16 (bge-reranker-v2-m3), optional
+tier-0 hot cache              `hot_tier.max_bytes`, default 2 GB, tunable
+generator                     checkpoint size x 1.35 (KV cache + activations)
+============================  ==================================================
+
+The `x 1.35` KV overhead already exists in `serve/devices.py:fits()` and is reused rather
+than reinvented. On unified memory every one of these draws from the same pool as the
+display server, which is why `usable_ram_gb` reserves 6 GB there against 4 GB on discrete
+GPUs.
+
+### 13.4 Wizard flow
+
+1. **Detect** — `devices.detect()`, plus disk free at the configured root and the live chunk
+   count if a corpus already exists.
+2. **Probe** — scan `:8000` (vLLM), `:11434` (Ollama), `:1234` (LM Studio), `:8080`
+   (llama.cpp) for a live OpenAI-compatible `/v1/models`. If one answers, the entire model
+   download step is skipped — many Mac users already have Ollama running, and asking them
+   to re-download a model they have is the fastest way to lose them.
+3. **Retrieval profile** — D20, with a live memory budget bar. Every dial shows its cost in
+   GB and its cost in quality, both measured.
+4. **Model** — the existing `/api/model/resolve` HF lookup, guarded by D18.
+5. **Benchmark** *(optional, ~30 s)* — actually time this machine's embed throughput and
+   tier-1 matmul rather than quoting figures from a 3-GPU Blackwell box. Latency estimates
+   shown to the user should come from their hardware, not ours.
+6. **Write and launch** — `config.local.yaml`, then `lara preflight`, then hand off.
+
+`lara setup --reconfigure` reloads current values and backs up the previous file with a
+timestamp. Changing `dim_truncated` invalidates every existing vector, so the wizard states
+that re-embed cost up front (~1.7 h across three GPUs at current corpus size) rather than
+letting it be discovered afterwards.
+
+### 13.5 The no-GPU path is first-class
+
+Retrieval without a GPU is genuinely fine — CPU HNSW measured ~7 ms at 96 % recall
+(§12.0.3). Only *building* the index is painful, at roughly 50x slower embedding. So a
+machine with no accelerator should get a fully working reader by fetching a prebuilt corpus
+(§ dataset tiers) and pointing `serving.vllm.base_url` at any OpenAI-compatible endpoint,
+local or remote. The wizard should present this as a supported configuration rather than a
+degraded one.
+
+### 13.6 Phasing
+
+============  =======================================================  ==========================
+phase         work                                                     unlocks
+============  =======================================================  ==========================
+1             `lara/device.py`; purge hardcoded `cuda:`                 runs on Mac / CPU at all
+2             config layering (D16), portable defaults, advisory        a fresh clone starts
+              preflight
+3             int8-resident index (D19), memory planner (D20)           16 GB machines viable
+4             wizard UI, `lara setup` (D17, D18)                        the requested feature
+5             endpoint probing, benchmark step, fingerprint (D21)       accessibility polish
+============  =======================================================  ==========================
+
+Phases 1–3 are the substance; phase 4 is mostly UI over primitives that already exist
+(`devices.detect()`, `devices.fits()`, `downloads.resolve()`). Phase 3 modifies
+`index/search.py`, which the running server holds in memory, so it needs a restart window
+and must not land while a bulk embed is in flight.
