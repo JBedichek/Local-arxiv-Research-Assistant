@@ -779,6 +779,103 @@ def embed_papers(
         conn.close()
 
 
+@app.command("bench-index")
+def bench_index(
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    n: int = typer.Option(2_000_000, help="Vectors to benchmark over (0 = whole corpus)"),
+    queries: int = typer.Option(20, help="Queries to time"),
+    k: int = typer.Option(200, help="Candidates per query, as tier 1 is actually used"),
+    only: str = typer.Option(None, help="Comma-separated subset, e.g. 'faiss sq8,torch int8'"),
+) -> None:
+    """Measure every tier-1 backend on THIS machine, so the choice is not a guess.
+
+    Recall is reported against exact fp16, which is the definition of correct here — not
+    against ground truth, which tier 1 was never trying to produce on its own.
+    """
+    import time
+
+    import numpy as np
+
+    from lara.index import backends as BK
+    from lara.index.vectors import VectorStore
+
+    cfg = config_mod.load(config)
+    ecfg = cfg.get_in("embedding")
+    store = VectorStore(
+        cfg.get_path("paths.vectors_fp16"), cfg.get_path("paths.vectors_int8"),
+        dim_full=int(ecfg["dim_full"]), dim_trunc=int(ecfg["dim_truncated"]),
+    )
+    total = store.rows()
+    if total == 0:
+        console.print("[red]no vectors[/red] — build or fetch the corpus first")
+        raise typer.Exit(1)
+
+    use = total if not n else min(n, total)
+    mat = store.load_int8(mmap=True)[:use]
+    console.print(f"benchmarking [bold]{use:,}[/bold] of {total:,} vectors, "
+                  f"dim {mat.shape[1]}, k={k}, {queries} queries\n")
+
+    rng = np.random.default_rng(0)
+    picks = rng.choice(use, queries, replace=False)
+    qs = [(lambda v: (v / np.linalg.norm(v)).astype(np.float16))(mat[i].astype(np.float32))
+          for i in picks]
+
+    candidates = [
+        ("torch fp16", lambda: BK.TorchBackend(mat, precision="fp16")),
+        ("torch int8", lambda: BK.TorchBackend(mat, precision="int8")),
+        ("torch fp16 cpu", lambda: BK.TorchBackend(mat, device="cpu", precision="fp16")),
+        ("faiss flat", lambda: BK.FaissBackend(mat, cfg=BK.FaissConfig(kind="flat"))),
+        ("faiss sq8", lambda: BK.FaissBackend(mat, cfg=BK.FaissConfig(kind="sq8"))),
+        ("faiss hnsw", lambda: BK.FaissBackend(mat, cfg=BK.FaissConfig(kind="hnsw"))),
+    ]
+    if only:
+        want = {s.strip().lower() for s in only.split(",")}
+        candidates = [c for c in candidates if c[0].lower() in want]
+    if not BK.faiss_available():
+        candidates = [c for c in candidates if not c[0].startswith("faiss")]
+        console.print("[yellow]faiss not installed[/yellow] — skipping those "
+                      "(pip install 'lara[cpu]')\n")
+
+    gold: list[set[int]] = []
+    table = Table(show_header=True, header_style="bold")
+    for col, just in (("backend", "left"), ("memory", "right"), ("build", "right"),
+                      ("p50", "right"), ("p95", "right"), ("recall@k", "right")):
+        table.add_column(col, justify=just)
+
+    for name, make in candidates:
+        try:
+            t0 = time.time()
+            ix = make()
+            build_s = time.time() - t0
+            lat = []
+            got = []
+            for q in qs:
+                t0 = time.time()
+                rows, _ = ix.search(q, k=k)
+                lat.append((time.time() - t0) * 1000)
+                got.append(set(rows.tolist()))
+            if not gold:
+                gold = got                       # first backend is exact fp16 = reference
+            rec = sum(len(a & b) for a, b in zip(got, gold)) / max(1, sum(len(g) for g in gold))
+            lat.sort()
+            table.add_row(
+                name, f"{ix.memory_bytes() / 1e9:.2f} GB", f"{build_s:.1f}s",
+                f"{lat[len(lat) // 2]:.1f}ms", f"{lat[int(len(lat) * 0.95) - 1]:.1f}ms",
+                f"{rec:.3f}",
+            )
+            del ix
+            ldev.empty_cache()
+        except Exception as exc:                  # a backend that cannot build is a result
+            table.add_row(name, "-", "-", "-", "-", f"[red]{type(exc).__name__}[/red]")
+
+    console.print(table)
+    scale = total / use if use else 1
+    console.print(f"\n[dim]Memory scales linearly: multiply by {scale:.1f}x for the full "
+                  f"{total:,}-vector corpus. Recall is measured against exact fp16.[/dim]")
+    console.print("[dim]Write the winner into config.local.yaml as index.backend / "
+                  "index.precision / index.faiss.kind.[/dim]")
+
+
 corpus_app = typer.Typer(help="Corpus residency — what stays in RAM")
 app.add_typer(corpus_app, name="corpus")
 

@@ -99,6 +99,18 @@ class VectorStore:
     def open_fp16(self) -> np.memmap:
         return np.memmap(self.fp16_path, dtype=np.float16, mode="r").reshape(-1, self.dim_full)
 
-    def load_int8(self) -> np.ndarray:
-        """Read the whole tier-1 matrix into RAM — 4.1 GB at 16 M chunks."""
+    def load_int8(self, mmap: bool = False) -> np.ndarray:
+        """The tier-1 matrix — 7.3 GB at 28.7 M chunks.
+
+        ``mmap=True`` maps it instead of reading it, which matters in two cases that are
+        the norm on a small machine: a **scoped** index (D22) touches only the pages of the
+        rows it keeps, and a **faiss** build streams the matrix in blocks and never needs
+        all of it at once. Reading 7.3 GB into RAM first, only to gather 5 % of it, is the
+        difference between working and swapping on a 16 GB laptop.
+
+        The default stays eager: the CUDA path copies the whole thing to the device
+        immediately, where a memmap would only add a page-fault detour.
+        """
+        if mmap:
+            return np.memmap(self.int8_path, dtype=np.int8, mode="r").reshape(-1, self.dim_trunc)
         return np.fromfile(self.int8_path, dtype=np.int8).reshape(-1, self.dim_trunc)

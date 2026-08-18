@@ -20,6 +20,7 @@ import numpy as np
 
 from lara import config as config_mod
 from lara import device as dev
+from lara.index import backends as BK
 from lara.index import embed as emb
 from lara.index import retrieve as R
 from lara.index import scope as SC
@@ -141,6 +142,9 @@ class AppState:
             df_ceiling_frac=float(lex.get("df_ceiling_frac", 0.005)),
             cross_encoder=cross,
             resident_rows=resident,
+            backend=icfg.get("backend", "auto"),
+            precision=icfg.get("precision", "fp16"),
+            faiss_cfg=BK.FaissConfig(**(icfg.get("faiss") or {})),
         )
         self.warmup_ms["index"] = (time.time() - t0) * 1000
 

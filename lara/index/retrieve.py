@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from lara import device as dev
+from lara.index import backends as BK
 from lara.index import search as S
 from lara.index.embed import embed_queries
 from lara.index.vectors import VectorStore
@@ -44,6 +45,9 @@ class Retriever:
         df_ceiling_frac: float = 0.005,
         cross_encoder=None,
         resident_rows: "np.ndarray | None" = None,
+        backend: str | None = None,
+        precision: str = "fp16",
+        faiss_cfg=None,
     ) -> None:
         # A connection may be passed directly (CLI, single-threaded) or as a factory
         # (server). It must be a factory under a server: Starlette dispatches sync
@@ -75,8 +79,16 @@ class Retriever:
         self.device = dev.resolve(device)
         # resident_rows is D22's keep-set. None means the whole corpus is resident, which
         # is the default and the behaviour everything else assumes.
-        self.dense = S.DenseIndex(store.load_int8(), device=self.device,
-                                  row_ids=resident_rows)
+        #
+        # mmap the source whenever we will not copy all of it to a device: faiss streams it
+        # in blocks and a scoped index gathers a few percent of the rows, so reading 7.3 GB
+        # eagerly first is pure waste on exactly the machines that can least afford it.
+        chosen = BK.choose_backend(backend)
+        lazy = chosen == "faiss" or resident_rows is not None
+        self.dense = BK.make_index(
+            store.load_int8(mmap=lazy), backend=chosen, precision=precision,
+            device=self.device, row_ids=resident_rows, faiss_cfg=faiss_cfg,
+        )
         self.fp16 = store.open_fp16()          # mmap; the OS page cache does the rest
         self._row_to_chunk = self._load_row_map()
 

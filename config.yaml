@@ -121,11 +121,34 @@ embedding:
   doc_prefix: "title: {title} > {section} | text: "
 
 index:
-  warm:
-    kind: hnsw                           # faiss HNSW over int8 MRL-256
-    m: 32
+  # Tier-1 search backend. `lara bench-index` measures these on your machine and
+  # `lara setup` writes the answer into config.local.yaml.
+  #
+  # Measured p50 / recall@200 / full-corpus memory (see lara/index/backends.py):
+  #   torch fp16 cuda    1.1ms  1.000  15.1 GB   fastest anywhere
+  #   torch int8 cuda    8.2ms  0.996   7.5 GB   half the memory for 0.4% recall
+  #   torch fp16 cpu    12.3ms  0.995  15.1 GB   best exact CPU option
+  #   torch int8 cpu     282ms  0.995   7.5 GB   avoid: dequant is not vectorised on CPU
+  #   faiss flat        61.3ms  0.996  30.3 GB   slower AND larger than torch fp16
+  #   faiss sq8          372ms  0.991   7.5 GB   smallest, far too slow
+  #   faiss hnsw         2.1ms  0.979  37.9 GB   fastest at scale, memory-hungry
+  #
+  #   backend: auto -> torch. faiss is opt-in and worth it only for hnsw.
+  #   precision: fp16 | int8. int8 is a GPU optimisation; on CPU it is 25x slower.
+  #
+  # No backend fits the full corpus on a laptop. Use `lara corpus scope` to keep only the
+  # topics you care about resident — at keep=0.05 this is ~1.4M chunks, where torch fp16
+  # needs 0.7 GB and answers in single-digit ms.
+  backend: auto
+  precision: fp16
+  faiss:
+    kind: hnsw                           # flat (exact) | sq8 (exact-ish, 4x smaller) | hnsw (approximate)
+    m: 32                                # hnsw graph degree
     ef_construction: 200
-    ef_search: 64
+    # recall@200 measured on 1M real vectors: 64 -> 0.750, 256 -> 0.938, 512 -> 0.979,
+    # 1024 -> 0.993. Below 512 you silently lose a large slice of the true top-k.
+    ef_search: 512
+    threads: 0                           # 0 leaves faiss's default
   rerank:
     tier2_candidates: 200                # exact fp16 rescore from mmap
     final_k: 20
