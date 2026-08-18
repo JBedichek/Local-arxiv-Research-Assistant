@@ -234,9 +234,9 @@ li.placeholder { color: var(--dim); padding: 12px; }
   height: var(--graph-h, 460px); min-height: 160px; }
 #results-graph { display: block; }
 #results-labels { position: absolute; inset: 0; pointer-events: none; }
-a.glabel { position: absolute; display: flex; align-items: center; gap: 7px;
-  pointer-events: auto; text-decoration: none; color: var(--text);
-  padding: 0 7px; border-radius: 5px; max-width: 54%; font-size: 12px; }
+a.glabel { position: absolute; left: 0; right: 8px; display: flex; align-items: center;
+  gap: 7px; pointer-events: auto; text-decoration: none; color: var(--text);
+  border-radius: 5px; font-size: 12px; cursor: pointer; }
 a.glabel:hover { background: var(--panel-2); outline: 1px solid var(--accent); }
 a.glabel .rk { color: var(--dim); font-size: 10.5px; min-width: 15px;
   font-variant-numeric: tabular-nums; }
@@ -275,3 +275,9 @@ label.breadth #breadth-val em { font-style: normal; color: var(--dim); }
   border: 2px solid var(--line); border-top-color: var(--accent);
   animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* A collapsed pane keeps its splitter grabbable so it can be dragged back open. */
+#graph-pane.collapsed, #chat-pane.collapsed { display: none; }
+.splitter { min-width: 6px; }
+.splitter::after { content: ""; position: absolute; width: 14px; height: 100%;
+  transform: translateX(-4px); }

@@ -44,25 +44,32 @@ def _state() -> AppState:
 
 # ── UI ────────────────────────────────────────────────────────────────────────────
 
+# no-cache, not no-store: the browser still revalidates cheaply with ETag, but never
+# serves a stale bundle after an edit. Debugging a fix that "did not work" because the
+# browser kept yesterday's JavaScript is a bad afternoon.
+_NOCACHE = {"Cache-Control": "no-cache, must-revalidate"}
+
+
 @app.get("/")
 def index() -> FileResponse:
-    return FileResponse(WEB_ROOT / "index.html")
+    return FileResponse(WEB_ROOT / "index.html", headers=_NOCACHE)
 
 
 @app.get("/app.js")
 def appjs() -> FileResponse:
-    return FileResponse(WEB_ROOT / "app.js", media_type="application/javascript")
+    return FileResponse(WEB_ROOT / "app.js", media_type="application/javascript",
+                        headers=_NOCACHE)
 
 
 @app.get("/style.css")
 def appcss() -> FileResponse:
-    return FileResponse(WEB_ROOT / "style.css", media_type="text/css")
+    return FileResponse(WEB_ROOT / "style.css", media_type="text/css", headers=_NOCACHE)
 
 
 @app.get("/p/{arxiv_id:path}")
 def reader(arxiv_id: str) -> FileResponse:
     """Deep links land here; the client reads the id and fragment from the URL."""
-    return FileResponse(WEB_ROOT / "index.html")
+    return FileResponse(WEB_ROOT / "index.html", headers=_NOCACHE)
 
 
 # ── data ──────────────────────────────────────────────────────────────────────────

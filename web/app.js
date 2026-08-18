@@ -634,10 +634,43 @@ const prefs = {
   set(k, v) { try { localStorage.setItem("lara." + k, v); } catch { /* private mode */ } },
 };
 
-function applyLayout() {
-  document.documentElement.style.setProperty("--col-left", prefs.get("colLeft", "300px"));
-  document.documentElement.style.setProperty("--col-right", prefs.get("colRight", "400px"));
+function setPaneCollapsed(edge, collapsed) {
+  const pane = edge === "left" ? $("#graph-pane") : $("#chat-pane");
+  pane.classList.toggle("collapsed", collapsed);
 }
+
+function applyLayout() {
+  const l = prefs.get("colLeft", "300px"), r = prefs.get("colRight", "400px");
+  document.documentElement.style.setProperty("--col-left", l);
+  document.documentElement.style.setProperty("--col-right", r);
+  setPaneCollapsed("left", parseInt(l, 10) === 0);
+  setPaneCollapsed("right", parseInt(r, 10) === 0);
+}
+
+/* Keyboard: [ and ] toggle the sidebars, \ gives the paper the whole window. */
+document.addEventListener("keydown", (ev) => {
+  if (ev.target.matches("input, textarea, select")) return;
+  const root = document.documentElement;
+  const toggle = (v, dflt, edge) => {
+    const cur = parseInt(getComputedStyle(root).getPropertyValue(v), 10) || 0;
+    const next = cur === 0 ? dflt : "0px";
+    root.style.setProperty(v, next);
+    prefs.set(v === "--col-left" ? "colLeft" : "colRight", next);
+    setPaneCollapsed(edge, next === "0px");
+  };
+  if (ev.key === "[") { toggle("--col-left", "300px", "left"); drawGraph(); }
+  else if (ev.key === "]") { toggle("--col-right", "400px", "right"); }
+  else if (ev.key === "\\") {
+    const hidden = parseInt(getComputedStyle(root).getPropertyValue("--col-left"), 10) === 0;
+    const l = hidden ? "300px" : "0px", r = hidden ? "400px" : "0px";
+    root.style.setProperty("--col-left", l);
+    root.style.setProperty("--col-right", r);
+    prefs.set("colLeft", l); prefs.set("colRight", r);
+    setPaneCollapsed("left", !hidden); setPaneCollapsed("right", !hidden);
+    drawGraph();
+  } else return;
+  setTimeout(drawSearchGraph, 0);
+});
 
 function makeSplitter(el, varName, prefKey, edge) {
   let startX = 0, startPx = 0;
@@ -656,9 +689,13 @@ function makeSplitter(el, varName, prefKey, edge) {
   el.addEventListener("pointermove", (ev) => {
     if (!el.hasPointerCapture?.(ev.pointerId)) return;
     const delta = edge === "left" ? ev.clientX - startX : startX - ev.clientX;
-    // Clamp so a pane can never be dragged to nothing or swallow the paper.
-    const px = Math.max(180, Math.min(startPx + delta, window.innerWidth * 0.45));
+    // Free range: 0 (collapsed, so the paper gets the whole window) up to 85%, so the
+    // graph or chat can take over the screen instead. Below 60px it snaps shut rather
+    // than leaving a useless sliver.
+    let px = Math.max(0, Math.min(startPx + delta, window.innerWidth * 0.85));
+    if (px < 60) px = 0;
     root.style.setProperty(varName, px + "px");
+    setPaneCollapsed(edge, px === 0);
   });
   const end = (ev) => {
     if (!el.classList.contains("dragging")) return;
@@ -670,11 +707,17 @@ function makeSplitter(el, varName, prefKey, edge) {
   };
   el.addEventListener("pointerup", end);
   el.addEventListener("pointercancel", end);
+  // Double-click toggles collapsed <-> default, which is the fast path for "give me the
+  // whole screen for the paper" and back.
   el.addEventListener("dblclick", () => {
-    const d = edge === "left" ? "300px" : "400px";
-    root.style.setProperty(varName, d);
-    prefs.set(prefKey, d);
+    const dflt = edge === "left" ? "300px" : "400px";
+    const now = current();
+    const next = now === 0 ? dflt : "0px";
+    root.style.setProperty(varName, next);
+    prefs.set(prefKey, next);
+    setPaneCollapsed(edge, next === "0px");
     drawGraph();
+    drawSearchGraph();
   });
 }
 
@@ -871,14 +914,17 @@ function drawSearchGraph() {
     }
   }
 
-  // labels as real links
+  // Each row is one full-width link, indented past its own dot. Making the whole row the
+  // target means clicking the node circle, the title, or the empty space between them all
+  // open the paper — an earlier version put the link only on the text, so clicking the
+  // dot silently did nothing, which is the most natural thing to click.
   overlay.innerHTML = placed.map((n) => {
-    const left = Math.round(n.x + n.radius + NODE_LABEL_GAP);
+    const pad = Math.round(n.x + n.radius + NODE_LABEL_GAP);
     const cites = n.in_degree
       ? `<span class="deg" title="cited by ${n.in_degree} of these results">↩${n.in_degree}</span>` : "";
     return `<a class="glabel" href="/p/${n.arxiv_id}v${n.version}" data-id="${n.arxiv_id}"
-       style="left:${left}px; top:${Math.round(n.y - ROW_H / 2)}px; height:${ROW_H}px"
-       title="${escapeHtml(n.title)}">
+       style="top:${Math.round(n.y - ROW_H / 2)}px; height:${ROW_H}px; padding-left:${pad}px"
+       title="${escapeHtml(n.title)} — click to open">
        <span class="rk">${n.rank}</span>${cites}
        <span class="ttl">${escapeHtml(n.title)}</span>
        <span class="yr">${escapeHtml((n.submitted || "").slice(0, 7))}</span></a>`;
