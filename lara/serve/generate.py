@@ -28,13 +28,43 @@ import httpx
 OPEN, CLOSE = "<think>", "</think>"
 
 SYSTEM = """You answer questions about arXiv machine-learning papers using only the \
-excerpts provided. Rules:
+excerpts provided.
 
-1. Ground every claim in an excerpt. If the excerpts do not contain the answer, say so \
-plainly rather than guessing.
-2. Cite with the bracketed marker of the excerpt you used, e.g. [1] or [3].
-3. Prefer quoting the paper's own terminology and notation.
-4. Be concise. Two or three sentences unless the question needs more."""
+Rules:
+1. Ground every claim in an excerpt and cite it as [n]. A sentence carrying a factual \
+claim with no citation is a bug.
+2. Never let a citation stand for something the excerpt does not actually say. If an \
+excerpt only partly supports a claim, say which part.
+3. Distinguish what the sources state from what you are inferring. Mark inference \
+explicitly ("this implies", "the excerpts do not say, but").
+4. If two excerpts disagree — different numbers, opposite conclusions, incompatible \
+setups — say so and cite both. Do not silently pick one.
+5. Prefer the paper's own terminology and notation.
+6. Be concise. Two or three sentences unless the question genuinely needs more."""
+
+
+# Coverage-specific instructions appended to SYSTEM. The point is to make an honest
+# non-answer a first-class outcome rather than something the model has to improvise its
+# way out of — an LLM handed weak excerpts and a bare "answer the question" instruction
+# will reliably paper over the gap instead of naming it.
+COVERAGE_INSTRUCTIONS = {
+    "full": "",
+    "partial": """
+
+IMPORTANT — the retrieved excerpts only PARTIALLY answer this question. You must:
+- Open with one sentence stating plainly what the sources do not establish.
+- Then give what they DO support, cited as usual.
+- Do not fill the gap with background knowledge.""",
+    "none": """
+
+IMPORTANT — the retrieved excerpts do NOT answer this question. You must:
+- Open by saying plainly that the sources do not contain the answer.
+- Then summarise what the most relevant excerpts DO cover, cited as usual, so the reader \
+can judge whether to rephrase or search elsewhere.
+- Do not attempt an answer from background knowledge. An honest non-answer is correct \
+here; a plausible invented one is not.""",
+}
+
 
 FEWSHOT = """Example.
 
@@ -58,15 +88,40 @@ def prefix_body(prefix: str) -> str:
     return prefix.split('---\n\n', 1)[-1]
 
 
+def order_for_attention(hits: list[dict]) -> list[dict]:
+    """Reorder excerpts so the strongest sit at the two ends of the context.
+
+    Transformers attend most reliably to the beginning and end of a long context and
+    weakest to its middle — the "lost in the middle" effect. Retrieval hands us excerpts
+    in descending relevance, which puts the second- and third-best evidence exactly where
+    the model is least likely to use it. Alternating outward from the ends costs nothing
+    and keeps the best material where it is actually read.
+    """
+    out: list[dict] = []
+    tail: list[dict] = []
+    for i, h in enumerate(hits):
+        (out if i % 2 == 0 else tail).append(h)
+    return out + tail[::-1]
+
+
 def build_prompt(
     query: str, hits: list[dict], selection: str | None = None
 ) -> tuple[str, str]:
     """Return (stable_prefix, tail). Split at the prefix-cache boundary."""
     lines = []
+    # Bind each citation marker to the excerpt's ORIGINAL rank first, so reordering for
+    # attention never renumbers what the reader ends up clicking.
     for i, h in enumerate(hits, 1):
+        h.setdefault("marker", i)
+    ordered = order_for_attention(hits)
+    for h in ordered:
         where = h.get("section") or ""
         title = h.get("paper_title") or h.get("arxiv_id", "")
-        lines.append(f"[{i}] ({title} > {where}) {h.get('text', '').strip()}")
+        date = (h.get("submitted") or "")[:7]
+        stamp = f", {date}" if date else ""
+        lines.append(
+            f"[{h['marker']}] ({title}{stamp} > {where}) {h.get('text', '').strip()}"
+        )
     excerpts = "\n\n".join(lines) if lines else "(no excerpts retrieved)"
 
     prefix = f"{SYSTEM}\n\n{FEWSHOT}\n\n---\n\nExcerpts:\n{excerpts}\n"
@@ -88,6 +143,7 @@ async def stream_answer(
     max_tokens: int = 1024,
     system: str | None = None,
     raw_user: bool = False,
+    coverage: str = "full",
 ) -> AsyncIterator[str]:
     """Stream a completion.
 
@@ -114,7 +170,8 @@ async def stream_answer(
     payload = {
         "model": model_name,
         "messages": [
-            {"role": "system", "content": system or SYSTEM},
+            {"role": "system",
+             "content": system or (SYSTEM + COVERAGE_INSTRUCTIONS.get(coverage, ""))},
             {"role": "user", "content": user_content},
         ],
         "temperature": temperature,

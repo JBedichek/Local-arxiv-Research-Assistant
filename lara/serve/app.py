@@ -595,12 +595,36 @@ async def ask(req: AskRequest) -> StreamingResponse:
 
                 break   # "answer"
 
-            yield step("answer", f"Writing answer from {len(hits)} excerpts…", rounds=rounds)
+            # Coverage gate. Naming an insufficient result set explicitly is what stops
+            # the model quietly filling the gap from parametric memory, which is the most
+            # common way a RAG answer goes wrong while looking right.
+            yield step("assess", "Checking whether the excerpts answer the question…")
+            verdict = await AG.assess(s.cfg, req.query, hits, req.model)
+            coverage = verdict.get("coverage", "full")
+            yield f"event: coverage\ndata: {json.dumps(verdict)}\n\n"
+            label = {"full": "Answering", "partial": "Answering what is supported",
+                     "none": "Summarising what was found"}[coverage]
+            yield step("answer", f"{label} from {len(hits)} excerpts…",
+                       rounds=rounds, coverage=coverage)
+
+            answer = ""
             async for token in stream_answer(
                 s.cfg, req.query, hits, selection=req.selection,
                 model=req.model, temperature=req.temperature, max_tokens=req.max_tokens,
+                coverage=coverage,
             ):
+                answer += token
                 yield f"event: token\ndata: {json.dumps(token)}\n\n"
+
+            # Post-hoc grounding check: score every cited sentence against the excerpt it
+            # actually cites. A citation marker makes a claim look verified, so an
+            # unsupported one is worse than none at all.
+            if answer.strip() and s.retriever.cross_encoder is not None:
+                checks = await run_in_threadpool(
+                    AG.check_grounding, s.retriever.cross_encoder, answer, hits
+                )
+                if checks:
+                    yield f"event: grounding\ndata: {json.dumps(checks)}\n\n"
         except Exception as exc:
             yield f"event: error\ndata: {json.dumps(str(exc)[:300])}\n\n"
         yield f"event: done\ndata: {json.dumps({'elapsed_ms': round((time.time()-started)*1000)})}\n\n"

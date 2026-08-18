@@ -311,6 +311,10 @@ $("#ask-form").addEventListener("submit", async (ev) => {
           hits = JSON.parse(dm[1]);
           state.hits = hits;
           renderCitations(answerEl, hits);
+        } else if (ev[1] === "coverage") {
+          renderCoverage(answerEl, JSON.parse(dm[1]));
+        } else if (ev[1] === "grounding") {
+          renderGrounding(answerEl, JSON.parse(dm[1]));
         } else if (ev[1] === "clarify") {
           renderClarify(answerEl, JSON.parse(dm[1]));
         } else if (ev[1] === "token") {
@@ -1072,3 +1076,46 @@ $("#topk").addEventListener("change", () => {
   const h = await api("/api/health").catch(() => null);
   if (h) setStatus(`${h.vectors.toLocaleString()} chunks indexed`);
 })();
+
+/* ---------- coverage + grounding badges ---------- */
+
+/* Both of these exist so the reader can calibrate trust without clicking every citation.
+ * A grounded answer and a confidently-worded guess look identical in prose; the only
+ * honest fix is to surface what the system itself knows about its evidence. */
+
+const COVERAGE_UI = {
+  full:    { label: "Sources answer this", cls: "cov-full" },
+  partial: { label: "Partially answered",  cls: "cov-partial" },
+  none:    { label: "Not answered by sources", cls: "cov-none" },
+};
+
+function renderCoverage(msgEl, v) {
+  const ui = COVERAGE_UI[v.coverage] || COVERAGE_UI.full;
+  const bits = [];
+  if (v.missing) bits.push(`<div class="cov-detail">Missing: ${escapeHtml(v.missing)}</div>`);
+  if (v.conflict) bits.push(`<div class="cov-detail warn">Sources disagree: ${escapeHtml(v.conflict)}</div>`);
+  const el = document.createElement("div");
+  el.className = `coverage ${ui.cls}`;
+  el.innerHTML = `<span class="dot"></span><b>${ui.label}</b>` +
+    (v.via === "scores" ? `<span class="dim"> · from retrieval scores</span>` : "") +
+    bits.join("");
+  const anchor = msgEl.querySelector(".steps");
+  anchor ? anchor.after(el) : msgEl.prepend(el);
+}
+
+function renderGrounding(msgEl, checks) {
+  const weak = checks.filter((c) => !c.supported);
+  const el = document.createElement("div");
+  el.className = "grounding" + (weak.length ? " has-weak" : "");
+  if (!weak.length) {
+    el.innerHTML = `<span class="ok">✓</span> all ${checks.length} cited statement${
+      checks.length === 1 ? "" : "s"} matched their source`;
+  } else {
+    el.innerHTML =
+      `<b>${weak.length} of ${checks.length} cited statement${checks.length === 1 ? "" : "s"} ` +
+      `may not be supported by the excerpt cited</b>` +
+      weak.map((c) => `<div class="weak">[${c.marker}] “${escapeHtml(c.sentence)}”
+         <span class="dim">score ${c.support.toFixed(3)}</span></div>`).join("");
+  }
+  msgEl.append(el);
+}

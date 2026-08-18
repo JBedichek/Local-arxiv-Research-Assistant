@@ -219,3 +219,133 @@ def merge_hits(existing: list[dict], new: list[dict], cap: int) -> tuple[list[di
         if len(existing) >= cap:
             break
     return existing, added
+
+
+# ── coverage assessment and grounding verification ─────────────────────────────────
+
+ASSESS_SYSTEM = """You judge whether a set of excerpts answers a question. You do not \
+answer it. Reply with one JSON object and nothing else:
+
+{"coverage": "full" | "partial" | "none",
+ "missing": "<what the excerpts do not establish, one clause; empty if full>",
+ "conflict": "<what two excerpts disagree about, or empty>"}
+
+"full"    the excerpts contain what is needed to answer directly.
+"partial" they bear on the question but leave a specific part unestablished.
+"none"    they do not address what was asked, even if they share its topic.
+
+Judge only what the excerpts state. Do not use outside knowledge to fill a gap: if the \
+answer requires a fact that is not present, that is "partial" or "none" however familiar \
+the fact may be."""
+
+# Reranker scores below this mean nothing retrieved is really on topic. The cross-encoder
+# already scored every excerpt against the question, so an obviously empty result set can
+# be called without spending an LLM turn on it.
+SCORE_NONE = 0.05
+SCORE_STRONG = 0.55
+
+
+def score_prior(hits: list[dict]) -> str | None:
+    """Cheap coverage verdict from reranker scores alone, or None if inconclusive.
+
+    Worth doing before asking the model: the scores are already computed, they cost
+    nothing to read, and at the extremes they are more reliable than a self-assessment —
+    a model shown five irrelevant excerpts will often still find something to say about
+    them.
+    """
+    scores = [h.get("score") for h in hits if isinstance(h.get("score"), (int, float))]
+    if not scores:
+        return None
+    top = max(scores)
+    if top < SCORE_NONE:
+        return "none"
+    if top > SCORE_STRONG and sum(s > SCORE_STRONG for s in scores) >= 3:
+        return "full"
+    return None
+
+
+async def assess(cfg, question: str, hits: list[dict], model: str | None) -> dict[str, Any]:
+    """Decide whether the excerpts answer the question, and how."""
+    prior = score_prior(hits)
+    if prior == "none":
+        return {"coverage": "none", "missing": "nothing retrieved was on topic",
+                "conflict": "", "via": "scores"}
+
+    prompt = (
+        f"Question: {question}\n\nExcerpts:\n{format_excerpts(hits)}\n\n"
+        "Reply with the JSON object only."
+    )
+    buf = ""
+    async for tok in stream_answer(
+        cfg, prompt, [], system=ASSESS_SYSTEM, model=model,
+        temperature=0.0, max_tokens=250, raw_user=True,
+    ):
+        buf += tok
+    m = _JSON.search(buf or "")
+    if not m:
+        return {"coverage": prior or "full", "missing": "", "conflict": "", "via": "default"}
+    try:
+        d = json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return {"coverage": prior or "full", "missing": "", "conflict": "", "via": "default"}
+    cov = d.get("coverage")
+    if cov not in {"full", "partial", "none"}:
+        cov = prior or "full"
+    return {"coverage": cov, "missing": str(d.get("missing") or "")[:200],
+            "conflict": str(d.get("conflict") or "")[:200], "via": "model"}
+
+
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+(?=[A-Z(\[])")
+_CITE = re.compile(r"\[(\d+)\]")
+
+
+# Calibrated against bge-reranker-v2-m3 on deliberately mis-cited sentences:
+#
+#   genuinely supported claim ........... 0.98 - 1.00
+#   fabricated but on-topic claim ....... ~0.29   <- the dangerous case
+#   wholly unrelated claim .............. ~0.00
+#
+# The first threshold tried was 0.06, which caught only the unrelated case and waved
+# through the invented-but-plausible one — precisely the failure the check exists to
+# catch. Real support scores near 1.0, so a much higher bar costs almost no false
+# positives on legitimate paraphrase.
+GROUNDING_THRESHOLD = 0.5
+
+
+def check_grounding(cross_encoder, answer: str, hits: list[dict],
+                    threshold: float = GROUNDING_THRESHOLD) -> list[dict]:
+    """Score each cited sentence against the excerpt it cites.
+
+    The most damaging failure mode in a citing RAG system is not a missing citation but a
+    confident sentence carrying a citation that does not support it: the marker makes the
+    claim look checked, and a reader who trusts the format will not click through. The
+    cross-encoder is already loaded and already answers exactly this question — does this
+    passage support this text — so verification costs one extra batch.
+
+    Returns one record per cited sentence, flagged when its own source scores it low.
+    """
+    if cross_encoder is None or not answer.strip():
+        return []
+    by_marker = {h.get("marker", i + 1): h for i, h in enumerate(hits)}
+    pairs, meta = [], []
+    for sentence in _SENT_SPLIT.split(answer.strip()):
+        markers = {int(x) for x in _CITE.findall(sentence)}
+        clean = _CITE.sub("", sentence).strip()
+        if not markers or len(clean) < 25:
+            continue
+        for mk in markers:
+            hit = by_marker.get(mk)
+            if not hit:
+                continue
+            pairs.append((clean, hit.get("text", "")))
+            meta.append({"sentence": clean[:220], "marker": mk,
+                         "arxiv_id": hit.get("arxiv_id", "")})
+    if not pairs:
+        return []
+    scores = cross_encoder.predict(pairs, show_progress_bar=False)
+    out = []
+    for rec, sc in zip(meta, scores):
+        rec["support"] = round(float(sc), 4)
+        rec["supported"] = float(sc) >= threshold
+        out.append(rec)
+    return out

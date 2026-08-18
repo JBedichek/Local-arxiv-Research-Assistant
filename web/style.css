@@ -287,3 +287,22 @@ label.breadth #breadth-val em { font-style: normal; color: var(--dim); }
 .splitter { min-width: 6px; }
 .splitter::after { content: ""; position: absolute; width: 14px; height: 100%;
   transform: translateX(-4px); }
+
+/* coverage + grounding */
+.coverage { display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  font-size: 11.5px; margin: 0 0 7px; padding: 5px 8px; border-radius: 6px;
+  border: 1px solid var(--line); }
+.coverage .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+.coverage.cov-full .dot { background: #4caf7d; }
+.coverage.cov-partial .dot { background: #d9a441; }
+.coverage.cov-none .dot { background: var(--warn); }
+.coverage.cov-partial { border-color: #d9a44166; }
+.coverage.cov-none { border-color: var(--warn); }
+.cov-detail { flex-basis: 100%; color: var(--dim); margin-top: 2px; }
+.cov-detail.warn { color: var(--warn); }
+.grounding { margin-top: 8px; font-size: 11px; color: var(--dim);
+  border-top: 1px solid var(--line); padding-top: 6px; }
+.grounding .ok { color: #4caf7d; }
+.grounding.has-weak { color: var(--warn); }
+.grounding .weak { margin-top: 4px; padding-left: 8px;
+  border-left: 2px solid var(--warn); color: var(--text); opacity: .85; }
