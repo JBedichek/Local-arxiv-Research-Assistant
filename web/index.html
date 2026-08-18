@@ -23,6 +23,21 @@
   <label>model <select id="model"><option value="">(loading)</option></select></label>
   <label>quant <select id="quant"></select></label>
   <label>temp <input id="temp" type="range" min="0" max="1.5" step="0.05" value="0.2"><span id="temp-val">0.20</span></label>
+  <label class="breadth">depth
+    <input id="breadth" type="range" min="0" max="4" step="1" value="2">
+    <span id="breadth-val">Balanced <em>~3s</em></span>
+  </label>
+  <label>font
+    <select id="font">
+      <option value="serif">Serif</option>
+      <option value="sans" selected>Sans</option>
+      <option value="mono">Mono</option>
+      <option value="dyslexic">Wide</option>
+    </select>
+  </label>
+  <label>size
+    <input id="fontsize" type="range" min="13" max="24" step="1" value="16"><span id="fontsize-val">16</span>
+  </label>
   <span id="status" class="status"></span>
 </header>
 
@@ -33,14 +48,24 @@
     <div id="graph-tip" hidden></div>
   </section>
 
+  <div class="splitter" id="split-left" title="Drag to resize · double-click to reset"></div>
+
   <section id="paper-pane">
     <div id="paper-meta"></div>
     <article id="paper"><p class="placeholder">Enter an arXiv id to open a paper, or type a question to search the corpus.</p></article>
     <div id="results" hidden>
       <div id="results-head"></div>
-      <ol id="results-list"></ol>
+      <div id="results-toggle">
+        <button type="button" data-view="graph" class="on">Citation graph</button>
+        <button type="button" data-view="list">List</button>
+      </div>
+      <canvas id="results-graph"></canvas>
+      <div id="results-tip" hidden></div>
+      <ol id="results-list" hidden></ol>
     </div>
   </section>
+
+  <div class="splitter" id="split-right" title="Drag to resize · double-click to reset"></div>
 
   <section id="chat-pane">
     <div id="messages"></div>

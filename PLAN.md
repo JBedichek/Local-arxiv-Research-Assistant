@@ -378,6 +378,59 @@ ask them about. Deciding this on measurement beats deciding it now on priors.
 
 ---
 
+### 5.2 Fine-tuning the embedder on this corpus (planned, not started)
+
+`embeddinggemma-300m` is a general-purpose encoder. Domain-adapting it to arXiv ML is
+worthwhile, and this corpus is unusually well suited to it — but only with an evaluation
+harness in place first, because a fine-tune that quietly degrades retrieval is easy to
+produce and hard to notice.
+
+**Do we need labelled pairs?** We need **positive** pairs. We do *not* need negatives:
+`MultipleNegativesRankingLoss` treats the other items in a batch as negatives for free.
+So the question is only where positives come from, and there are four label-free sources:
+
+============================  ==================  ==========================================
+source                        pairs available     notes
+============================  ==================  ==========================================
+**citation edges**            500k+ collected     strongest signal; SPECTER's core insight
+(title+abstract) ↔ chunk      ~4 M                cheap, plentiful, weaker
+title ↔ abstract              377 k               teaches summarisation-style matching
+same-paper chunk pairs        millions            weakest; mostly topical, easy positives
+============================  ==================  ==========================================
+
+**Citations are the standout.** If paper A cites paper B, the two are related in a way no
+purely textual signal captures, and it is precisely the relation a general encoder cannot
+have learned. This is what SPECTER trains on (query paper, cited = positive, uncited =
+negative); SciNCL refines it by drawing positives and negatives from the citation graph's
+embedding neighbourhood rather than a binary cited/not-cited split. We already hold the
+edges.
+
+**Fully unsupervised alternatives**, for comparison: *SimCSE* makes a positive pair by
+passing the same text through the encoder twice under different dropout masks; *TSDAE*
+corrupts and reconstructs. Both give real but modest domain-adaptation gains. *GPL* is the
+strongest no-label option — generate synthetic queries per passage with an LLM, mine hard
+negatives with the current retriever, score with a cross-encoder, train with MarginMSE —
+and we already run all three components.
+
+**Hard negatives matter more than the loss function.** In-batch random negatives are
+trivially easy at this corpus size; mining the current index's top-k non-positives is
+where most of the gain comes from.
+
+**Order of work:**
+
+1. **Evaluation harness first.** Held-out citation prediction as a free proxy metric, plus
+   ~50 hand-checked queries with known-good answers. Without this there is no way to tell
+   a good fine-tune from a bad one.
+2. Citation-pair training with mined hard negatives.
+3. GPL on top if that plateaus.
+
+**Costs.** Fine-tuning changes the vector space, so the whole corpus must be re-embedded —
+~1.7 GPU-hours at the measured 2,600 chunks/s, cheap enough to iterate on. A 300 M encoder
+fine-tunes on one card in wall-clock under an hour. Keep the old vectors until the new
+index wins on the eval set.
+
+---
+
 ## 6. Citation graph and similarity heatmap (R8, R9)
 
 - In-memory CSR adjacency over ~18 M edges, both directions. Neighbour lookup is a slice.

@@ -18,7 +18,7 @@
 const $ = (s) => document.querySelector(s);
 const state = {
   paper: null, version: 1, hits: [], pendingHits: null,
-  selection: null, models: [], busy: false,
+  selection: null, models: [], busy: false, breadth: 'balanced', abort: null,
 };
 
 /* ---------- helpers ---------- */
@@ -191,8 +191,17 @@ $("#ask-form").addEventListener("submit", async (ev) => {
   const q = $("#question").value.trim();
   if (!q || state.busy) return;
   state.busy = true;
+  state.abort = new AbortController();
   $("#ask-btn").disabled = true;
   $("#question").value = "";
+  // A multi-round search can run for 20s at the deep end. Anything that long must be
+  // interruptible, or the only way out is reloading the page.
+  if (!$("#cancel-btn")) {
+    const c = document.createElement("button");
+    c.type = "button"; c.id = "cancel-btn"; c.textContent = "Stop";
+    c.addEventListener("click", () => state.abort?.abort());
+    $("#ask-form").append(c);
+  }
 
   addMessage("user", q, state.selection);
   const answerEl = addMessage("assistant", "");
@@ -220,7 +229,9 @@ $("#ask-form").addEventListener("submit", async (ev) => {
         scope: $("#scope").value, hits,
         model: $("#model").value || null,
         temperature: parseFloat($("#temp").value),
+        breadth: state.breadth,
       }),
+      signal: state.abort.signal,
     });
 
     const reader = res.body.getReader();
@@ -238,8 +249,20 @@ $("#ask-form").addEventListener("submit", async (ev) => {
         const ev = /event: (\w+)/.exec(frame);
         const dm = /data: ([\s\S]*)$/.exec(frame);
         if (!ev || !dm) continue;
-        if (ev[1] === "token") {
+        if (ev[1] === "step") {
+          const st = JSON.parse(dm[1]);
+          addStep(answerEl, st.kind, st.detail);
+        } else if (ev[1] === "hits") {
+          // Later rounds append material; keep the citation list in sync so the
+          // markers the model emits always resolve.
+          hits = JSON.parse(dm[1]);
+          state.hits = hits;
+          renderCitations(answerEl, hits);
+        } else if (ev[1] === "clarify") {
+          renderClarify(answerEl, JSON.parse(dm[1]));
+        } else if (ev[1] === "token") {
           if (first) {
+            finishSteps(answerEl);
             setStatus(`first token ${Math.round(performance.now() - t0)}ms`);
             first = false;
           }
@@ -256,9 +279,14 @@ $("#ask-form").addEventListener("submit", async (ev) => {
     answerEl.querySelector(".text").innerHTML =
       `<span class="error">${escapeHtml(String(err.message || err))}</span>`;
   } finally {
+    finishSteps(answerEl);
     state.busy = false;
+    state.abort = null;
     $("#ask-btn").disabled = false;
+    $("#ask-btn").textContent = "Ask";
     state.pendingHits = null;
+    const el = $("#cancel-btn");
+    if (el) el.remove();
   }
 });
 
@@ -427,11 +455,14 @@ async function searchPapers(query) {
       body: JSON.stringify({ query, limit: 25 }),
     });
     const ms = Math.round(performance.now() - t0);
+    searchData = data;
+    const nEdges = (data.edges || []).length;
     $("#results-head").innerHTML =
       `<h2>${data.results.length} papers for “${escapeHtml(query)}”</h2>
        <p class="meta">${ms}ms · server ${Math.round(data.timings_ms.total)}ms
        · abstracts ${Math.round(data.timings_ms.abstracts)}ms
-       · full text ${Math.round(data.timings_ms.fulltext)}ms</p>`;
+       · full text ${Math.round(data.timings_ms.fulltext)}ms
+       · ${nEdges} citation${nEdges === 1 ? "" : "s"} among results</p>`;
     list.innerHTML = data.results.map((r, i) => {
       // Show which evidence carried the paper: its abstract, its body text, or both.
       const ev = Object.entries(r.evidence)
@@ -449,6 +480,9 @@ async function searchPapers(query) {
           <p class="evidence">score ${r.score.toFixed(3)} ${ev}</p>
         </div></li>`;
     }).join("") || `<li class="placeholder">No matches.</li>`;
+    $("#results-graph").hidden = searchView !== "graph";
+    $("#results-list").hidden = searchView !== "list";
+    drawSearchGraph();
     setStatus("");
   } catch (err) {
     $("#results-head").innerHTML = `<h2 class="error">${escapeHtml(String(err.message || err))}</h2>`;
@@ -491,6 +525,21 @@ function escapeHtml(s) {
 /* ---------- boot ---------- */
 
 (async function boot() {
+  applyLayout();
+  applyTypography();
+  makeSplitter($("#split-left"), "--col-left", "colLeft", "left");
+  makeSplitter($("#split-right"), "--col-right", "colRight", "right");
+  bindSearchGraph();
+
+  try {
+    const b = await api("/api/breadth");
+    BREADTH = b.options;
+    $("#breadth").max = String(BREADTH.length - 1);
+    const saved = prefs.get("breadth", String(BREADTH.findIndex((x) => x.name === b.default)));
+    $("#breadth").value = saved;
+    applyBreadth();
+  } catch { /* fall back to the server default */ }
+
   try {
     const m = await api("/api/models");
     state.models = m.models;
@@ -511,4 +560,278 @@ function escapeHtml(s) {
 function syncQuant() {
   const m = state.models.find((x) => x.repo === $("#model").value);
   $("#quant").innerHTML = (m ? m.quant_options : []).map((q) => `<option>${q}</option>`).join("");
+}
+
+/* ================= layout, typography, and the depth dial ================= */
+
+/* Pane widths, font and size all persist: they are reading preferences, and having to
+ * re-set them on every visit is exactly the kind of small friction that makes a tool
+ * feel unfinished. */
+const prefs = {
+  get(k, d) { try { return localStorage.getItem("lara." + k) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("lara." + k, v); } catch { /* private mode */ } },
+};
+
+function applyLayout() {
+  document.documentElement.style.setProperty("--col-left", prefs.get("colLeft", "300px"));
+  document.documentElement.style.setProperty("--col-right", prefs.get("colRight", "400px"));
+}
+
+function makeSplitter(el, varName, prefKey, edge) {
+  let startX = 0, startPx = 0;
+  const root = document.documentElement;
+  const current = () =>
+    parseInt(getComputedStyle(root).getPropertyValue(varName), 10) || 300;
+
+  el.addEventListener("pointerdown", (ev) => {
+    ev.preventDefault();
+    startX = ev.clientX;
+    startPx = current();
+    el.setPointerCapture(ev.pointerId);
+    el.classList.add("dragging");
+    document.body.classList.add("resizing");
+  });
+  el.addEventListener("pointermove", (ev) => {
+    if (!el.hasPointerCapture?.(ev.pointerId)) return;
+    const delta = edge === "left" ? ev.clientX - startX : startX - ev.clientX;
+    // Clamp so a pane can never be dragged to nothing or swallow the paper.
+    const px = Math.max(180, Math.min(startPx + delta, window.innerWidth * 0.45));
+    root.style.setProperty(varName, px + "px");
+  });
+  const end = (ev) => {
+    if (!el.classList.contains("dragging")) return;
+    el.releasePointerCapture?.(ev.pointerId);
+    el.classList.remove("dragging");
+    document.body.classList.remove("resizing");
+    prefs.set(prefKey, getComputedStyle(root).getPropertyValue(varName).trim());
+    drawGraph();
+  };
+  el.addEventListener("pointerup", end);
+  el.addEventListener("pointercancel", end);
+  el.addEventListener("dblclick", () => {
+    const d = edge === "left" ? "300px" : "400px";
+    root.style.setProperty(varName, d);
+    prefs.set(prefKey, d);
+    drawGraph();
+  });
+}
+
+const FONTS = { serif: "var(--font-serif)", sans: "var(--font-sans)",
+                mono: "var(--font-mono)", dyslexic: "var(--font-wide)" };
+
+function applyTypography() {
+  const fam = prefs.get("font", "sans");
+  const size = prefs.get("fontsize", "16");
+  document.documentElement.style.setProperty("--paper-font", FONTS[fam] || FONTS.sans);
+  document.documentElement.style.setProperty("--paper-size", size + "px");
+  // Hold the measure near 70 characters as size changes; long lines at large type are
+  // what actually makes reading tiring, not the type size itself.
+  document.documentElement.style.setProperty("--measure", Math.round(size * 54) + "px");
+  $("#font").value = fam;
+  $("#fontsize").value = size;
+  $("#fontsize-val").textContent = size;
+}
+
+$("#font").addEventListener("change", (e) => { prefs.set("font", e.target.value); applyTypography(); });
+$("#fontsize").addEventListener("input", (e) => { prefs.set("fontsize", e.target.value); applyTypography(); });
+
+/* depth dial */
+let BREADTH = [];
+function applyBreadth() {
+  const i = Number($("#breadth").value);
+  const b = BREADTH[i];
+  if (!b) return;
+  state.breadth = b.name;
+  prefs.set("breadth", String(i));
+  $("#breadth-val").innerHTML =
+    `${escapeHtml(b.label)} <em>${escapeHtml(b.estimate)}</em>`;
+  const bits = [`${b.max_rounds} search round${b.max_rounds > 1 ? "s" : ""}`, `top ${b.k}`];
+  if (b.expand_context) bits.push("context expansion");
+  if (b.allow_clarify) bits.push("may ask to clarify");
+  $("#breadth").title = bits.join(" · ") + ` — estimated ${b.estimate}`;
+}
+$("#breadth").addEventListener("input", applyBreadth);
+
+/* ================= agent progress rendering ================= */
+
+function stepsEl(msgEl) {
+  let el = msgEl.querySelector(".steps");
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "steps";
+    msgEl.prepend(el);
+  }
+  return el;
+}
+
+function addStep(msgEl, kind, detail) {
+  const host = stepsEl(msgEl);
+  host.querySelectorAll(".step.active").forEach((s) => s.classList.remove("active"));
+  const row = document.createElement("div");
+  row.className = `step ${kind} active`;
+  row.innerHTML = `<span class="dot"></span><span>${escapeHtml(detail)}</span>`;
+  host.append(row);
+  row.scrollIntoView({ block: "nearest" });
+}
+
+function finishSteps(msgEl) {
+  msgEl.querySelectorAll(".step.active").forEach((s) => s.classList.remove("active"));
+}
+
+function renderClarify(msgEl, payload) {
+  const box = document.createElement("div");
+  box.className = "clarify";
+  box.innerHTML =
+    `<h4>${escapeHtml(payload.question)}</h4>` +
+    (payload.reason ? `<div class="dim">${escapeHtml(payload.reason)}</div>` : "") +
+    `<div class="opts">${(payload.options || [])
+      .map((o) => `<button type="button" data-q="${escapeHtml(o)}">${escapeHtml(o)}</button>`)
+      .join("")}</div>`;
+  msgEl.prepend(box);
+  box.querySelectorAll("button").forEach((b) =>
+    b.addEventListener("click", () => {
+      $("#question").value = b.dataset.q;
+      $("#ask-form").requestSubmit();
+    }));
+}
+
+/* ================= search results as a citation graph ================= */
+
+/* Laid out chronologically, not force-directed. A citation graph is a DAG ordered by
+ * time: a paper can only cite work that already existed. Putting the date on the x axis
+ * makes every edge point leftward, so lineage is readable at a glance — which paper
+ * started a line of work, which are extensions, which are contemporaries that never cite
+ * each other. A force layout throws that information away and produces a hairball. */
+
+let searchData = null;
+let searchView = "graph";
+
+function layoutSearchGraph(canvas) {
+  const nodes = searchData.results;
+  if (!nodes.length) return [];
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+
+  const times = nodes.map((n) => Date.parse(n.submitted || "") || 0).filter(Boolean);
+  const tMin = Math.min(...times), tMax = Math.max(...times);
+  const padL = 46, padR = 150, padT = 22, padB = 30;
+  const span = Math.max(tMax - tMin, 1);
+
+  // Lay out by date, then push apart vertically within date-neighbourhoods so labels
+  // do not collide. Rank breaks ties so the most relevant paper sits highest.
+  const placed = nodes.map((n) => {
+    const t = Date.parse(n.submitted || "") || tMin;
+    return { ...n, x: padL + ((t - tMin) / span) * (w - padL - padR), y: 0 };
+  });
+  placed.sort((a, b) => a.x - b.x);
+  const lanes = [];
+  const rowH = Math.max(22, Math.min(40, (h - padT - padB) / Math.max(placed.length, 1) * 1.6));
+  for (const n of placed) {
+    let lane = 0;
+    while (lanes[lane] !== undefined && n.x - lanes[lane] < 130) lane++;
+    lanes[lane] = n.x;
+    n.y = padT + lane * rowH + rowH / 2;
+    if (n.y > h - padB) n.y = padT + ((lane % Math.max(1, Math.floor((h - padT - padB) / rowH))) * rowH) + rowH / 2;
+  }
+  return placed;
+}
+
+function drawSearchGraph() {
+  const canvas = $("#results-graph");
+  if (!searchData || searchView !== "graph") return;
+  const placed = layoutSearchGraph(canvas);
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  ctx.clearRect(0, 0, w, h);
+  const byId = Object.fromEntries(placed.map((n) => [n.arxiv_id, n]));
+
+  // year gridlines give the time axis meaning
+  const years = [...new Set(placed.map((n) => (n.submitted || "").slice(0, 4)))].filter(Boolean).sort();
+  ctx.font = "10px ui-sans-serif, system-ui, sans-serif";
+  for (const y of years) {
+    const same = placed.filter((n) => (n.submitted || "").startsWith(y));
+    const x = same.reduce((a, n) => a + n.x, 0) / same.length;
+    ctx.strokeStyle = "rgba(140,150,170,.13)";
+    ctx.beginPath(); ctx.moveTo(x, 12); ctx.lineTo(x, h - 18); ctx.stroke();
+    ctx.fillStyle = "rgba(140,150,170,.7)";
+    ctx.fillText(y, x - 12, h - 6);
+  }
+
+  // edges: cited paper <- citing paper, so arrows point back in time
+  for (const e of searchData.edges || []) {
+    const a = byId[e.src], b = byId[e.dst];
+    if (!a || !b) continue;
+    ctx.strokeStyle = "rgba(140,160,200,.42)";
+    ctx.lineWidth = 1.1;
+    ctx.beginPath();
+    const mx = (a.x + b.x) / 2;
+    ctx.moveTo(a.x, a.y);
+    ctx.bezierCurveTo(mx, a.y, mx, b.y, b.x, b.y);
+    ctx.stroke();
+    // arrowhead at the cited end
+    const ang = Math.atan2(b.y - a.y, b.x - mx);
+    ctx.fillStyle = "rgba(140,160,200,.62)";
+    ctx.beginPath();
+    ctx.moveTo(b.x, b.y);
+    ctx.lineTo(b.x - 7 * Math.cos(ang - 0.4), b.y - 7 * Math.sin(ang - 0.4));
+    ctx.lineTo(b.x - 7 * Math.cos(ang + 0.4), b.y - 7 * Math.sin(ang + 0.4));
+    ctx.closePath(); ctx.fill();
+  }
+
+  const scores = placed.map((n) => n.score);
+  const lo = Math.min(...scores), hi = Math.max(...scores);
+  for (const n of placed) {
+    const t = hi > lo ? (n.score - lo) / (hi - lo) : 1;
+    // size by how much the *result set* cites it: the local hub is the foundational work
+    const r = 5 + Math.min(n.in_degree, 8) * 1.6;
+    ctx.beginPath(); ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+    ctx.fillStyle = heatColor(t); ctx.fill();
+    if (n.in_degree > 0) { ctx.strokeStyle = "rgba(255,255,255,.5)"; ctx.lineWidth = 1; ctx.stroke(); }
+    ctx.fillStyle = "rgba(190,200,215,.92)";
+    ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
+    const label = (n.title || n.arxiv_id).slice(0, 30) + ((n.title || "").length > 30 ? "…" : "");
+    ctx.fillText(`${n.rank}. ${label}`, n.x + r + 5, n.y + 3.5);
+  }
+  canvas._nodes = placed;
+}
+
+function bindSearchGraph() {
+  const canvas = $("#results-graph"), tip = $("#results-tip");
+  const at = (ev) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+    return (canvas._nodes || []).find((n) => (n.x - x) ** 2 + (n.y - y) ** 2 < 160);
+  };
+  canvas.addEventListener("mousemove", (ev) => {
+    const n = at(ev);
+    if (!n) { tip.hidden = true; return; }
+    const rect = canvas.getBoundingClientRect();
+    tip.hidden = false;
+    tip.style.left = `${ev.clientX - rect.left + 14}px`;
+    tip.style.top = `${ev.clientY - rect.top + 14 + canvas.offsetTop}px`;
+    tip.innerHTML =
+      `<b>${escapeHtml(n.title)}</b>
+       <span class="dim">${n.arxiv_id} · ${escapeHtml(n.submitted)} ·
+       score ${n.score.toFixed(3)} · cited by ${n.in_degree} of these results</span>
+       <p style="margin:5px 0 0">${escapeHtml((n.abstract || "").slice(0, 180))}…</p>`;
+  });
+  canvas.addEventListener("mouseleave", () => { tip.hidden = true; });
+  canvas.addEventListener("click", (ev) => {
+    const n = at(ev);
+    if (n) { hideResults(); openPaper(n.arxiv_id); }
+  });
+  $("#results-toggle").addEventListener("click", (ev) => {
+    const b = ev.target.closest("button");
+    if (!b) return;
+    searchView = b.dataset.view;
+    $("#results-toggle").querySelectorAll("button")
+      .forEach((x) => x.classList.toggle("on", x.dataset.view === searchView));
+    $("#results-graph").hidden = searchView !== "graph";
+    $("#results-list").hidden = searchView !== "list";
+    if (searchView === "graph") drawSearchGraph();
+  });
+  window.addEventListener("resize", () => drawSearchGraph());
 }

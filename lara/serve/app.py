@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from lara.serve import papers as papers_mod
@@ -257,11 +258,34 @@ def search_papers(req: SearchRequest) -> JSONResponse:
     if req.require_fulltext:
         hits = [h for h in hits if h.fulltext]
     hits = hits[: req.limit]
+
+    # Induced subgraph over the results only. Edges to papers outside the result set are
+    # deliberately dropped: a topic's structure is who-cites-whom *among the relevant
+    # work*, and including every outbound citation would bury that in hundreds of edges
+    # to unrelated background references.
+    t0 = clock()
+    ids = [h.arxiv_id for h in hits]
+    edges: list[dict] = []
+    indeg: dict[str, int] = {i: 0 for i in ids}
+    outdeg: dict[str, int] = {i: 0 for i in ids}
+    if len(ids) > 1:
+        ph = ",".join("?" * len(ids))
+        for r in s.conn().execute(
+            f"SELECT src, dst FROM citations WHERE src IN ({ph}) AND dst IN ({ph})",
+            ids + ids,
+        ):
+            if r["src"] == r["dst"]:
+                continue
+            edges.append({"src": r["src"], "dst": r["dst"]})
+            outdeg[r["src"]] = outdeg.get(r["src"], 0) + 1
+            indeg[r["dst"]] = indeg.get(r["dst"], 0) + 1
+    t["graph"] = (clock() - t0) * 1000
     t["total"] = sum(t.values())
 
     return JSONResponse({
         "query": req.query,
         "timings_ms": {k: round(v, 1) for k, v in t.items()},
+        "edges": edges,
         "results": [
             {
                 "arxiv_id": h.arxiv_id, "title": h.title, "abstract": h.abstract,
@@ -270,8 +294,11 @@ def search_papers(req: SearchRequest) -> JSONResponse:
                 "n_chunks": h.n_chunks, "fulltext": h.fulltext,
                 "cited_by": h.cited_by, "version": h.version,
                 "evidence": {k: round(v, 4) for k, v in h.evidence.items()},
+                "rank": i + 1,
+                "in_degree": indeg.get(h.arxiv_id, 0),
+                "out_degree": outdeg.get(h.arxiv_id, 0),
             }
-            for h in hits
+            for i, h in enumerate(hits)
         ],
     })
 
@@ -322,6 +349,24 @@ def models() -> JSONResponse:
     })
 
 
+@app.get("/api/breadth")
+def breadth_options() -> JSONResponse:
+    """The speed<->accuracy spectrum, so the UI can render it without hardcoding."""
+    from lara.serve import agent as AG
+
+    return JSONResponse({
+        "default": AG.DEFAULT,
+        "options": [
+            {
+                "name": b.name, "label": b.label, "estimate": b.estimate,
+                "max_rounds": b.max_rounds, "k": b.k,
+                "expand_context": b.expand_context, "allow_clarify": b.allow_clarify,
+            }
+            for b in AG.SPECTRUM
+        ],
+    })
+
+
 class AskRequest(BaseModel):
     query: str
     selection: str | None = None
@@ -331,6 +376,7 @@ class AskRequest(BaseModel):
     model: str | None = None
     temperature: float = 0.2
     max_tokens: int = 1024
+    breadth: str | None = None           # instant | fast | balanced | thorough | exhaustive
 
 
 @app.post("/api/ask")
@@ -344,22 +390,108 @@ async def ask(req: AskRequest) -> StreamingResponse:
     s = _state()
     assert s.retriever is not None
 
-    hits = req.hits
-    if hits is None:
-        restrict = [req.paper] if (req.scope == "paper" and req.paper) else None
-        result = s.retriever.retrieve(req.query, papers=restrict, selection=req.selection)
-        hits = [
-            {"arxiv_id": h.arxiv_id, "version": h.version, "url": h.fragment(),
-             "section": h.section_title or h.section_anchor, "text": h.text,
-             "paper_title": h.paper_title}
+    import time
+
+    from lara.serve import agent as AG
+    from lara.serve.generate import stream_answer
+
+    breadth = AG.resolve(req.breadth)
+    restrict = [req.paper] if (req.scope == "paper" and req.paper) else None
+
+    def run_search(query: str, k: int) -> list[dict]:
+        result = s.retriever.retrieve(
+            query, papers=restrict, selection=req.selection, final_k=k
+        )
+        return [
+            {"chunk_id": h.chunk_id, "arxiv_id": h.arxiv_id, "version": h.version,
+             "url": h.fragment(), "anchor": h.anchor_start, "char_start": h.char_start,
+             "char_end": h.char_end, "anchor_end": h.anchor_end,
+             "section": h.section_title or h.section_anchor, "kind": h.kind,
+             "score": round(h.score, 4), "paper_title": h.paper_title, "text": h.text}
             for h in result.hits
         ]
 
-    from lara.serve.generate import stream_answer
-
     async def events():
-        yield f"event: hits\ndata: {json.dumps(hits)}\n\n"
+        started = time.time()
+        cap = breadth.k * (breadth.max_rounds + 2)
+
+        def step(kind: str, detail: str, **payload):
+            return f"event: step\ndata: {json.dumps({'kind': kind, 'detail': detail, **payload})}\n\n"
+
         try:
+            hits = req.hits
+            if hits is None:
+                yield step("search", f"Searching ({breadth.label})…")
+                hits = await run_in_threadpool(run_search, req.query, breadth.k)
+            yield f"event: hits\ndata: {json.dumps(hits)}\n\n"
+
+            rounds = 0
+            while rounds < breadth.max_rounds:
+                if time.time() - started > breadth.budget_sec:
+                    yield step("budget", "Time budget reached; answering with what I have.")
+                    break
+                # A single round needs no controller turn: there is nothing yet to judge
+                # against, and the extra LLM call would double "instant" latency.
+                if breadth.max_rounds == 1:
+                    break
+
+                yield step("decide", "Assessing whether the excerpts answer the question…")
+                verdict = await AG.decide(
+                    s.cfg, req.query, hits, breadth, rounds, req.model
+                )
+                action = verdict.get("action", "answer")
+
+                if action == "clarify" and breadth.allow_clarify:
+                    yield (
+                        "event: clarify\ndata: "
+                        + json.dumps({
+                            "question": verdict.get("question")
+                            or "Could you be more specific?",
+                            "options": verdict.get("options", [])[:4],
+                            "reason": verdict.get("reason", ""),
+                        })
+                        + "\n\n"
+                    )
+                    # Non-blocking by design: the reader still gets an answer from what we
+                    # have, with the refinements offered alongside. A model that stops to
+                    # ask a question and returns nothing is worse than one that guesses
+                    # well and offers to narrow down.
+                    break
+
+                if action == "expand" and breadth.expand_context:
+                    ids = [int(i) for i in verdict.get("chunk_ids", [])[:6] if str(i).isdigit()]
+                    yield step("expand", f"Reading around {len(ids)} excerpt(s) for context…")
+                    extra = await run_in_threadpool(AG.expand_chunks, s.conn(), ids)
+                    hits, added = AG.merge_hits(hits, extra, cap)
+                    yield f"event: hits\ndata: {json.dumps(hits)}\n\n"
+                    if added == 0:
+                        break
+                    rounds += 1
+                    continue
+
+                if action == "search":
+                    queries = [q for q in verdict.get("queries", []) if isinstance(q, str)][:3]
+                    if not queries:
+                        break
+                    yield step("search", f"Searching again: {'; '.join(queries)[:110]}",
+                               queries=queries)
+                    total_added = 0
+                    for q in queries:
+                        more = await run_in_threadpool(run_search, q, breadth.k)
+                        hits, added = AG.merge_hits(hits, more, cap)
+                        total_added += added
+                    yield f"event: hits\ndata: {json.dumps(hits)}\n\n"
+                    # No new evidence means another round would ask the same question of
+                    # the same excerpts. Stop rather than spend the budget.
+                    if total_added == 0:
+                        yield step("converged", "No new material found; answering.")
+                        break
+                    rounds += 1
+                    continue
+
+                break   # "answer"
+
+            yield step("answer", f"Writing answer from {len(hits)} excerpts…", rounds=rounds)
             async for token in stream_answer(
                 s.cfg, req.query, hits, selection=req.selection,
                 model=req.model, temperature=req.temperature, max_tokens=req.max_tokens,
@@ -367,7 +499,7 @@ async def ask(req: AskRequest) -> StreamingResponse:
                 yield f"event: token\ndata: {json.dumps(token)}\n\n"
         except Exception as exc:
             yield f"event: error\ndata: {json.dumps(str(exc)[:300])}\n\n"
-        yield "event: done\ndata: {}\n\n"
+        yield f"event: done\ndata: {json.dumps({'elapsed_ms': round((time.time()-started)*1000)})}\n\n"
 
     return StreamingResponse(
         events(),

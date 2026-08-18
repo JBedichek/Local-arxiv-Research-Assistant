@@ -86,7 +86,15 @@ async def stream_answer(
     model: str | None = None,
     temperature: float = 0.2,
     max_tokens: int = 1024,
+    system: str | None = None,
+    raw_user: bool = False,
 ) -> AsyncIterator[str]:
+    """Stream a completion.
+
+    ``system`` overrides the answering persona and ``raw_user`` sends ``query`` verbatim
+    instead of wrapping it in the excerpt template — together they let the retrieval
+    controller in :mod:`lara.serve.agent` reuse this transport for its JSON verdicts.
+    """
     # Reasoning-block stripping runs over the accumulated stream, not per chunk.
     acc, sent, state = "", 0, "unknown"
     vcfg = cfg.get_in("serving.vllm")
@@ -102,11 +110,12 @@ async def stream_answer(
     # default, which for a two-sentence grounded answer is most of the latency and none
     # of the output. The tags are also stripped below, since the flag is model-specific
     # and silently ignored by generators that do not know it.
+    user_content = query if raw_user else prefix_body(prefix) + tail
     payload = {
         "model": model_name,
         "messages": [
-            {"role": "system", "content": SYSTEM},
-            {"role": "user", "content": prefix_body(prefix) + tail},
+            {"role": "system", "content": system or SYSTEM},
+            {"role": "user", "content": user_content},
         ],
         "temperature": temperature,
         "max_tokens": max_tokens,
