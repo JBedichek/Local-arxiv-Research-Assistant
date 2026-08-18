@@ -123,9 +123,32 @@ def score_task(model, task: Task, batch_size: int = 128,
     }
 
 
+def collapse_stats(model, conn: sqlite3.Connection, n: int = 300) -> dict[str, float]:
+    """Detect representation collapse.
+
+    A destroyed encoder does not usually produce garbage — it produces vectors that are
+    all nearly identical, so every ranking is arbitrary while the loss still looks
+    finite. Mean off-diagonal cosine over unrelated texts is the direct test: a healthy
+    encoder sits near 0.2-0.5 on arXiv prose, a collapsed one approaches 1.0.
+    """
+    rows = conn.execute(
+        "SELECT text FROM chunks WHERE kind='body' AND length(text) > 400 "
+        "ORDER BY chunk_id LIMIT ?", (n,)
+    ).fetchall()
+    if len(rows) < 16:
+        return {}
+    v = model.encode([r[0] for r in rows], batch_size=64, convert_to_numpy=True,
+                     normalize_embeddings=True, show_progress_bar=False).astype(np.float32)
+    sim = v @ v.T
+    off = sim[~np.eye(len(v), dtype=bool)]
+    return {"mean_cos": float(off.mean()), "p95_cos": float(np.percentile(off, 95)),
+            "std_cos": float(off.std())}
+
+
 def run(model, conn: sqlite3.Connection, n: int = 800, pool_size: int = 2000,
         seed: int = 0) -> dict[str, dict[str, float]]:
     return {
+        "collapse": collapse_stats(model, conn),
         "citation": score_task(model, build_citation_task(conn, n, pool_size, seed=seed)),
         "paraphrase": score_task(model, build_paraphrase_task(conn, n, pool_size, seed=seed)),
     }
@@ -147,3 +170,103 @@ def format_report(before: dict, after: dict | None = None) -> str:
                 arrow = "+" if delta > 0 else ""
                 lines.append(f"    {k:6} {b[k]:.4f} -> {a:.4f}  ({arrow}{delta:.4f})")
     return "\n".join(lines)
+
+
+# ── synthetic question generation ──────────────────────────────────────────────────
+
+SYNTH_SYSTEM = """You write evaluation questions for a scientific search engine.
+
+Given a passage from an arXiv machine-learning paper, write ONE question that the passage
+answers specifically. Reply with the question and nothing else.
+
+Constraints, all of which matter:
+- The question must be answerable from this passage alone.
+- Do NOT reuse the passage's distinctive wording. Paraphrase the technical terms where a
+  natural synonym exists, and never quote a phrase of more than two words from it.
+- Ask what a researcher would ask before they had found the passage, not a comprehension
+  question written by someone already looking at it.
+- No meta-references: never write "the passage", "this paper", "the authors", "Figure 2".
+- One sentence."""
+
+
+async def generate_questions(cfg, conn, n: int = 200, model: str | None = None,
+                             seed: int = 0) -> list[dict]:
+    """LLM-written questions paired with the chunk they came from.
+
+    This is the only eval that matches the product's actual task shape — a natural
+    language question against body chunks. The structural tasks use paragraphs and
+    abstracts as queries, which is not what anyone types.
+
+    **The prompt fights lexical leakage on purpose.** A generator that echoes the chunk's
+    rare terms produces questions any retriever solves by keyword overlap, and the metric
+    then measures vocabulary matching rather than retrieval quality — flattering every
+    model equally and distinguishing none of them. Forbidding quotation and asking for
+    paraphrase is what keeps the task discriminative.
+    """
+    import numpy as np
+
+    from lara.serve.generate import stream_answer
+
+    rng = np.random.default_rng(seed)
+    rows = conn.execute(
+        """SELECT chunk_id, arxiv_id, text FROM chunks
+           WHERE kind='body' AND length(text) BETWEEN 500 AND 1400
+           ORDER BY chunk_id LIMIT 40000"""
+    ).fetchall()
+    if not rows:
+        return []
+    pick = rng.permutation(len(rows))[:n]
+
+    out = []
+    for i in pick:
+        r = rows[int(i)]
+        buf = ""
+        try:
+            async for tok in stream_answer(
+                cfg, f"Passage:\n{r['text'][:1400]}\n\nQuestion:", [],
+                system=SYNTH_SYSTEM, model=model, temperature=0.3,
+                max_tokens=90, raw_user=True,
+            ):
+                buf += tok
+        except Exception:
+            continue
+        q = buf.strip().split("\n")[0].strip().strip('"')
+        if len(q) > 25 and q.endswith("?"):
+            out.append({"question": q, "chunk_id": r["chunk_id"],
+                        "arxiv_id": r["arxiv_id"], "text": r["text"]})
+    return out
+
+
+def leakage_score(question: str, chunk: str) -> float:
+    """Fraction of the question's content words that appear verbatim in the chunk.
+
+    Reported alongside the metric so a suspiciously easy eval set is visible rather than
+    silently inflating every score.
+    """
+    import re
+    stop = set("what how why when where which does do is are the a an of to in on for and "
+               "or with that this it its can could would should may might".split())
+    qw = {w for w in re.findall(r"[a-z0-9]+", question.lower()) if w not in stop and len(w) > 2}
+    if not qw:
+        return 0.0
+    cw = set(re.findall(r"[a-z0-9]+", chunk.lower()))
+    return len(qw & cw) / len(qw)
+
+
+def build_synthetic_task(items: list[dict], conn, pool_size: int = 2000) -> Task:
+    """Questions as queries, their source chunks as gold, other chunks as distractors."""
+    if not items:
+        return Task("synthetic", [], [], [])
+    gold_ids = {it["chunk_id"] for it in items}
+    pool = [
+        r[0] for r in conn.execute(
+            "SELECT text FROM chunks WHERE kind='body' AND length(text) > 400 "
+            "AND chunk_id NOT IN (%s) ORDER BY chunk_id DESC LIMIT ?"
+            % ",".join(str(i) for i in gold_ids),
+            (pool_size,),
+        )
+    ]
+    return Task("synthetic",
+                [it["question"] for it in items],
+                [it["text"] for it in items],
+                pool)
