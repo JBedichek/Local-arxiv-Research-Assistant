@@ -406,6 +406,70 @@ def pairs(
 
 
 @app.command()
+def explore(
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    n: int = typer.Option(50, help="Questions to generate"),
+    k: int = typer.Option(20, help="Passages retrieved per question"),
+    device: str = typer.Option("cuda:0"),
+    seed: int = typer.Option(0),
+) -> None:
+    """Generate questions, retrieve, and judge — harvesting training pairs."""
+    import asyncio
+
+    from lara.finetune import explore as EX
+    from lara.finetune import judgements as J
+    from lara.index import embed as emb
+    from lara.index import retrieve as R
+    from lara.index.vectors import VectorStore
+    from lara.store import db
+
+    cfg = config_mod.load(config)
+    ecfg, icfg = cfg.get_in("embedding"), cfg.get_in("index")
+    conn = db.connect(cfg.get_path("paths.metadata_db"))
+    store = VectorStore(cfg.get_path("paths.vectors_fp16"), cfg.get_path("paths.vectors_int8"),
+                        dim_full=int(ecfg["dim_full"]), dim_trunc=int(ecfg["dim_truncated"]))
+    ccfg = icfg["rerank"]["cross_encoder"]
+
+    console.print("loading embedder, reranker and index…")
+    embedder = emb.load_model(ecfg["model"], device=device, max_seq_length=512)
+    ce = R.load_cross_encoder(ccfg["model"], device=f"cuda:{ccfg.get('device', 1)}",
+                              max_length=int(ccfg.get("max_length", 512)))
+    lex = icfg["lexical"]
+    retr = R.Retriever(conn, store, embedder, device=device,
+                       dim_trunc=int(ecfg["dim_truncated"]),
+                       tier2_candidates=int(icfg["rerank"]["tier2_candidates"]),
+                       rerank_candidates=int(ccfg.get("candidates", 24)), final_k=k,
+                       rrf_k=int(lex["rrf_k"]), lexical=bool(lex["enabled"]),
+                       max_terms=int(lex.get("max_terms", 3)),
+                       df_ceiling_frac=float(lex.get("df_ceiling_frac", 0.005)),
+                       cross_encoder=ce)
+
+    def reporter():
+        while True:
+            s = yield
+            mark = "miss" if s["source_rank"] is None else f"#{s['source_rank']}"
+            console.print(
+                f"  [{s['cycles']:>4}] {s['style']:16} src {mark:5} "
+                f"+{s['positives']}/-{s['negatives']}  {s['last_q'][:58]}"
+            )
+
+    p = reporter()
+    next(p)
+    stats = asyncio.run(EX.run_cycles(cfg, conn, retr, ce, n=n, k=k, seed=seed, progress=p))
+    console.print(
+        f"\n[green]{stats['cycles']} cycles[/green] · {stats['stored']:,} new judgements "
+        f"({stats['positives']} pos / {stats['negatives']} neg) · "
+        f"{stats['rejected']} questions rejected"
+    )
+    console.print(
+        f"  source-chunk recall@{k}: {stats['source_recall']:.1%} "
+        f"(MRR {stats['source_mrr']:.3f}) — misses are the most valuable examples"
+    )
+    console.print(f"  totals: {J.stats(conn)}")
+    conn.close()
+
+
+@app.command()
 def finetune(
     config: str = typer.Option(None, help="Path to config.yaml"),
     out: str = typer.Option(None, help="Where to save the tuned model"),

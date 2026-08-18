@@ -429,6 +429,56 @@ where most of the gain comes from.
 fine-tunes on one card in wall-clock under an hour. Keep the old vectors until the new
 index wins on the eval set.
 
+### 5.3 Distilling relevance judgements into the embedder (built, not yet trained on)
+
+A cross-encoder reading (query, passage) jointly is far better at relevance than a
+bi-encoder that compressed the passage to 768 numbers before the query existed. That gap is
+what distillation closes — and the teacher is already paid for: every search scores its
+candidates with the reranker and then discards the verdict.
+
+**Teachers, by cost.**
+
+===============  ===========================================================================
+cross_encoder    free — already computed per query; capture is a write
+llm              expensive; reserved for scores in the 0.15-0.75 band, where the reranker
+                 is guessing and a reading model changes the label rather than confirming it
+user_click       rare, unbiased by any model, worth the most per example
+synthetic        generated during an exploration run
+===============  ===========================================================================
+
+**Live traffic alone cannot train this.** Measured on the first three real queries: 24
+positives, **zero** negatives. Everything the retriever returns scores above threshold, so
+usage teaches it to reorder what it already finds and never to find what it misses — the
+textbook exposure-bias failure. Model bias is the risk people worry about here; the
+sampling bias is the one that actually breaks it.
+
+**The exploration loop fixes that.** Sample a passage, ask the model for a question about
+it (including "what do you least understand here"), retrieve at high k, judge everything,
+and record where the *source* chunk landed. Measured over 40 cycles:
+
+- 1,058 judgements, **569 positive / 489 negative** — balanced, unlike live traffic
+- **source-chunk recall@20 = 55%** (MRR 0.407)
+
+That 45% miss rate is the point. Each miss is a known-relevant passage the current embedder
+cannot see, labelled without a human — exactly the example type usage can never produce.
+It also quantifies the headroom: on model-written questions, current retrieval misses the
+target chunk almost half the time.
+
+**Negatives are mined at three depths** — the tail of the ranking (hard), random chunks
+(easy, to anchor the scale), and the misses above. Random negatives are *scored* rather
+than assumed to be irrelevant, because occasionally they are not, and labelling them 0
+regardless would inject noise into precisely the pairs meant to calibrate the low end.
+
+**On circularity.** Generator, judge and student share a lineage, so this distils one
+model's notion of relevance rather than discovering ground truth. That is acceptable only
+because the evaluation is independent: citation retrieval is scored against what human
+authors actually cited, so a student that merely learns to please its teacher will not move
+that number. Train on synthetic, validate on citations.
+
+**Prerequisite.** None of this pays off until the training recipe is fixed — the first run
+destroyed the encoder (§12.0.4), and better data cannot rescue a learning rate that is
+40x too high.
+
 ---
 
 ## 6. Citation graph and similarity heatmap (R8, R9)

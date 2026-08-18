@@ -48,8 +48,12 @@ class Retriever:
         # endpoints across a threadpool, and sqlite3 refuses to use a connection from a
         # thread other than the one that created it. Sharing one connection makes
         # requests fail or succeed depending on which worker thread they land on.
+        # isinstance, NOT callable(): sqlite3.Connection defines __call__ (it compiles a
+        # statement), so callable() reports True for a real connection and the "factory"
+        # becomes the connection itself — which then raises
+        # "function takes exactly 1 argument (0 given)" on first use.
         self._conn_factory: Callable[[], sqlite3.Connection] = (
-            conn if callable(conn) else (lambda c=conn: c)
+            (lambda c=conn: c) if isinstance(conn, sqlite3.Connection) else conn
         )
         self.store = store
         self.embedder = embedder

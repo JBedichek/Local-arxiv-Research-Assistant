@@ -112,6 +112,49 @@ def get_paper(arxiv_id: str) -> JSONResponse:
     })
 
 
+def _capture_judgements(s, query: str, hits, source: str) -> None:
+    """Store the reranker's verdict on every retrieved passage.
+
+    Free by construction — the scores were computed to rank these hits and are otherwise
+    discarded. Failures are swallowed: harvesting training data must never be able to fail
+    a user's search.
+    """
+    try:
+        from lara.finetune import judgements as J
+        from lara.store import db
+
+        items = J.from_hits(query, [
+            {"chunk_id": h.chunk_id, "score": h.score, "provenance": h.provenance}
+            for h in hits
+        ], source=source)
+        if not items:
+            return
+        conn = db.connect(s.db_path)
+        try:
+            J.record(conn, items)
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _capture_hit_dicts(s, query: str, hits: list[dict], source: str) -> None:
+    try:
+        from lara.finetune import judgements as J
+        from lara.store import db
+
+        items = J.from_hits(query, hits, source=source)
+        if not items:
+            return
+        conn = db.connect(s.db_path)
+        try:
+            J.record(conn, items)
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
 class RetrieveRequest(BaseModel):
     query: str
     selection: str | None = None
@@ -145,6 +188,7 @@ def retrieve(req: RetrieveRequest) -> JSONResponse:
         req.query, papers=restrict, selection=req.selection,
         final_k=max(1, min(req.k, 32)),
     )
+    _capture_judgements(s, req.query, result.hits, source="search")
     return JSONResponse({
         "timings_ms": {k: round(v, 1) for k, v in result.timings_ms.items()},
         "candidates": result.n_candidates,
@@ -763,6 +807,7 @@ async def ask(req: AskRequest) -> StreamingResponse:
                     yield step("search", f"Searching ({breadth.label})…")
                     hits = await run_in_threadpool(run_search, req.query, breadth.k)
             yield f"event: hits\ndata: {json.dumps(hits)}\n\n"
+            _capture_hit_dicts(s, req.query, hits, "ask")
 
             rounds = 0
             while rounds < breadth.max_rounds:

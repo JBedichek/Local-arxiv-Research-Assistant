@@ -153,6 +153,39 @@ CREATE TABLE IF NOT EXISTS paper_vectors (
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS paper_vectors_row ON paper_vectors(vector_row);
 
+-- Relevance judgements harvested from retrieval, for distilling the cross-encoder's
+-- judgement into the bi-encoder (PLAN.md §5.3).
+--
+-- Every retrieval already scores its candidates with the cross-encoder and then discards
+-- those scores. Keeping them is free: no extra inference, and the queries are real.
+--
+-- `teacher` records WHO judged, because the teachers differ in cost and reliability and a
+-- later training run needs to weight them differently:
+--   cross_encoder  bge-reranker score, captured on every query at no cost
+--   llm            adjudication of the uncertain middle band, where the reranker is
+--                  unsure and a reading model earns its latency
+--   user_click     a citation the reader actually followed — human signal, the most
+--                  valuable per example and the only kind free of model bias
+--   synthetic      generated during an exploration run
+CREATE TABLE IF NOT EXISTS judgements (
+    id          INTEGER PRIMARY KEY,
+    query       TEXT NOT NULL,
+    query_hash  TEXT NOT NULL,
+    chunk_id    INTEGER NOT NULL,
+    score       REAL,                -- teacher score, native scale
+    label       INTEGER,             -- 1 relevant, 0 not, NULL unjudged
+    teacher     TEXT NOT NULL,
+    rank        INTEGER,             -- position in the ranking that produced it
+    source      TEXT,                -- ask | search | explore | click
+    created_utc TEXT NOT NULL
+);
+-- Dedup on (query, chunk): the same passage judged twice for the same question adds no
+-- information but would silently reweight it in training.
+CREATE UNIQUE INDEX IF NOT EXISTS judgements_uniq
+    ON judgements(query_hash, chunk_id, teacher);
+CREATE INDEX IF NOT EXISTS judgements_teacher ON judgements(teacher, label);
+CREATE INDEX IF NOT EXISTS judgements_chunk   ON judgements(chunk_id);
+
 -- Citation edges (D6, Semantic Scholar). Both endpoints are arXiv ids; references to
 -- non-arXiv works are dropped, which is fine since the graph UI only navigates arXiv.
 CREATE TABLE IF NOT EXISTS citations (
