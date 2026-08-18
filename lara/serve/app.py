@@ -421,12 +421,31 @@ def models() -> JSONResponse:
     from lara.models import scan
 
     found = scan(s.cfg.get_path("huggingface.home"))
+
+    # Which model vLLM is actually serving. The picker lists everything in the cache, but
+    # only one is loaded (D5, single_resident), and sending any other name to vLLM is a
+    # 404 at generation time. Reporting it lets the UI default to the live one instead of
+    # whichever happened to sort first.
+    import httpx
+
+    loaded: list[str] = []
+    try:
+        base = s.cfg.get_in("serving.vllm.base_url").rstrip("/")
+        r = httpx.get(f"{base}/models", timeout=2.0)
+        if r.status_code == 200:
+            loaded = [m["id"] for m in r.json().get("data", [])]
+    except Exception:
+        pass
+
     return JSONResponse({
+        "loaded": loaded,
+        "configured_default": s.cfg.get_in("serving.vllm.default_model"),
         "models": [
             {
                 "repo": m.repo, "arch": m.arch, "size_gb": round(m.size_gb, 1),
                 "quantization": m.quantization,
                 "quant_options": m.runtime_quant_options(),
+                "loaded": m.repo in loaded,
             }
             for m in found if m.servable
         ],

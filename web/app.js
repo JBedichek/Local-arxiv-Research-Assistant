@@ -581,43 +581,7 @@ function escapeHtml(s) {
 
 /* ---------- boot ---------- */
 
-(async function boot() {
-  applyLayout();
-  applyTypography();
-  document.documentElement.style.setProperty("--graph-h", prefs.get("graphH", "460px"));
-  $("#topk").value = prefs.get("topk", "20");
-  $("#topk-val").textContent = $("#topk").value;
-  makeSplitter($("#split-left"), "--col-left", "colLeft", "left");
-  makeSplitter($("#split-right"), "--col-right", "colRight", "right");
-  bindSearchGraph();
 
-  try {
-    const b = await api("/api/breadth");
-    BREADTH = b.options;
-    $("#breadth").max = String(BREADTH.length - 1);
-    const saved = prefs.get("breadth", String(BREADTH.findIndex((x) => x.name === b.default)));
-    $("#breadth").value = saved;
-    applyBreadth();
-  } catch { /* fall back to the server default */ }
-
-  try {
-    const m = await api("/api/models");
-    state.models = m.models;
-    $("#model").innerHTML =
-      m.models.map((x) => `<option value="${x.repo}">${x.repo} (${x.size_gb}GB)</option>`).join("")
-      || `<option value="">none servable</option>`;
-    syncQuant();
-    $("#model").addEventListener("change", syncQuant);
-  } catch { /* models are optional for browsing */ }
-
-  const path = location.pathname.match(/^\/p\/(.+?)(?:v(\d+))?$/);
-  const q0 = new URLSearchParams(location.search).get("q");
-  if (path) openPaper(path[1], location.hash, false);
-  else if (q0) { $("#arxiv-input").value = q0; searchPapers(q0, false); }
-
-  const h = await api("/api/health").catch(() => null);
-  if (h) setStatus(`${h.vectors.toLocaleString()} chunks indexed`);
-})();
 
 function syncQuant() {
   const m = state.models.find((x) => x.repo === $("#model").value);
@@ -1006,4 +970,63 @@ $("#topk").addEventListener("change", () => {
       if (h > 100) prefs.set("graphH", h + "px");
     }, 250);
   }).observe(wrap);
+})();
+
+/* ---------- boot ----------
+ * Must be last in the file. This ran mid-file once, before the `const prefs` and
+ * `const BREADTH` declarations below it, and hit the temporal dead zone:
+ * "Cannot access 'prefs' before initialization" threw out of boot() on every load,
+ * so bindSearchGraph() never ran and nothing in the graph was clickable. Search still
+ * worked, because its listener is registered at top level, which made the failure
+ * look like a graph bug rather than a load-order bug. */
+(async function boot() {
+  applyLayout();
+  applyTypography();
+  document.documentElement.style.setProperty("--graph-h", prefs.get("graphH", "460px"));
+  $("#topk").value = prefs.get("topk", "20");
+  $("#topk-val").textContent = $("#topk").value;
+  makeSplitter($("#split-left"), "--col-left", "colLeft", "left");
+  makeSplitter($("#split-right"), "--col-right", "colRight", "right");
+  bindSearchGraph();
+
+  try {
+    const b = await api("/api/breadth");
+    BREADTH = b.options;
+    $("#breadth").max = String(BREADTH.length - 1);
+    const saved = prefs.get("breadth", String(BREADTH.findIndex((x) => x.name === b.default)));
+    $("#breadth").value = saved;
+    applyBreadth();
+  } catch { /* fall back to the server default */ }
+
+  try {
+    const m = await api("/api/models");
+    state.models = m.models;
+    // Any model in the cache can be listed, but only the one vLLM has loaded can answer;
+    // selecting another would 404 at generation time. Default to the live one and mark
+    // the rest as needing a restart.
+    // Prefer what vLLM actually has loaded; if it is down, fall back to the configured
+    // default rather than whichever repo happens to sort first (which was Mixtral, purely
+    // because it is the largest file on disk).
+    const live = new Set(m.loaded?.length ? m.loaded : [m.configured_default].filter(Boolean));
+    const opts = m.models.map((x) =>
+      `<option value="${x.repo}"${live.has(x.repo) ? " selected" : ""}>` +
+      `${x.repo} (${x.size_gb}GB)${live.has(x.repo) ? " — loaded" : " — not loaded"}</option>`);
+    $("#model").innerHTML = opts.join("") || `<option value="">none servable</option>`;
+    if (m.loaded?.length && ![...$("#model").options].some((o) => o.selected && live.has(o.value))) {
+      // The served model is not in the cache scan (e.g. a repo the filter rejects);
+      // offer it explicitly so the UI still points at something that works.
+      $("#model").insertAdjacentHTML("afterbegin",
+        `<option value="${m.loaded[0]}" selected>${m.loaded[0]} — loaded</option>`);
+    }
+    syncQuant();
+    $("#model").addEventListener("change", syncQuant);
+  } catch { /* models are optional for browsing */ }
+
+  const path = location.pathname.match(/^\/p\/(.+?)(?:v(\d+))?$/);
+  const q0 = new URLSearchParams(location.search).get("q");
+  if (path) openPaper(path[1], location.hash, false);
+  else if (q0) { $("#arxiv-input").value = q0; searchPapers(q0, false); }
+
+  const h = await api("/api/health").catch(() => null);
+  if (h) setStatus(`${h.vectors.toLocaleString()} chunks indexed`);
 })();
