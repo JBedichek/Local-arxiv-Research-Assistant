@@ -1297,6 +1297,7 @@ def dataset_pull(
     revision: str = typer.Option(None, help="Branch, tag or commit to pin"),
     list_only: bool = typer.Option(False, "--list", help="Show what is in the repo and exit"),
     workers: int = typer.Option(8, help="Parallel download workers"),
+    extract: bool = typer.Option(True, help="Unpack raw/*.tar after pulling the archive tier"),
 ) -> None:
     """Download the corpus from Hugging Face. No account needed; resumes if interrupted.
 
@@ -1357,6 +1358,30 @@ def dataset_pull(
         repo_id=repo, repo_type="dataset", revision=revision,
         local_dir=str(root), allow_patterns=patterns, max_workers=int(workers),
     )
+    # The archive tier arrives as one tar per year; nothing else in the codebase reads a
+    # tar, so without this step it is 40 GB the parser cannot see.
+    if "archive" in want and extract:
+        console.print("\nunpacking the raw archive…")
+        done, skipped = DS.extract_archives(root)
+        if done:
+            console.print(f"  extracted {len(done)} tar(s) into {root / 'raw'}")
+        if skipped:
+            console.print(f"  [dim]{len(skipped)} already extracted, left alone[/dim]")
+        tars = sorted((root / "raw").glob("raw-*.tar"))
+        if tars:
+            freeable = sum(t.stat().st_size for t in tars) / 1e9
+            console.print(
+                f"  [dim]the .tar files are kept so re-running `pull` stays a no-op; "
+                f"delete them to reclaim {freeable:.0f} GB once you are happy:[/dim]\n"
+                f"  [dim]  rm {root / 'raw'}/raw-*.tar[/dim]"
+            )
+    elif "archive" in want:
+        console.print(
+            "\n[yellow]--no-extract given[/yellow]: raw/*.tar are on disk but the parser "
+            "reads raw/{YYMM}/*.zst. Unpack them from the corpus root, not from inside "
+            f"raw/:\n  tar xf {root / 'raw'}/raw-2015.tar -C {root}"
+        )
+
     console.print(f"\n[green]done[/green] — {root}")
     console.print("next: [bold]lara setup[/bold], then [bold]lara serve[/bold]")
 

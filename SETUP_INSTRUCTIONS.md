@@ -125,12 +125,17 @@ where it stopped.
 |---|---|---|
 | `core` | ~50 GB | paper text, BM25 index, citations, and the search vectors. **Start here.** |
 | `full` | +45 GB | fp16 vectors for exact rescoring — slightly better ranking |
-| `archive` | +38 GB | raw crawled HTML; only useful if you intend to re-parse |
+| `archive` | +40 GB | raw crawled HTML; only useful if you intend to re-parse |
 
 **`core` runs on its own.** It ships the int8 vectors only, so tier-2 rescore falls back to
 those instead of the 768-d fp16 file. Measured against a `full` install on the same queries,
 that costs about 15 % of the top-8 result set and no latency — adding `full` sharpens the
 ranking rather than switching search on.
+
+**`archive` needs ~80 GB transiently.** The raw HTML ships as one tar per year (368 k loose
+files is past the Hub's per-repo limit), and `pull` unpacks them into the layout the parser
+reads. Both forms are on disk until you remove the tars, which the command tells you how to
+do; `--no-extract` skips unpacking and prints the manual command instead.
 
 ```bash
 lara dataset pull --tiers core,full          # both
@@ -139,9 +144,6 @@ lara dataset pull --list                     # see what is in the repo without d
 
 The corpus is **1,011,039 papers harvested / 377,093 in scope, 28.7 M chunks, 7.2 M citation
 edges**, covering `cs.LG`, `cs.CL`, `stat.ML` and `cs.NE` from 2015 on.
-
-> The upload is still in progress at the time of writing. If `pull` reports *"nothing matches
-> tier core"*, the files are not published yet — `--list` shows what is actually there.
 
 Building it yourself instead is documented in [`docs/setup/scraping_from_scratch.md`](docs/setup/scraping_from_scratch.md).
 It takes about a day and needs a GPU.

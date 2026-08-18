@@ -64,6 +64,39 @@ def hf_patterns(tiers: tuple[str, ...]) -> list[str]:
     return out
 
 
+def extract_archives(root: Path) -> tuple[list[str], list[str]]:
+    """Unpack ``raw/raw-YYYY.tar`` into the sharded layout the parser actually reads.
+
+    The Hub ships the raw HTML as one tar per year because 368 k loose files is far past
+    the per-repo file limit. Downloading them is therefore only half the job: nothing else
+    in the codebase opens a tar, and ``lara.ingest.fulltext.raw_path`` looks for
+    ``raw/{YYMM}/{id}.{source}.html.zst``.
+
+    **Members carry a leading ``raw/``, so they extract against the corpus root, not
+    against ``root/raw``.** Extracting from inside the ``raw`` directory — the obvious
+    thing to do, since that is where the tars land — nests them at ``raw/raw/1501/...``
+    and the parser then finds nothing, with no error to explain why.
+
+    Idempotent: a marker beside each tar records success, so re-running ``pull`` neither
+    re-extracts nor re-downloads. Returns (extracted, skipped) tar names.
+    """
+    import tarfile
+
+    raw = root / "raw"
+    extracted: list[str] = []
+    skipped: list[str] = []
+    for tar in sorted(raw.glob("raw-*.tar")):
+        marker = tar.with_suffix(".extracted")
+        if marker.exists():
+            skipped.append(tar.name)
+            continue
+        with tarfile.open(tar) as tf:
+            tf.extractall(root, filter="data")     # members are `raw/YYMM/...`
+        marker.write_text(f"{tar.name}\n")
+        extracted.append(tar.name)
+    return extracted, skipped
+
+
 @dataclass
 class Entry:
     name: str
