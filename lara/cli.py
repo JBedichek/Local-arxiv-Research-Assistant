@@ -7,6 +7,7 @@ from rich.console import Console
 from rich.table import Table
 
 from lara import config as config_mod
+from lara import device as ldev
 from lara import models as models_mod
 from lara import preflight as preflight_mod
 
@@ -263,19 +264,19 @@ def embed(
         conn.close()
         return
 
-    devices = [int(d) for d in (ecfg.get("devices") or [0])]
-    if device:
-        devices = [int(device.rsplit(":", 1)[-1])]
+    devices = ldev.resolve_all([device] if device else ecfg.get("devices"))
     mode = None if no_compile else ecfg.get("compile")
     console.print(
-        f"loading {ecfg['model']} on cuda:{devices} (compile={mode or 'off'})…"
+        f"loading {ecfg['model']} on {', '.join(devices)} (compile={mode or 'off'})…"
     )
     model = emb.load_model(
-        ecfg["model"], device=f"cuda:{devices[0]}", max_seq_length=int(ecfg["max_seq_len"]),
+        ecfg["model"], device=devices[0], max_seq_length=int(ecfg["max_seq_len"]),
         compile_mode=mode, compile_dynamic=bool(ecfg.get("compile_dynamic", True)),
     )
     encoder = model
-    if len(devices) > 1:
+    # Only fan out across several CUDA cards; one unified-memory GPU gains nothing from
+    # N worker processes and pays N times the memory. See lara.device.can_fan_out.
+    if ldev.can_fan_out(devices):
         encoder = emb.MultiGPUEncoder(
             model, devices, chunk_size=int(ecfg.get("slice_size", 8192)) // len(devices)
         )
@@ -337,21 +338,22 @@ def search(
         cfg.get_path("paths.vectors_fp16"), cfg.get_path("paths.vectors_int8"),
         dim_full=int(ecfg["dim_full"]), dim_trunc=int(ecfg["dim_truncated"]),
     )
-    dev = f"cuda:{(ecfg.get('devices') or [0])[0]}"
-    console.print(f"loading index ({store.rows():,} vectors) and embedder on {dev}…")
-    embedder = emb.load_model(ecfg["model"], device=dev, max_seq_length=int(ecfg["max_seq_len"]))
+    edev = ldev.resolve((ecfg.get("devices") or [None])[0])
+    console.print(f"loading index ({store.rows():,} vectors) and embedder on {edev}…")
+    embedder = emb.load_model(ecfg["model"], device=edev,
+                              max_seq_length=int(ecfg["max_seq_len"]))
 
     ce = None
     ccfg = icfg["rerank"].get("cross_encoder") or {}
     if ccfg.get("enabled") and not no_rerank:
         console.print(f"loading reranker {ccfg['model']}…")
         ce = R.load_cross_encoder(
-            ccfg["model"], device=f"cuda:{ccfg.get('device', 1)}",
+            ccfg["model"], device=ldev.resolve(ccfg.get("device", 1)),
             max_length=int(ccfg.get("max_length", 512)),
         )
 
     retr = R.Retriever(
-        conn, store, embedder, device=dev, dim_trunc=int(ecfg["dim_truncated"]),
+        conn, store, embedder, device=edev, dim_trunc=int(ecfg["dim_truncated"]),
         tier2_candidates=int(icfg["rerank"]["tier2_candidates"]),
         rerank_candidates=int(ccfg.get("candidates", 50)),
         final_k=k, rrf_k=int(icfg["lexical"]["rrf_k"]),
@@ -410,7 +412,7 @@ def explore(
     config: str = typer.Option(None, help="Path to config.yaml"),
     n: int = typer.Option(50, help="Questions to generate"),
     k: int = typer.Option(20, help="Passages retrieved per question"),
-    device: str = typer.Option("cuda:0"),
+    device: str = typer.Option(None, help="Override device; default auto-detects"),
     seed: int = typer.Option(0),
 ) -> None:
     """Generate questions, retrieve, and judge — harvesting training pairs."""
@@ -432,7 +434,7 @@ def explore(
 
     console.print("loading embedder, reranker and index…")
     embedder = emb.load_model(ecfg["model"], device=device, max_seq_length=512)
-    ce = R.load_cross_encoder(ccfg["model"], device=f"cuda:{ccfg.get('device', 1)}",
+    ce = R.load_cross_encoder(ccfg["model"], device=ldev.resolve(ccfg.get("device", 1)),
                               max_length=int(ccfg.get("max_length", 512)))
     lex = icfg["lexical"]
     retr = R.Retriever(conn, store, embedder, device=device,
@@ -478,7 +480,7 @@ def fit_check(
     epochs: int = typer.Option(3),
     batch_size: int = typer.Option(64),
     lr_muon: float = typer.Option(5e-5),
-    device: str = typer.Option("cuda:0"),
+    device: str = typer.Option(None, help="Override device; default auto-detects"),
 ) -> None:
     """Can the embedder fit the harvested judgements at all?
 
@@ -519,7 +521,7 @@ def fit_check(
         console.print(f"  before: pair_acc {before['pair_acc']:.3f}  "
                       f"margin_mae {before['margin_mae']:.3f}  spearman {before['spearman']}")
         del base
-        __import__("torch").cuda.empty_cache()
+        ldev.empty_cache(device)
 
         p = reporter(); next(p)
         model = KF.train_on(list(sub), model_name, device, rec, progress=p)
@@ -552,12 +554,12 @@ def fit_check(
         base = load_model(model_name, device=device, max_seq_length=rec.max_seq_length)
         before = KF.evaluate(base, val, device)
         del base
-        __import__("torch").cuda.empty_cache()
+        ldev.empty_cache(device)
         p = reporter(); next(p)
         model = KF.train_on(list(train), model_name, device, rec, progress=p)
         after = KF.evaluate(model, val, device)
         del model
-        __import__("torch").cuda.empty_cache()
+        ldev.empty_cache(device)
         console.print(f"    pair_acc {before['pair_acc']:.3f} -> {after['pair_acc']:.3f}   "
                       f"spearman {before['spearman']} -> {after['spearman']}")
         results.append((before, after))
@@ -578,7 +580,7 @@ def finetune(
     batch_size: int = typer.Option(16, help="Citation edges (bags) per step"),
     chunks_per_paper: int = typer.Option(4, help="Chunks sampled from each side of a bag"),
     max_edges: int = typer.Option(200000, help="Cap citation edges used (0 = all)"),
-    device: str = typer.Option("cuda:0"),
+    device: str = typer.Option(None, help="Override device; default auto-detects"),
     no_compile: bool = typer.Option(False, "--no-compile"),
     eval_only: bool = typer.Option(False, "--eval-only", help="Just measure the baseline"),
 ) -> None:
@@ -604,8 +606,7 @@ def finetune(
     before = EV.run(base_model, conn, n=400, pool_size=1500)
     console.print(EV.format_report(before))
     del base_model
-    import torch as _t
-    _t.cuda.empty_cache()
+    ldev.empty_cache(device)
     if eval_only:
         conn.close()
         return
@@ -720,11 +721,9 @@ def embed_papers(
         conn.close()
         return
 
-    devices = [int(d) for d in (ecfg.get("devices") or [0])]
-    if device:
-        devices = [int(device.rsplit(":", 1)[-1])]
+    devices = ldev.resolve_all([device] if device else ecfg.get("devices"))
     model = emb.load_model(
-        ecfg["model"], device=f"cuda:{devices[0]}", max_seq_length=int(ecfg["max_seq_len"]),
+        ecfg["model"], device=devices[0], max_seq_length=int(ecfg["max_seq_len"]),
         compile_mode=ecfg.get("compile"), compile_dynamic=True,
     )
     encoder = model

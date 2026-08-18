@@ -54,6 +54,7 @@ from collections.abc import Iterator
 import numpy as np
 import torch
 
+from lara import device as dev
 from lara.index.vectors import VectorStore
 
 QUERY_PROMPT = "task: search result | query: "
@@ -70,7 +71,7 @@ def document_text(title: str | None, section_title: str | None, text: str) -> st
 
 def load_model(
     name: str,
-    device: str = "cuda:0",
+    device: str | int | None = None,
     max_seq_length: int = 512,
     compile_mode: str | None = None,
     compile_dynamic: bool = True,
@@ -89,7 +90,11 @@ def load_model(
     """
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(name, device=device, model_kwargs={"dtype": torch.bfloat16})
+    device = dev.resolve(device)
+    # bf16 on CUDA, fp16 on MPS, fp32 on CPU — half precision is emulated on CPU and comes
+    # out slower than fp32, so "smaller is faster" does not hold there.
+    model = SentenceTransformer(name, device=device,
+                                model_kwargs={"dtype": dev.model_dtype(device)})
     model.max_seq_length = max_seq_length
     if compile_mode:
         model[0].auto_model = torch.compile(
@@ -109,13 +114,17 @@ class MultiGPUEncoder:
 
     Exposes the same ``.encode(...)`` shape as a plain SentenceTransformer so
     :func:`run` does not care which it was handed.
+
+    Only ever constructed for multiple CUDA cards — see :func:`lara.device.can_fan_out`.
+    On unified memory there is one GPU behind one pool of RAM, so N workers would multiply
+    the footprint while contending for the same silicon.
     """
 
-    def __init__(self, model, devices: list[int], chunk_size: int | None = None) -> None:
+    def __init__(self, model, devices: list[str | int], chunk_size: int | None = None) -> None:
         self.model = model
-        self.devices = devices
+        self.devices = dev.resolve_all(devices)
         self.chunk_size = chunk_size
-        self.pool = model.start_multi_process_pool([f"cuda:{d}" for d in devices])
+        self.pool = model.start_multi_process_pool(self.devices)
 
     def encode(self, texts: list[str], batch_size: int = 256, **_: object) -> np.ndarray:
         return self.model.encode_multi_process(

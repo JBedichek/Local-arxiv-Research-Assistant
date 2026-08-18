@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from lara import device as dev
 from lara.index import search as S
 from lara.index.embed import embed_queries
 from lara.index.vectors import VectorStore
@@ -32,7 +33,7 @@ class Retriever:
         store: VectorStore,
         embedder,
         *,
-        device: str = "cuda:0",
+        device: str | int | None = None,
         dim_trunc: int = 256,
         tier2_candidates: int = 200,
         rerank_candidates: int = 50,
@@ -70,7 +71,8 @@ class Retriever:
             self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0] or 1
         )
 
-        self.dense = S.DenseIndex(store.load_int8(), device=device)
+        self.device = dev.resolve(device)
+        self.dense = S.DenseIndex(store.load_int8(), device=self.device)
         self.fp16 = store.open_fp16()          # mmap; the OS page cache does the rest
         self._row_to_chunk = self._load_row_map()
 
@@ -243,7 +245,7 @@ class Retriever:
 
 
 def load_cross_encoder(
-    name: str, device: str = "cuda:1", max_length: int = 512, verify: bool = True
+    name: str, device: str | int | None = None, max_length: int = 512, verify: bool = True
 ):
     """Load the reranker.
 
@@ -253,12 +255,12 @@ def load_cross_encoder(
     inherently batched (50 pairs at a time), pad has to be supplied. EOS is the
     conventional choice and is masked out anyway.
     """
-    import torch
     from sentence_transformers import CrossEncoder
 
+    device = dev.resolve(device if device is not None else 1)
     ce = CrossEncoder(
         name, device=device, max_length=max_length,
-        model_kwargs={"dtype": torch.bfloat16},
+        model_kwargs={"dtype": dev.model_dtype(device)},
     )
     tok = ce.tokenizer
     if tok.pad_token is None:

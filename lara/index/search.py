@@ -31,6 +31,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 
+from lara import device as dev
+
 
 @dataclass
 class Hit:
@@ -85,9 +87,10 @@ def reciprocal_rank_fusion(
 class DenseIndex:
     """Whole-corpus exact search as a GPU matmul. No ANN structure, no build step."""
 
-    def __init__(self, int8_matrix: np.ndarray, device: str = "cuda:0",
+    def __init__(self, int8_matrix: np.ndarray, device: str | None = None,
                  block: int = 1_000_000) -> None:
-        self.device = device
+        self.device = dev.resolve(device)
+        device = self.device
         n, dim = int8_matrix.shape
         # Built block-wise straight into the destination tensor. Converting the whole
         # matrix at once needs a full float32 copy — 11.4 GB at 11M vectors — which the
@@ -101,7 +104,7 @@ class DenseIndex:
             # inner product is a true cosine.
             self.matrix[start:stop] = torch.nn.functional.normalize(part, dim=1).half()
             del part
-        torch.cuda.empty_cache()
+        dev.empty_cache(device)
         self.n, self.dim = self.matrix.shape
 
     def vram_bytes(self) -> int:

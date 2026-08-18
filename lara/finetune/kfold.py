@@ -37,6 +37,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from lara import device as dev
+
 QUERY_PREFIX = "task: search result | query: "
 DOC_PREFIX = "title: none | text: "
 
@@ -192,6 +194,7 @@ def train_on(triples: list[Triple], model_name: str, device: str, rec: Recipe,
     from lara.finetune.train import margin_mse, split_param_groups
 
     torch.manual_seed(rec.seed)
+    device = dev.resolve(device)
     model = SentenceTransformer(model_name, device=device,
                                 model_kwargs={"dtype": torch.float32})
     model.max_seq_length = rec.max_seq_length
@@ -224,7 +227,7 @@ def train_on(triples: list[Triple], model_name: str, device: str, rec: Recipe,
             for g, b in zip(opt.param_groups, base):
                 g["lr"] = b * scale
 
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            with dev.autocast(device):
                 q = _encode(model, [QUERY_PREFIX + t.query for t in part], device)
                 p = _encode(model, [DOC_PREFIX + t.pos_text for t in part], device)
                 n = _encode(model, [DOC_PREFIX + t.neg_text for t in part], device)

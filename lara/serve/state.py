@@ -19,6 +19,7 @@ from pathlib import Path
 import numpy as np
 
 from lara import config as config_mod
+from lara import device as dev
 from lara.index import embed as emb
 from lara.index import retrieve as R
 from lara.index.vectors import VectorStore
@@ -36,7 +37,9 @@ class AppState:
 
         ecfg = self.cfg.get_in("embedding")
         icfg = self.cfg.get_in("index")
-        self.device = f"cuda:{(ecfg.get('devices') or [0])[0]}"
+        # Config expresses devices as CUDA ordinals; lara.device maps that intent onto
+        # whatever is actually here (see lara/device.py). On a Mac this becomes "mps".
+        self.device = dev.resolve((ecfg.get("devices") or [None])[0])
 
         self.store = VectorStore(
             self.cfg.get_path("paths.vectors_fp16"),
@@ -112,7 +115,7 @@ class AppState:
         if ccfg.get("enabled"):
             t0 = time.time()
             cross = R.load_cross_encoder(
-                ccfg["model"], device=f"cuda:{ccfg.get('device', 1)}",
+                ccfg["model"], device=dev.resolve(ccfg.get("device", 1)),
                 max_length=int(ccfg.get("max_length", 512)),
             )
             self.warmup_ms["reranker"] = (time.time() - t0) * 1000

@@ -33,15 +33,19 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from lara import device as dev
+
 
 @dataclass
 class TrainConfig:
     model: str = "google/embeddinggemma-300m"
-    device: str = "cuda:0"
+    device: str = ""            # resolved via lara.device at use; "" means auto
     # Chunks average 219 tokens (p95 432). Training at 512 pads most of the batch with
     # nothing while paying full attention cost for it.
     max_seq_length: int = 384
-    amp_dtype: str = "bfloat16"    # activations in bf16; master weights stay fp32
+    # Autocast dtype is derived from the device, not configured: bf16 on CUDA, fp16 on
+    # MPS (Metal's bf16 is uneven), off on CPU. A fixed "bfloat16" here would reintroduce
+    # the portability bug this module exists to remove. Master weights stay fp32.
     grad_checkpointing: bool = True
     batch_size: int = 16           # bags (citation edges) per step
     chunks_per_paper: int = 4      # m: chunks sampled from each side of a bag
@@ -171,6 +175,7 @@ def train(conn: sqlite3.Connection, cfg: TrainConfig, progress=None):
     torch.manual_seed(cfg.seed)
 
     held = EV._held_out_srcs(conn, cfg.held_out_frac, cfg.seed)
+    cfg.device = dev.resolve(cfg.device)
     model = SentenceTransformer(cfg.model, device=cfg.device,
                                 model_kwargs={"dtype": torch.float32})
     model.max_seq_length = cfg.max_seq_length
@@ -219,7 +224,6 @@ def train(conn: sqlite3.Connection, cfg: TrainConfig, progress=None):
         for g, base in zip(opt.param_groups, base_lrs):
             g["lr"] = base * scale
 
-    amp = getattr(torch, cfg.amp_dtype)
     rng = random.Random(cfg.seed)
     history: list[dict] = []
     step = 0
@@ -239,7 +243,7 @@ def train(conn: sqlite3.Connection, cfg: TrainConfig, progress=None):
                 dst_texts.extend(d_c)
 
             # One forward pass for both sides keeps the batch shapes stable for compile.
-            with torch.autocast(device_type="cuda", dtype=amp):
+            with dev.autocast(cfg.device):
                 emb = encode_batch(model, src_texts + dst_texts, cfg.device)
                 D = emb.size(-1)
                 half = len(src_texts)

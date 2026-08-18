@@ -4,8 +4,10 @@ Interactive reader for arXiv ML papers with local-LLM RAG: open a paper, highlig
 passage, ask a question, get a grounded answer with click-through citations, and explore
 the citation neighbourhood as a similarity-shaded graph.
 
-Status: **planning**. Nothing implemented yet. Decisions taken so far are in §12.0;
-remaining open questions in §12.1.
+Status: **built and running**. Corpus, index, reader, agent loop and fine-tuning pipeline
+are implemented; measured figures throughout have superseded the original estimates, and
+where they disagree the measurement is right (see §12.0.2–12.0.3). Current work is
+portability and first-run setup, §13. Decisions are in §12.0; open questions in §12.1.
 
 ---
 
@@ -901,6 +903,47 @@ external-content FTS5 does not track its content table. Triggers now maintain it
   box and on a 16 GB box are genuinely different configurations rather than the same guess
   with a different label. A table of fixed presets would be stale the moment the corpus
   grows, and this corpus grows continuously.
+- **D22 — Topic-scoped residency: keep the relevant fraction of the corpus in RAM, the
+  rest on disk.** The user names one or more topics ("data selection for LLMs") and sets a
+  keep fraction; papers are ranked against those topics using the **paper-level vectors
+  that already exist** (377 k title+abstract embeddings, 96 MB int8, one matmul to score
+  all of them), and only the kept papers' chunks are loaded into the resident tier-1
+  index. Combined with D19 this is what puts the project on a laptop:
+
+  ==========  ===============  =========================  ==================
+  keep        papers resident  chunks resident            tier-1 (int8-256)
+  ==========  ===============  =========================  ==================
+  1.00        377 k            28.7 M                     7.3 GB
+  0.25        94 k             7.2 M                      1.8 GB
+  0.10        38 k             2.9 M                      735 MB
+  0.02        7.5 k            574 k                      147 MB
+  ==========  ===============  =========================  ==================
+
+  Four properties make this safe rather than lossy:
+
+  1. **Nothing is deleted.** Residency is a load-time decision. The fp16 tier-2 mmap and
+     the FTS5 index still cover the whole corpus.
+  2. **BM25 is the safety net, for free.** The retriever already fuses dense with lexical,
+     and FTS5 covers every chunk on disk. So a pruned dense tier degrades *gracefully* —
+     an off-topic question still matches lexically and RRF folds it back in. The failure
+     mode is reduced semantic recall outside the topic, not blindness.
+  3. **The knob is cheap to move.** Re-scoring and re-slicing the int8 file takes seconds
+     and requires no re-embedding — unlike `dim_truncated`, which invalidates every vector.
+  4. **Promotion on demand.** Tier 0 already pins the open paper; opening a non-resident
+     paper pulls its chunks in, so following a citation out of the kept set still works.
+
+  Two refinements that matter more than the knob itself. **Score by max over topics, not
+  mean** — a paper perfectly on one of three interests should not be penalised for
+  ignoring the other two. And **expand along the citation graph**: a paper cited by many
+  kept papers is worth keeping even when its abstract does not match, which is exactly the
+  foundational-work case ("Adam: A Method for Stochastic Optimization" will not score
+  against "data selection for LLMs", and you want it anyway). The 6.8 M-edge graph is
+  already built, so this costs one hop.
+
+  **The honest caveat, which the UI must carry:** a similarity-ranked cut is not a clean
+  topical boundary. Title+abstract embeddings are decent but the tail is fuzzy, so the
+  wizard shows the papers nearest the cut line in both directions before committing — a
+  knob whose effect you cannot see is a knob you cannot set.
 - **D21 — Hardware changes are detected, never silently accommodated.** Setup records the
   machine fingerprint it configured against. If the GPU count, VRAM or `dim_truncated`
   no longer matches what the vectors were built with, refuse to start and say so. Silent
@@ -1021,7 +1064,34 @@ machine with no accelerator should get a fully working reader by fetching a preb
 local or remote. The wizard should present this as a supported configuration rather than a
 degraded one.
 
-### 13.6 Phasing
+### 13.6 Topic-scoped residency (D22)
+
+The memory planner (§13.3) treats the tier-1 index as a fixed cost derived from
+`n_chunks`. D22 makes it a *variable* the user controls, which changes the planner's job
+from "tell you what fits" to "tell you what you have to give up".
+
+    score(paper) = max over topics of  cos(paper_vector, topic_vector)
+    keep         = top `fraction` by score, optionally unioned with 1-hop citations
+    resident     = chunks of kept papers, loaded into tier 1
+    everything else stays on disk, reachable via BM25 and tier 2
+
+Implementation notes:
+
+- The keep-set is a **row-id list**, which is exactly the shape `DenseIndex.search(rows=…)`
+  already accepts for scoped search (§ "Scope"). So residency reuses the mechanism built
+  for "search this paper only" rather than adding a parallel path.
+- Persist the keep-set, not the topic string. Re-deriving it at every start would make
+  results drift as the corpus grows, and a search index that silently changes what it
+  covers between restarts is not debuggable.
+- `lara corpus scope --topic "..." --keep 0.1 --preview` prints the cut without applying
+  it; `--apply` writes the keep-set; `--reclaim` additionally drops non-resident vectors
+  from disk, which is destructive and therefore a separate explicit flag.
+- Composes with the LAN dataset tiers: a topic-scoped machine can compute its keep-set
+  from the (small) paper vectors and fetch **only** the chunk vectors it will use, turning
+  a 42 GB transfer into a few GB. This is the cheapest path to a useful install and is
+  worth wiring up once §13.4 exists.
+
+### 13.7 Phasing
 
 ============  =======================================================  ==========================
 phase         work                                                     unlocks
@@ -1030,8 +1100,9 @@ phase         work                                                     unlocks
 2             config layering (D16), portable defaults, advisory        a fresh clone starts
               preflight
 3             int8-resident index (D19), memory planner (D20)           16 GB machines viable
-4             wizard UI, `lara setup` (D17, D18)                        the requested feature
-5             endpoint probing, benchmark step, fingerprint (D21)       accessibility polish
+4             topic-scoped residency (D22)                              laptop-scale installs
+5             wizard UI, `lara setup` (D17, D18)                        the requested feature
+6             endpoint probing, benchmark step, fingerprint (D21)       accessibility polish
 ============  =======================================================  ==========================
 
 Phases 1–3 are the substance; phase 4 is mostly UI over primitives that already exist
