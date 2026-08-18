@@ -377,6 +377,120 @@ def search(
 
 
 @app.command()
+def pairs(
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    limit: int = typer.Option(0, help="Stop after N papers (0 = all cached)"),
+) -> None:
+    """Extract citation-context training pairs from the raw HTML cache."""
+    from lara.finetune import pairs as P
+    from lara.store import db
+
+    cfg = config_mod.load(config)
+    conn = db.connect(cfg.get_path("paths.metadata_db"))
+
+    def reporter():
+        while True:
+            s = yield
+            console.print(
+                f"  {s['files']:,} papers · {s['contexts']:,} contexts · {s['skipped']} skipped"
+            )
+
+    p = reporter()
+    next(p)
+    try:
+        stats = P.build(conn, cfg.get_path("paths.raw_cache"), limit=limit, progress=p)
+        total = conn.execute("SELECT COUNT(*) FROM citation_contexts").fetchone()[0]
+        console.print(f"[green]{stats['contexts']:,} new contexts[/green] · {total:,} total")
+    finally:
+        conn.close()
+
+
+@app.command()
+def finetune(
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    out: str = typer.Option(None, help="Where to save the tuned model"),
+    epochs: int = typer.Option(1),
+    batch_size: int = typer.Option(16, help="Citation edges (bags) per step"),
+    chunks_per_paper: int = typer.Option(4, help="Chunks sampled from each side of a bag"),
+    max_edges: int = typer.Option(200000, help="Cap citation edges used (0 = all)"),
+    device: str = typer.Option("cuda:0"),
+    no_compile: bool = typer.Option(False, "--no-compile"),
+    eval_only: bool = typer.Option(False, "--eval-only", help="Just measure the baseline"),
+) -> None:
+    """Fine-tune the embedder on citation contexts with Muon. Evaluates before and after."""
+    from pathlib import Path as _P
+
+    from lara.finetune import evaluate as EV
+    from lara.finetune import train as T
+    from lara.index.embed import load_model
+    from lara.store import db
+
+    cfg = config_mod.load(config)
+    conn = db.connect(cfg.get_path("paths.metadata_db"))
+    from lara.finetune import bags as BG
+    st = BG.edge_stats(conn, min_chunks=8)
+    console.print(
+        f"[bold]{st['usable_edges']:,}[/bold] usable citation edges "
+        f"(of {st['citation_edges']:,}) across {st['papers_with_fulltext']:,} crawled papers"
+    )
+
+    console.print("\n[bold]baseline[/bold] (before training)")
+    base_model = load_model(cfg.get_in("embedding.model"), device=device, max_seq_length=512)
+    before = EV.run(base_model, conn, n=400, pool_size=1500)
+    console.print(EV.format_report(before))
+    del base_model
+    import torch as _t
+    _t.cuda.empty_cache()
+    if eval_only:
+        conn.close()
+        return
+
+    tc = T.TrainConfig(model=cfg.get_in("embedding.model"), device=device,
+                       epochs=epochs, batch_size=batch_size,
+                       chunks_per_paper=chunks_per_paper, max_edges=max_edges,
+                       compile_mode=None if no_compile else "default")
+
+    def reporter():
+        while True:
+            s = yield
+            console.print(
+                f"  step {s['step']:>5}/{s['steps']}  loss {s['loss']:.4f}  "
+                f"lr {s['lr']:.2e}  {s['elapsed']/60:.1f} min"
+            )
+
+    p = reporter()
+    next(p)
+    model, stats = T.train(conn, tc, progress=p)
+    console.print(
+        f"[green]trained[/green] {stats['steps']} steps on {stats['bags']:,} bags "
+        f"in {stats['seconds']/60:.1f} min ({stats['held_out_papers']:,} papers held out)"
+    )
+
+    console.print("\n[bold]after training[/bold]")
+    after = EV.run(model, conn, n=400, pool_size=1500)
+    console.print(EV.format_report(before, after))
+
+    # Only keep a fine-tune that wins where it should without losing where it must not.
+    won = after["citation"]["mrr"] > before["citation"]["mrr"]
+    kept = after["paraphrase"]["mrr"] > before["paraphrase"]["mrr"] - 0.02
+    if not (won and kept):
+        console.print(
+            "\n[yellow]not saved[/yellow]: citation MRR must improve and paraphrase MRR "
+            "must not fall more than 0.02. Re-embedding the corpus with a worse encoder "
+            "costs hours and degrades every search."
+        )
+        conn.close()
+        return
+
+    dest = _P(out or (cfg.get_path("disk.root") / "models" / "embeddinggemma-citation"))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    model.save(str(dest))
+    console.print(f"[green]saved[/green] {dest}")
+    console.print("Point embedding.model at it and re-run `lara embed --restart` to adopt.")
+    conn.close()
+
+
+@app.command()
 def citations(
     config: str = typer.Option(None, help="Path to config.yaml"),
     limit: int = typer.Option(0, help="Stop after N papers (0 = drain)"),
