@@ -31,7 +31,7 @@ import math
 import random
 import sqlite3
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 import torch
@@ -171,11 +171,16 @@ class Recipe:
     the effective step ignores how large the pretrained weights already are — a pretraining
     LR applied to fine-tuning. Both evals collapsed ~85% while the loss barely moved, the
     signature of destroying pretrained structure rather than learning the task.
+
+    ``epochs`` is now a *cap*, not a target: with ``patience`` set, training stops when the
+    inner-validation loss stops improving. The first 5-fold run trained a fixed 3 epochs and
+    degraded rank correlation in all five folds while the loss it was optimising kept
+    falling — the signature of running past the useful point.
     """
     lr_muon: float = 5e-5          # was 2e-3 — 40x lower
     lr_adam: float = 1e-5          # was 2e-5
-    batch_size: int = 64           # was 16 — larger batch, steadier gradient
-    epochs: int = 1
+    batch_size: int = 128          # was 16, then 64 — steadier gradient still
+    epochs: int = 4                # upper bound; early stopping decides the real number
     weight_decay: float = 0.01
     warmup_frac: float = 0.1
     max_seq_length: int = 320
@@ -184,10 +189,71 @@ class Recipe:
     compile_mode: str | None = None   # off by default: folds are short, compile is not free
     seed: int = 0
 
+    # ── early stopping ────────────────────────────────────────────────────────────
+    # Evaluated against an INNER split carved out of the training data, never against the
+    # held-out fold: selecting a checkpoint on the fold you then report would leak, and the
+    # reported numbers would be optimistic by an unknown amount.
+    patience: int = 3              # evaluations without improvement before stopping
+    eval_every: int = 5            # steps between validation passes
+    inner_val_frac: float = 0.15   # of the training set, split by query
+    min_delta: float = 1e-3        # improvement smaller than this does not count
+
+
+def inner_split(triples: list[Triple], frac: float, seed: int = 0
+                ) -> tuple[list[Triple], list[Triple]]:
+    """Carve a validation slice off the training set, **split by query**.
+
+    Same anti-leak rule as the outer folds: one query contributes many triples sharing its
+    phrasing, so splitting by triple would let the model see a paraphrase of every
+    validation item during training and make the stopping signal useless.
+    """
+    rng = random.Random(seed)
+    queries = sorted({t.query_hash for t in triples})
+    rng.shuffle(queries)
+    n_val = max(1, int(round(len(queries) * frac)))
+    val_q = set(queries[:n_val])
+    train = [t for t in triples if t.query_hash not in val_q]
+    val = [t for t in triples if t.query_hash in val_q]
+    return (train, val) if train and val else (triples, [])
+
+
+def validation_loss(model, triples: list[Triple], device: str, rec: Recipe,
+                    batch: int = 64) -> float:
+    """Mean MarginMSE over a held-out slice — the same quantity training minimises.
+
+    Deliberately the *training objective* rather than a ranking metric: early stopping
+    should answer "has this stopped learning", and mixing in a differently-scaled metric
+    makes the patience threshold meaningless.
+    """
+    from lara.finetune.train import margin_mse
+
+    if not triples:
+        return float("nan")
+    model.eval()
+    total, n = 0.0, 0
+    with torch.no_grad():
+        for i in range(0, len(triples), batch):
+            part = triples[i:i + batch]
+            q = _encode(model, [QUERY_PREFIX + t.query for t in part], device, grad=False)
+            p = _encode(model, [DOC_PREFIX + t.pos_text for t in part], device, grad=False)
+            ng = _encode(model, [DOC_PREFIX + t.neg_text for t in part], device, grad=False)
+            tm = torch.tensor([t.margin for t in part], device=device)
+            loss = margin_mse(q.float(), p.float(), ng.float(), tm, rec.margin_scale)
+            total += float(loss) * len(part)
+            n += len(part)
+    model.train()
+    return total / max(1, n)
+
 
 def train_on(triples: list[Triple], model_name: str, device: str, rec: Recipe,
-             progress=None):
-    """Train one model on one set of triples with MarginMSE."""
+             progress=None, val_triples: list[Triple] | None = None):
+    """Train one model on one set of triples with MarginMSE.
+
+    If ``val_triples`` is given, validation loss is checked every ``rec.eval_every`` steps,
+    the best-scoring weights are kept, and training stops after ``rec.patience``
+    evaluations without improvement. The best checkpoint is restored before returning — not
+    the last one, which is the whole point of measuring.
+    """
     from muon import SingleDeviceMuonWithAuxAdam
     from sentence_transformers import SentenceTransformer
 
@@ -218,7 +284,17 @@ def train_on(triples: list[Triple], model_name: str, device: str, rec: Recipe,
     step = 0
     started = time.time()
 
+    best_loss, best_state, since_best, stopped = float("inf"), None, 0, False
+    val_triples = val_triples or []
+
+    def snapshot():
+        # Kept on CPU: a second fp32 copy of a 300M-param encoder is ~1.2 GB, which is
+        # cheap in host RAM and would otherwise compete with activations on the device.
+        return {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
+
     for _ in range(rec.epochs):
+        if stopped:
+            break
         rng.shuffle(triples)
         for i in range(0, len(triples) - rec.batch_size + 1, rec.batch_size):
             part = triples[i:i + rec.batch_size]
@@ -239,9 +315,36 @@ def train_on(triples: list[Triple], model_name: str, device: str, rec: Recipe,
             torch.nn.utils.clip_grad_norm_(model.parameters(), rec.grad_clip)
             opt.step()
             step += 1
+
+            vl = None
+            if val_triples and step % rec.eval_every == 0:
+                vl = validation_loss(model, val_triples, device, rec)
+                if vl < best_loss - rec.min_delta:
+                    best_loss, best_state, since_best = vl, snapshot(), 0
+                else:
+                    since_best += 1
+
             if progress is not None and step % 5 == 0:
                 progress.send({"step": step, "steps": steps, "loss": float(loss.detach()),
-                               "lr": opt.param_groups[0]["lr"],
+                               "lr": opt.param_groups[0]["lr"], "val_loss": vl,
+                               "best_val": best_loss if best_state is not None else None,
                                "elapsed": time.time() - started})
+
+            if val_triples and since_best >= rec.patience:
+                if progress is not None:
+                    progress.send({"step": step, "steps": steps,
+                                   "loss": float(loss.detach()),
+                                   "lr": opt.param_groups[0]["lr"], "val_loss": vl,
+                                   "best_val": best_loss, "early_stop": True,
+                                   "elapsed": time.time() - started})
+                stopped = True
+                break
+
+    # Restore the best checkpoint, not the last — otherwise the measurement was pointless.
+    if best_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
     model.eval()
+    model.stopped_early = stopped
+    model.best_val_loss = best_loss if best_state is not None else None
+    model.steps_trained = step
     return model

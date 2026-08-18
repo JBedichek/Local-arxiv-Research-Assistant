@@ -479,8 +479,10 @@ def fit_check(
     k: int = typer.Option(5, help="Folds, for kfold mode"),
     n: int = typer.Option(400, help="Triples to use in overfit mode"),
     epochs: int = typer.Option(3),
-    batch_size: int = typer.Option(64),
+    batch_size: int = typer.Option(128),
     lr_muon: float = typer.Option(5e-5),
+    patience: int = typer.Option(3, help="Evals without improvement before stopping (0=off)"),
+    eval_every: int = typer.Option(5, help="Steps between validation passes"),
     device: str = typer.Option(None, help="Override device; default auto-detects"),
 ) -> None:
     """Can the embedder fit the harvested judgements at all?
@@ -501,16 +503,25 @@ def fit_check(
         console.print("[red]not enough triples[/red] — run `lara explore` first")
         raise typer.Exit(1)
 
-    rec = KF.Recipe(lr_muon=lr_muon, batch_size=batch_size, epochs=epochs)
+    rec = KF.Recipe(lr_muon=lr_muon, batch_size=batch_size, epochs=epochs,
+                    patience=patience, eval_every=eval_every)
     console.print(f"recipe: muon lr {rec.lr_muon:.1e} · adam lr {rec.lr_adam:.1e} · "
-                  f"batch {rec.batch_size} · {rec.epochs} epochs")
+                  f"batch {rec.batch_size} · max {rec.epochs} epochs · "
+                  + (f"early stop patience {rec.patience} every {rec.eval_every} steps"
+                     if rec.patience else "no early stopping"))
     model_name = cfg.get_in("embedding.model")
 
     def reporter():
         while True:
             s = yield
+            if s.get("early_stop"):
+                console.print(f"    [yellow]early stop[/yellow] at step {s['step']}  "
+                              f"best val loss {s['best_val']:.4f}")
+                continue
+            v = s.get("val_loss")
             console.print(f"    step {s['step']:>4}/{s['steps']}  loss {s['loss']:8.4f}  "
-                          f"lr {s['lr']:.2e}")
+                          f"lr {s['lr']:.2e}"
+                          + (f"  val {v:7.4f}" if v is not None else ""))
 
     if mode == "overfit":
         sub = triples[:n]
@@ -525,7 +536,8 @@ def fit_check(
         ldev.empty_cache(device)
 
         p = reporter(); next(p)
-        model = KF.train_on(list(sub), model_name, device, rec, progress=p)
+        model = KF.train_on(list(sub), model_name, device,
+                            KF.replace(rec, patience=0), progress=p)
         after = KF.evaluate(model, sub, device)
         console.print(f"  after : pair_acc {after['pair_acc']:.3f}  "
                       f"margin_mae {after['margin_mae']:.3f}  spearman {after['spearman']}")
@@ -556,13 +568,25 @@ def fit_check(
         before = KF.evaluate(base, val, device)
         del base
         ldev.empty_cache(device)
+        # Early stopping selects on an INNER split of the training folds. Selecting on
+        # `val` would leak: the checkpoint would be chosen using the very data the fold
+        # metrics are computed from, making them optimistic by an unknown amount.
+        inner_train, inner_val = (KF.inner_split(train, rec.inner_val_frac, rec.seed)
+                                  if rec.patience else (train, []))
+        if inner_val:
+            console.print(f"    inner split: {len(inner_train):,} train · "
+                          f"{len(inner_val):,} early-stop val (by query)")
         p = reporter(); next(p)
-        model = KF.train_on(list(train), model_name, device, rec, progress=p)
+        model = KF.train_on(list(inner_train), model_name, device, rec, progress=p,
+                            val_triples=inner_val)
         after = KF.evaluate(model, val, device)
+        note = ""
+        if getattr(model, "stopped_early", False):
+            note = f"   [dim](stopped at step {model.steps_trained})[/dim]"
         del model
         ldev.empty_cache(device)
         console.print(f"    pair_acc {before['pair_acc']:.3f} -> {after['pair_acc']:.3f}   "
-                      f"spearman {before['spearman']} -> {after['spearman']}")
+                      f"spearman {before['spearman']} -> {after['spearman']}{note}")
         results.append((before, after))
 
     import statistics as st
