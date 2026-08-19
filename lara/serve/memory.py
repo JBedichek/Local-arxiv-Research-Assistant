@@ -107,18 +107,25 @@ def record_visit(root: Path, *, arxiv_id: str, version: int = 1, title: str = ""
     with _LOCK:
         data = load(root)
         now = time.time()
-        for e in data["entries"]:
-            if e.get("kind") != "paper" or e.get("arxiv_id") != arxiv_id:
-                continue
-            if now - e.get("_ts", 0) > VISIT_COALESCE_SEC:
-                break
-            e["_ts"] = now
-            e["updated_utc"] = _now()
-            e["visits"] = int(e.get("visits", 1)) + 1
+        # The MOST RECENT matching row decides, not the first one encountered. Entries are
+        # in insertion order, so scanning forward hits the oldest visit first; treating
+        # that one as the candidate meant that once it aged past the window every later
+        # visit appended a fresh row and the history became the click log this coalescing
+        # exists to prevent.
+        recent = max(
+            (e for e in data["entries"]
+             if e.get("kind") == "paper" and e.get("arxiv_id") == arxiv_id),
+            key=lambda e: e.get("_ts", 0),
+            default=None,
+        )
+        if recent is not None and now - recent.get("_ts", 0) <= VISIT_COALESCE_SEC:
+            recent["_ts"] = now
+            recent["updated_utc"] = _now()
+            recent["visits"] = int(recent.get("visits", 1)) + 1
             if title:
-                e["title"] = title
+                recent["title"] = title
             save(root, data)
-            return e
+            return recent
         entry = {
             "id": uuid.uuid4().hex[:12],
             "kind": "paper",
