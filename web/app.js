@@ -80,6 +80,7 @@ async function openPaper(id, fragment, push = true) {
     else history.replaceState(entry, "", url);
     setStatus("");
     loadGraph();
+    loadLibrary();          // the server recorded this visit while serving the paper
     if (fragment) scrollToAnchor(fragment);
     applyHeatmap();
   } catch (err) {
@@ -369,6 +370,7 @@ $("#ask-form").addEventListener("submit", async (ev) => {
     }
     if (!body) textEl.innerHTML ||= `<span class="dim">(no generation — is vLLM running?)</span>`;
     loadGraph();
+    loadLibrary();          // the answer was written to the library as the stream closed
     // Repaint here too, not only on paper-open: asking while already reading a paper is
     // the common case, and it is exactly when the reference vector becomes available.
     applyHeatmap();
@@ -700,15 +702,20 @@ const prefs = {
   set(k, v) { try { localStorage.setItem("lara." + k, v); } catch { /* private mode */ } },
 };
 
+const PANES = { lib: "#library-pane", left: "#graph-pane", right: "#chat-pane" };
+
 function setPaneCollapsed(edge, collapsed) {
-  const pane = edge === "left" ? $("#graph-pane") : $("#chat-pane");
-  pane.classList.toggle("collapsed", collapsed);
+  const pane = $(PANES[edge]);
+  if (pane) pane.classList.toggle("collapsed", collapsed);
 }
 
 function applyLayout() {
+  const lib = prefs.get("colLib", "240px");
   const l = prefs.get("colLeft", "300px"), r = prefs.get("colRight", "400px");
+  document.documentElement.style.setProperty("--col-lib", lib);
   document.documentElement.style.setProperty("--col-left", l);
   document.documentElement.style.setProperty("--col-right", r);
+  setPaneCollapsed("lib", parseInt(lib, 10) === 0);
   setPaneCollapsed("left", parseInt(l, 10) === 0);
   setPaneCollapsed("right", parseInt(r, 10) === 0);
 }
@@ -725,17 +732,21 @@ document.addEventListener("keydown", (ev) => {
     const cur = parseInt(getComputedStyle(root).getPropertyValue(v), 10) || 0;
     const next = cur === 0 ? dflt : "0px";
     root.style.setProperty(v, next);
-    prefs.set(v === "--col-left" ? "colLeft" : "colRight", next);
+    prefs.set({ "--col-lib": "colLib", "--col-left": "colLeft", "--col-right": "colRight" }[v], next);
     setPaneCollapsed(edge, next === "0px");
   };
-  if (ev.key === "[") { toggle("--col-left", "300px", "left"); drawGraph(); }
+  if (ev.key === ";") { toggle("--col-lib", "240px", "lib"); }
+  else if (ev.key === "[") { toggle("--col-left", "300px", "left"); drawGraph(); }
   else if (ev.key === "]") { toggle("--col-right", "400px", "right"); }
   else if (ev.key === "\\" || ev.code === "Backslash") {
     const hidden = parseInt(getComputedStyle(root).getPropertyValue("--col-left"), 10) === 0;
+    const lib = hidden ? "240px" : "0px";
     const l = hidden ? "300px" : "0px", r = hidden ? "400px" : "0px";
+    root.style.setProperty("--col-lib", lib);
     root.style.setProperty("--col-left", l);
     root.style.setProperty("--col-right", r);
-    prefs.set("colLeft", l); prefs.set("colRight", r);
+    prefs.set("colLib", lib); prefs.set("colLeft", l); prefs.set("colRight", r);
+    setPaneCollapsed("lib", !hidden);
     setPaneCollapsed("left", !hidden); setPaneCollapsed("right", !hidden);
     drawGraph();
   } else return;
@@ -758,7 +769,7 @@ function makeSplitter(el, varName, prefKey, edge) {
   });
   el.addEventListener("pointermove", (ev) => {
     if (!el.hasPointerCapture?.(ev.pointerId)) return;
-    const delta = edge === "left" ? ev.clientX - startX : startX - ev.clientX;
+    const delta = edge === "right" ? startX - ev.clientX : ev.clientX - startX;
     // Free range: 0 (collapsed, so the paper gets the whole window) up to 85%, so the
     // graph or chat can take over the screen instead. Below 60px it snaps shut rather
     // than leaving a useless sliver.
@@ -780,7 +791,7 @@ function makeSplitter(el, varName, prefKey, edge) {
   // Double-click toggles collapsed <-> default, which is the fast path for "give me the
   // whole screen for the paper" and back.
   el.addEventListener("dblclick", () => {
-    const dflt = edge === "left" ? "300px" : "400px";
+    const dflt = { lib: "240px", left: "300px", right: "400px" }[edge] || "300px";
     const now = current();
     const next = now === 0 ? dflt : "0px";
     root.style.setProperty(varName, next);
@@ -790,6 +801,304 @@ function makeSplitter(el, varName, prefKey, edge) {
     drawSearchGraph();
   });
 }
+
+/* ================= library: reading history and folders ================= */
+
+/* The server owns the data — it records visits and questions itself, so a client that
+ * navigates away mid-answer still leaves a complete history. This side only renders the
+ * tree and issues moves, which keeps the two from disagreeing about what happened. */
+
+let library = { folders: [], entries: [] };
+
+async function loadLibrary() {
+  try {
+    library = await api("/api/memory");
+  } catch {
+    library = { folders: [], entries: [] };
+  }
+  renderLibrary();
+}
+
+const libOpen = {
+  get(id) { return prefs.get("libOpen." + id, "1") === "1"; },
+  set(id, v) { prefs.set("libOpen." + id, v ? "1" : "0"); },
+};
+
+function libEntryLabel(e) {
+  if (e.kind === "question") return e.question || "(question)";
+  return e.title || e.arxiv_id || "(paper)";
+}
+
+function renderLibrary() {
+  const tree = $("#lib-tree");
+  if (!tree) return;
+  if (!library.folders.length && !library.entries.length) {
+    tree.innerHTML =
+      `<p class="lib-empty">Papers you open and questions you ask show up here.</p>`;
+    return;
+  }
+  const byParent = new Map();
+  for (const f of library.folders) {
+    if (!byParent.has(f.parent || "")) byParent.set(f.parent || "", []);
+    byParent.get(f.parent || "").push(f);
+  }
+  const byFolder = new Map();
+  for (const e of library.entries) {
+    const k = e.folder || "";
+    if (!byFolder.has(k)) byFolder.set(k, []);
+    byFolder.get(k).push(e);
+  }
+
+  const node = (html) => {
+    const d = document.createElement("div");
+    d.innerHTML = html;
+    return d.firstElementChild;
+  };
+
+  function buildFolder(f) {
+    const wrap = document.createElement("div");
+    const open = libOpen.get(f.id);
+    const kids = (byFolder.get(f.id) || []).length + (byParent.get(f.id) || []).length;
+    const row = node(
+      `<div class="lib-row lib-folder" draggable="true" data-folder="${f.id}">
+         <span class="twist">${open ? "▾" : "▸"}</span>
+         <span class="lib-label">${escapeHtml(f.name)}</span>
+         <span class="lib-count">${kids || ""}</span>
+         <button class="lib-del" title="Delete folder (contents move up)">×</button>
+       </div>`);
+    wrap.append(row);
+    if (open) {
+      const kidsEl = document.createElement("div");
+      kidsEl.className = "lib-children";
+      for (const sub of (byParent.get(f.id) || []).sort((a, b) => a.name.localeCompare(b.name)))
+        kidsEl.append(buildFolder(sub));
+      for (const e of byFolder.get(f.id) || []) kidsEl.append(buildEntry(e));
+      wrap.append(kidsEl);
+    }
+    return wrap;
+  }
+
+  function buildEntry(e) {
+    return node(
+      `<div class="lib-row lib-entry ${e.kind}" draggable="true" data-entry="${e.id}"
+            title="${escapeHtml(libEntryLabel(e))}">
+         <span class="twist">${e.kind === "question" ? "?" : "•"}</span>
+         <span class="lib-label">${escapeHtml(libEntryLabel(e))}</span>
+         <span class="lib-kind">${e.kind === "question" ? escapeHtml((e.title || "").slice(0, 14)) : ""}</span>
+         <button class="lib-del" title="Remove from library">×</button>
+       </div>`);
+  }
+
+  tree.innerHTML = "";
+  for (const f of (byParent.get("") || []).sort((a, b) => a.name.localeCompare(b.name)))
+    tree.append(buildFolder(f));
+  for (const e of byFolder.get("") || []) tree.append(buildEntry(e));
+}
+
+/* Restoring a question puts the reader back where they were: the paper open, the question
+ * in the box, and the answer they already paid for shown rather than regenerated. */
+async function restoreEntry(e) {
+  if (e.arxiv_id) await openPaper(e.arxiv_id);
+  if (e.kind !== "question") return;
+  $("#question").value = e.question || "";
+  state.heatRef = { text: e.question, kind: "question" };
+  loadGraph();
+  if (e.answer) {
+    addMessage("user", e.question, e.selection || null);
+    const el = addMessage("assistant", "");
+    el.classList.add("restored");
+    el.querySelector(".text").innerHTML =
+      `<span class="dim">from your library · ${escapeHtml((e.created_utc || "").slice(0, 16).replace("T", " "))}</span><br>`
+      + escapeHtml(e.answer);
+  }
+}
+
+function libFindEntry(id) { return library.entries.find((e) => e.id === id); }
+
+$("#lib-tree")?.addEventListener("click", async (ev) => {
+  const del = ev.target.closest(".lib-del");
+  const row = ev.target.closest(".lib-row");
+  if (!row) return;
+  const entryId = row.dataset.entry, folderId = row.dataset.folder;
+  if (del) {
+    ev.stopPropagation();
+    try {
+      if (entryId) await api(`/api/memory/entry/${entryId}`, { method: "DELETE" });
+      else if (folderId) await api(`/api/memory/folder/${folderId}`, { method: "DELETE" });
+    } catch { /* fall through to the reload, which shows the real state either way */ }
+    loadLibrary();
+    return;
+  }
+  if (folderId) { libOpen.set(folderId, !libOpen.get(folderId)); renderLibrary(); return; }
+  const e = libFindEntry(entryId);
+  if (e) restoreEntry(e);
+});
+
+/* Rename in place rather than through `window.prompt`. A modal dialog blocks the whole
+ * page, cannot be styled to match, and on a tree you are mid-drag through it is a jarring
+ * interruption for what should be a two-second edit. */
+function beginRename(row) {
+  const id = row.dataset.folder;
+  const label = row.querySelector(".lib-label");
+  if (!id || !label || label.querySelector("input")) return;
+  const cur = library.folders.find((f) => f.id === id);
+  const input = document.createElement("input");
+  input.className = "lib-rename";
+  input.value = cur ? cur.name : "";
+  label.textContent = "";
+  label.append(input);
+  input.focus();
+  input.select();
+
+  let done = false;
+  const commit = async (save) => {
+    if (done) return;                       // blur fires after Enter; commit exactly once
+    done = true;
+    const name = input.value;
+    if (save && name.trim() && (!cur || name !== cur.name)) {
+      await api(`/api/memory/folder/${id}`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name }),
+      }).catch(() => {});
+    }
+    loadLibrary();
+  };
+  input.addEventListener("keydown", (ev) => {
+    ev.stopPropagation();                   // ; [ ] are pane shortcuts outside a field
+    if (ev.key === "Enter") { ev.preventDefault(); commit(true); }
+    else if (ev.key === "Escape") { ev.preventDefault(); commit(false); }
+  });
+  input.addEventListener("blur", () => commit(true));
+  input.addEventListener("click", (ev) => ev.stopPropagation());
+  input.addEventListener("dblclick", (ev) => ev.stopPropagation());
+}
+
+$("#lib-tree")?.addEventListener("dblclick", (ev) => {
+  const row = ev.target.closest(".lib-row.lib-folder");
+  if (row) beginRename(row);
+});
+
+/* Create first, name second: the folder exists immediately and the name is an edit on a
+ * real object, so an abandoned rename leaves "New folder" rather than nothing. */
+$("#lib-newfolder")?.addEventListener("click", async () => {
+  let created = null;
+  try {
+    created = await api("/api/memory/folder", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "New folder" }),
+    });
+  } catch { return; }
+  await loadLibrary();
+  const row = document.querySelector(`.lib-row.lib-folder[data-folder="${created.id}"]`);
+  if (row) beginRename(row);
+});
+
+/* Drag to file. `refile`/`reparent` are sent explicitly because a null folder means "the
+ * root", and without the flag the server cannot tell that apart from "field omitted". */
+let libDragged = null;
+
+$("#lib-tree")?.addEventListener("dragstart", (ev) => {
+  const row = ev.target.closest(".lib-row");
+  if (!row) return;
+  libDragged = { entry: row.dataset.entry || null, folder: row.dataset.folder || null };
+  ev.dataTransfer.effectAllowed = "move";
+  ev.dataTransfer.setData("text/plain", row.dataset.entry || row.dataset.folder || "");
+});
+
+$("#lib-tree")?.addEventListener("dragover", (ev) => {
+  if (!libDragged) return;
+  ev.preventDefault();
+  ev.dataTransfer.dropEffect = "move";
+  const row = ev.target.closest(".lib-row.lib-folder");
+  for (const el of document.querySelectorAll(".lib-row.drop-into")) el.classList.remove("drop-into");
+  if (row) { row.classList.add("drop-into"); $("#lib-tree").classList.remove("drop-root"); }
+  else $("#lib-tree").classList.add("drop-root");
+});
+
+$("#lib-tree")?.addEventListener("dragleave", (ev) => {
+  if (ev.target === $("#lib-tree")) $("#lib-tree").classList.remove("drop-root");
+});
+
+$("#lib-tree")?.addEventListener("drop", async (ev) => {
+  if (!libDragged) return;
+  ev.preventDefault();
+  const row = ev.target.closest(".lib-row.lib-folder");
+  const target = row ? row.dataset.folder : null;
+  for (const el of document.querySelectorAll(".lib-row.drop-into")) el.classList.remove("drop-into");
+  $("#lib-tree").classList.remove("drop-root");
+  const moved = libDragged;
+  libDragged = null;
+  if (moved.folder && moved.folder === target) return;   // dropping a folder on itself
+  try {
+    if (moved.entry) {
+      await api(`/api/memory/entry/${moved.entry}`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ folder: target, refile: true }),
+      });
+    } else if (moved.folder) {
+      await api(`/api/memory/folder/${moved.folder}`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ parent: target, reparent: true }),
+      });
+    }
+  } catch { /* reload below reveals whatever actually happened */ }
+  loadLibrary();
+});
+
+$("#lib-tree")?.addEventListener("dragend", () => {
+  libDragged = null;
+  for (const el of document.querySelectorAll(".lib-row.drop-into")) el.classList.remove("drop-into");
+  $("#lib-tree")?.classList.remove("drop-root");
+});
+
+/* ================= system prompt ================= */
+
+let promptState = { default: "", custom: null };
+
+async function loadPrompt() {
+  try {
+    promptState = await api("/api/settings/prompt");
+  } catch {
+    return;
+  }
+  const ta = $("#sysprompt");
+  if (!ta) return;
+  ta.value = promptState.active || "";
+  setPromptState(promptState.is_custom ? "custom" : "default");
+}
+
+function setPromptState(kind, note) {
+  const el = $("#sysprompt-state");
+  if (!el) return;
+  el.textContent = note || (kind === "custom" ? "using your prompt" : "using the default");
+}
+
+$("#sysprompt-save")?.addEventListener("click", async () => {
+  const text = $("#sysprompt").value;
+  try {
+    promptState = await api("/api/settings/prompt", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    $("#sysprompt").value = promptState.active || "";
+    setPromptState(promptState.is_custom ? "custom" : "default", "saved");
+  } catch (err) {
+    setPromptState("", "save failed: " + (err.message || err));
+  }
+});
+
+$("#sysprompt-reset")?.addEventListener("click", async () => {
+  try {
+    promptState = await api("/api/settings/prompt", {
+      method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "" }),
+    });
+    $("#sysprompt").value = promptState.active || "";
+    setPromptState("default", "restored");
+  } catch (err) {
+    setPromptState("", "reset failed: " + (err.message || err));
+  }
+});
 
 /* ---------- reading style ---------- */
 
@@ -1387,9 +1696,14 @@ async function boot() {
   document.documentElement.style.setProperty("--graph-h", prefs.get("graphH", "460px"));
   $("#topk").value = prefs.get("topk", "20");
   $("#topk-val").textContent = $("#topk").value;
+  makeSplitter($("#split-lib"), "--col-lib", "colLib", "lib");
   makeSplitter($("#split-left"), "--col-left", "colLeft", "left");
   makeSplitter($("#split-right"), "--col-right", "colRight", "right");
   bindSearchGraph();
+  // Neither blocks the reader: the library and the prompt editor are both side panels,
+  // and awaiting them here would delay the paper for two requests that nothing needs yet.
+  loadLibrary();
+  loadPrompt();
 
   try {
     const b = await api("/api/breadth");

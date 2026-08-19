@@ -96,6 +96,17 @@
       <span id="measure-val">full width</span>
     </label>
     <label class="adv"><input id="justify" type="checkbox"> justify text</label>
+    <h4>System prompt</h4>
+    <p class="adv-note">The instructions the generator answers under. Grounding and
+      citation rules live here — loosen them and answers get less anchored to the
+      excerpts. Coverage handling is appended automatically and is not editable.</p>
+    <textarea id="sysprompt" rows="10" spellcheck="false"></textarea>
+    <div class="prompt-actions">
+      <button type="button" id="sysprompt-save">Save</button>
+      <button type="button" id="sysprompt-reset">Restore default</button>
+      <span class="adv-note" id="sysprompt-state"></span>
+    </div>
+
     <h4>Generation</h4>
     <label class="adv">temperature
       <input id="temp" type="range" min="0" max="1.5" step="0.05" value="0.2">
@@ -124,6 +135,15 @@
 </header>
 
 <main>
+  <section id="library-pane">
+    <h2>Library
+      <button type="button" id="lib-newfolder" title="New folder">+ folder</button>
+    </h2>
+    <div id="lib-tree"><p class="lib-empty">Papers you open and questions you ask show up here.</p></div>
+  </section>
+
+  <div class="splitter" id="split-lib" title="Drag to resize · double-click to reset"></div>
+
   <section id="graph-pane">
     <h2>Citation graph
       <small id="graph-hint">heat = relevance</small>

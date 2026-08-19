@@ -34,6 +34,7 @@ paths:
   graph:        ${disk.root}/graph/            # CSR citation adjacency
   raw_cache:    ${disk.root}/raw/              # transient fetched HTML, prunable
   logs:         ${disk.root}/logs/
+  memory:       ${disk.root}/memory/           # reading history, folders, prompt override
 
 # Hugging Face cache. Pinned explicitly so a stray HF_HOME in the environment cannot
 # redirect 100 GB of downloads onto a disk with no room. Override if your cache lives

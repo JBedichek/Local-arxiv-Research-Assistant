@@ -179,8 +179,12 @@ async def stream_answer(
     payload = {
         "model": model_name,
         "messages": [
+            # Coverage instructions append to whatever persona is in force, including a
+            # reader's custom prompt. They are not part of the persona — they are what
+            # makes an honest non-answer possible — so overriding the prompt must not
+            # silently switch them off.
             {"role": "system",
-             "content": system or (SYSTEM + COVERAGE_INSTRUCTIONS.get(coverage, ""))},
+             "content": (system or SYSTEM) + COVERAGE_INSTRUCTIONS.get(coverage, "")},
             {"role": "user", "content": user_content},
         ],
         "temperature": temperature,

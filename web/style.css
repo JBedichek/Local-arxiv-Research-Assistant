@@ -111,7 +111,9 @@ label.breadth em { font-style: normal; opacity: .75; }
    persist across reloads. */
 main {
   flex: 1; min-height: 0; display: grid;
-  grid-template-columns: var(--col-left, 300px) 6px minmax(0, 1fr) 6px var(--col-right, 400px);
+  grid-template-columns:
+    var(--col-lib, 240px) 6px var(--col-left, 300px) 6px
+    minmax(0, 1fr) 6px var(--col-right, 400px);
 }
 .splitter {
   cursor: col-resize; background: var(--line); opacity: .45;
@@ -122,6 +124,67 @@ body.resizing { cursor: col-resize; user-select: none; }
 main > section { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
 #graph-pane { border-right: 1px solid var(--line); background: var(--panel); }
 #chat-pane { border-left: 1px solid var(--line); background: var(--panel); }
+#library-pane { border-right: 1px solid var(--line); background: var(--panel); }
+
+/* library */
+#library-pane h2 {
+  margin: 0; padding: 10px 12px; font-size: 12px; text-transform: uppercase;
+  letter-spacing: .08em; color: var(--dim); border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 8px;
+}
+#lib-newfolder {
+  margin-left: auto; background: transparent; color: var(--accent);
+  border: 1px solid var(--line); border-radius: 5px; padding: 2px 7px;
+  font: inherit; font-size: 11px; text-transform: none; letter-spacing: 0; cursor: pointer;
+}
+#lib-newfolder:hover { border-color: var(--accent); }
+#lib-tree { flex: 1; overflow-y: auto; padding: 6px 4px 40px; font-size: 12.5px; }
+.lib-empty { color: var(--dim); padding: 10px 12px; line-height: 1.5; }
+
+.lib-row {
+  display: flex; align-items: center; gap: 5px; padding: 3px 6px;
+  border-radius: 5px; cursor: pointer; user-select: none;
+  border: 1px solid transparent;      /* reserved so the drop ring adds no layout shift */
+}
+.lib-row:hover { background: var(--panel-2); }
+.lib-row.drop-into { border-color: var(--accent); background: var(--panel-2); }
+.lib-row .twist {
+  width: 12px; flex: none; color: var(--dim); font-size: 10px; text-align: center;
+}
+.lib-row .lib-label { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lib-row .lib-kind { flex: none; font-size: 10px; color: var(--dim); }
+.lib-row .lib-del {
+  flex: none; visibility: hidden; background: none; border: 0; color: var(--dim);
+  cursor: pointer; font: inherit; font-size: 13px; line-height: 1; padding: 0 2px;
+}
+.lib-row:hover .lib-del { visibility: visible; }
+.lib-row .lib-del:hover { color: var(--warn); }
+.lib-folder > .lib-label { font-weight: 600; }
+.lib-entry.question > .lib-label { color: var(--text); }
+.lib-entry.paper > .lib-label { color: var(--dim); }
+.lib-children { margin-left: 11px; border-left: 1px solid var(--line); padding-left: 4px; }
+#lib-tree.drop-root { outline: 1px dashed var(--accent); outline-offset: -3px; }
+.lib-rename {
+  width: 100%; box-sizing: border-box; font: inherit; padding: 0 3px;
+  background: var(--bg); color: var(--text);
+  border: 1px solid var(--accent); border-radius: 3px;
+}
+.lib-count { flex: none; font-size: 10px; color: var(--dim); }
+
+/* system prompt editor */
+#advanced textarea#sysprompt {
+  width: 100%; box-sizing: border-box; resize: vertical; min-height: 120px;
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 7px 9px; font-family: var(--font-mono); font-size: 11.5px;
+  line-height: 1.45;
+}
+.prompt-actions { display: flex; align-items: center; gap: 8px; margin: 6px 0 2px; }
+.prompt-actions button {
+  background: var(--accent); color: #08111f; border: 0; border-radius: 6px;
+  padding: 4px 10px; font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.prompt-actions #sysprompt-reset { background: transparent; color: var(--dim); border: 1px solid var(--line); }
+.prompt-actions #sysprompt-reset:hover { color: var(--text); border-color: var(--accent); }
 
 #graph-pane h2 {
   margin: 0; padding: 10px 12px; font-size: 12px; text-transform: uppercase;
@@ -224,8 +287,8 @@ a.chip:hover, a.cite:hover { color: var(--accent); border-color: var(--accent); 
 }
 
 @media (max-width: 1100px) {
-  main { grid-template-columns: 1fr; grid-template-rows: 180px 0 minmax(0, 1fr) 0 320px; }
-  #graph-pane, #chat-pane { border: 0; border-top: 1px solid var(--line); }
+  main { grid-template-columns: 1fr; grid-template-rows: 150px 0 180px 0 minmax(0, 1fr) 0 320px; }
+  #graph-pane, #chat-pane, #library-pane { border: 0; border-top: 1px solid var(--line); }
   .splitter { display: none; }
 }
 
@@ -347,7 +410,7 @@ label.breadth #breadth-val em { font-style: normal; color: var(--dim); }
    NOT display:none — a grid item set to display:none is removed from the grid, so every
    later pane shifts one column left into a 6px splitter slot and the paper pane ends up
    6px wide. Its column is already 0px, so clipping the overflow is all that is needed. */
-#graph-pane.collapsed, #chat-pane.collapsed {
+#graph-pane.collapsed, #chat-pane.collapsed, #library-pane.collapsed {
   overflow: hidden; border: 0; min-width: 0; padding: 0;
 }
 .splitter { min-width: 6px; }
