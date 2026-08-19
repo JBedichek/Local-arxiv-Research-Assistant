@@ -119,7 +119,7 @@ function scrollToAnchor(fragment) {
   const [anchor, range] = raw.split(":");
   const el = document.getElementById(anchor);
   if (!el) return false;
-  scrollIntoPane(el, $("#paper"));
+  scrollIntoPane(el, $("#paper-scroll"));
   if (range) {
     const [s, e] = range.split("-").map(Number);
     if (Number.isFinite(s) && Number.isFinite(e)) paintRange(el, s, e);
@@ -604,7 +604,7 @@ async function searchPapers(query, push = true) {
   state.heatRef = { text: query, kind: "search" };
   const list = $("#results-list");
   $("#results").hidden = false;
-  $("#paper").hidden = true;
+  $("#paper-scroll").hidden = true;
   $("#paper-meta").innerHTML = "";
   $("#results-head").innerHTML = `<h2>Searching…</h2>`;
   try {
@@ -653,7 +653,7 @@ async function searchPapers(query, push = true) {
 
 function hideResults() {
   $("#results").hidden = true;
-  $("#paper").hidden = false;
+  $("#paper-scroll").hidden = false;
 }
 
 $("#results-list").addEventListener("click", (ev) => {
