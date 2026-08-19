@@ -20,6 +20,11 @@ const state = {
   paper: null, version: 1, hits: [], pendingHits: null,
   selection: null, candidate: null, models: [], busy: false,
   breadth: 'balanced', abort: null, lastAsk: null, lastAnswerChunk: null,
+  /* What the citation-graph heat is measured against: the most recent search or question,
+   * whichever happened last. Opening a paper deliberately does NOT overwrite it — you
+   * arrived at that paper *from* a query, and that query is what you still want the
+   * neighbourhood shaded by. */
+  heatRef: null,
 };
 
 /* ---------- helpers ---------- */
@@ -44,6 +49,7 @@ async function openPaper(id, fragment, push = true) {
     const data = await api(`/api/paper/${encodeURIComponent(id)}`);
     state.paper = data.arxiv_id;
     state.version = data.version;
+    state.paperTitle = data.title || "";
     $("#paper-meta").innerHTML = `
       <h1>${escapeHtml(data.title || data.arxiv_id)}</h1>
       <p class="authors">${escapeHtml(data.authors || "")}</p>
@@ -301,6 +307,7 @@ $("#ask-form").addEventListener("submit", async (ev) => {
     }
     state.hits = hits;
     state.lastAsk = q;
+    state.heatRef = { text: q, kind: "question" };
     state.lastAnswerChunk = hits[0]?.chunk_id ?? null;
     renderCitations(answerEl, hits);
 
@@ -361,7 +368,7 @@ $("#ask-form").addEventListener("submit", async (ev) => {
       }
     }
     if (!body) textEl.innerHTML ||= `<span class="dim">(no generation — is vLLM running?)</span>`;
-    loadGraph(q);
+    loadGraph();
     // Repaint here too, not only on paper-open: asking while already reading a paper is
     // the common case, and it is exactly when the reference vector becomes available.
     applyHeatmap();
@@ -439,11 +446,39 @@ document.addEventListener("click", (ev) => {
 /* ---------- graph (R8/R9) ---------- */
 
 let graphData = null;
-async function loadGraph(query = "") {
+
+/* The reference prompt, and how to describe it. Falls back to the open paper's own title so
+ * the graph is a heatmap even for someone who typed an arXiv id and never searched —
+ * "relevance to nothing" would just render every node the same dead blue. */
+function heatReference() {
+  if (state.heatRef && state.heatRef.text) return state.heatRef;
+  if (state.paperTitle) return { text: state.paperTitle, kind: "paper" };
+  return null;
+}
+
+const HEAT_REF_LABEL = {
+  search:   "relative to your search",
+  question: "relative to your question",
+  paper:    "relative to this paper",
+};
+
+function renderHeatRef(ref) {
+  const el = $("#graph-ref");
+  if (!el) return;
+  if (!ref) { el.textContent = ""; el.removeAttribute("title"); return; }
+  el.innerHTML = `${HEAT_REF_LABEL[ref.kind] || "relative to"}: <b>${escapeHtml(ref.text)}</b>`;
+  el.title = ref.text;          // the pane is narrow; the full prompt lives in the tooltip
+}
+
+async function loadGraph(query = null) {
   if (!state.paper) return;
+  // An explicit query still wins, but the default is the standing reference rather than
+  // the empty string — passing "" is what made every node heat 0 on paper-open.
+  const ref = query ? { text: query, kind: "question" } : heatReference();
+  renderHeatRef(ref);
   try {
     graphData = await api(
-      `/api/graph/${encodeURIComponent(state.paper)}?query=${encodeURIComponent(query)}`
+      `/api/graph/${encodeURIComponent(state.paper)}?query=${encodeURIComponent(ref ? ref.text : "")}`
     );
     drawGraph();
   } catch { /* graph is optional */ }
@@ -564,6 +599,7 @@ async function searchPapers(query, push = true) {
   if (push && location.search !== `?q=${encodeURIComponent(query)}`) history.pushState(sentry, "", surl);
   else history.replaceState(sentry, "", surl);
   state.lastQuery = query;
+  state.heatRef = { text: query, kind: "search" };
   const list = $("#results-list");
   $("#results").hidden = false;
   $("#paper").hidden = true;
@@ -757,6 +793,20 @@ function makeSplitter(el, varName, prefKey, edge) {
 
 /* ---------- reading style ---------- */
 
+/* Top of the `line width` range means "no cap — follow the pane" rather than 100 characters.
+ * Kept as a slider position rather than a separate checkbox so there is one control for one
+ * decision, and so dragging left from `full width` is a continuous gesture. */
+const MEASURE_FULL = 100;
+
+/* One-time reset. Filling the pane is the new default, but anyone who used a previous build
+ * has a fixed measure in localStorage that would silently override it — the change would
+ * look like it had not shipped. Runs once, and only touches this one key. */
+(function migrateMeasureToFull() {
+  if (prefs.get("measureFull", "") === "1") return;
+  prefs.set("measure", String(MEASURE_FULL));
+  prefs.set("measureFull", "1");
+})();
+
 /* Presets bundle theme, face, size, leading and measure, because those five interact:
  * a serif at 17px wants more leading and a wider column than a 14px sans, and setting one
  * without the others usually makes reading worse rather than better. Touching any
@@ -770,16 +820,19 @@ const FONTS = {
   wide: "var(--font-wide)", atkinson: "var(--font-atkinson)",
 };
 
+/* Every preset now fills the pane. A preset that pinned its own column width would undo
+ * the pane-following behaviour the moment someone picked one, which reads as the setting
+ * randomly reverting. Narrowing stays available on the slider, independent of preset. */
 const PRESETS = {
-  default:  { theme: "auto",     font: "system",   size: 16, leading: 1.60, measure: 54, justify: false },
-  // Warm page, serif, generous measure — closest to a printed journal.
-  paper:    { theme: "light",    font: "charter",  size: 17, leading: 1.65, measure: 62, justify: true  },
-  night:    { theme: "dark",     font: "system",   size: 16, leading: 1.72, measure: 58, justify: false },
-  sepia:    { theme: "sepia",    font: "literata", size: 17, leading: 1.70, measure: 60, justify: true  },
+  default:  { theme: "auto",     font: "system",   size: 16, leading: 1.60, measure: MEASURE_FULL, justify: false },
+  // Warm page, serif — closest to a printed journal.
+  paper:    { theme: "light",    font: "charter",  size: 17, leading: 1.65, measure: MEASURE_FULL, justify: true  },
+  night:    { theme: "dark",     font: "system",   size: 16, leading: 1.72, measure: MEASURE_FULL, justify: false },
+  sepia:    { theme: "sepia",    font: "literata", size: 17, leading: 1.70, measure: MEASURE_FULL, justify: true  },
   // More text per screen for skimming, at the cost of comfort over long sessions.
-  compact:  { theme: "auto",     font: "system",   size: 14, leading: 1.45, measure: 78, justify: false },
+  compact:  { theme: "auto",     font: "system",   size: 14, leading: 1.45, measure: MEASURE_FULL, justify: false },
   // Accessibility: Atkinson Hyperlegible was designed to disambiguate similar glyphs.
-  contrast: { theme: "contrast", font: "atkinson", size: 19, leading: 1.85, measure: 50, justify: false },
+  contrast: { theme: "contrast", font: "atkinson", size: 19, leading: 1.85, measure: MEASURE_FULL, justify: false },
 };
 
 function currentStyle() {
@@ -788,7 +841,7 @@ function currentStyle() {
     font:    prefs.get("font", "system"),
     size:    Number(prefs.get("fontsize", "16")),
     leading: Number(prefs.get("leading", "1.6")),
-    measure: Number(prefs.get("measure", "54")),
+    measure: Number(prefs.get("measure", String(MEASURE_FULL))),
     justify: prefs.get("justify", "0") === "1",
   };
 }
@@ -803,8 +856,13 @@ function applyTypography() {
   root.style.setProperty("--paper-size", st.size + "px");
   root.style.setProperty("--paper-leading", String(st.leading));
   // Measure is in characters, converted at roughly half the font size per character —
-  // the conventional approximation for average glyph advance in running text.
-  root.style.setProperty("--measure", Math.round(st.size * st.measure * 0.5) + "px");
+  // the conventional approximation for average glyph advance in running text. At the top
+  // of the range it resolves to `none` instead, which is what lets the column follow the
+  // pane rather than sitting at a fixed width with dead space beside it.
+  root.style.setProperty(
+    "--measure",
+    st.measure >= MEASURE_FULL ? "none" : Math.round(st.size * st.measure * 0.5) + "px",
+  );
   root.style.setProperty("--paper-align", st.justify ? "justify" : "start");
   root.style.setProperty("--paper-hyphens", st.justify ? "auto" : "manual");
 
@@ -815,7 +873,8 @@ function applyTypography() {
   $("#leading").value = String(st.leading);
   $("#leading-val").textContent = st.leading.toFixed(2);
   $("#measure").value = String(st.measure);
-  $("#measure-val").textContent = String(st.measure);
+  $("#measure-val").textContent =
+    st.measure >= MEASURE_FULL ? "full width" : `${st.measure} chars`;
   $("#justify").checked = st.justify;
   $("#preset").value = prefs.get("preset", "default");
   drawSearchGraph();
