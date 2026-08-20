@@ -65,7 +65,10 @@ _META = re.compile(
     r"\b("
     r"this (paper|passage|work|section|study|article|excerpt|text|figure|table|method)"
     r"|these (results|authors|findings|experiments)"
-    r"|the (passage|authors|above|below|former|latter|aforementioned|preceding|following)"
+    # "the text"/"the excerpt"/"the described method" leak the same way "this text" does;
+    # the generator reaches for the definite article once the demonstrative is blocked.
+    r"|the (passage|text|excerpt|paper|study|article|work|authors|above|below"
+    r"|former|latter|aforementioned|preceding|following|described|proposed) "
     r"|(figure|table|equation|section|eq\.?)\s*\d"
     r"|as (described|shown|discussed|mentioned|stated) (above|below|here|earlier)"
     r"|(here|herein)\b.*\?$"
@@ -94,6 +97,70 @@ def sample_chunks(conn: sqlite3.Connection, n: int, seed: int = 0) -> list[sqlit
            ORDER BY RANDOM() LIMIT ?""",
         (n,),
     ).fetchall()
+
+
+def sample_chunks_by_topic(conn: sqlite3.Connection, retriever, topics: list[str],
+                           n: int, seed: int = 0, pool_mult: int = 8) -> list[sqlite3.Row]:
+    """Seed passages drawn from papers about specific topics, not uniformly at random.
+
+    Uniform sampling spreads questions over the whole 377 k-paper corpus, which is right
+    for measuring general retrieval and wrong for deepening coverage of a handful of
+    subjects: at 50 questions a run, a topic holding 0.2 % of the corpus gets seen once
+    every ten runs.
+
+    Each topic is embedded as a query and searched against the tier-1 index directly,
+    rather than through the full retrieval pipeline. The pipeline is tuned for precision —
+    rerank down to a handful of the best passages — and what is wanted here is *breadth*
+    within a topic, since a hundred near-identical passages about Muon would produce a
+    hundred near-identical questions.
+
+    Topics are drawn round-robin so an easy topic with many matching papers cannot crowd
+    out a rare one.
+    """
+    from lara.index.embed import embed_queries
+
+    rng = random.Random(seed)
+    per_topic = max(1, (n * pool_mult) // max(1, len(topics)))
+    by_topic: list[list[int]] = []
+    for topic in topics:
+        q = embed_queries(retriever.embedder, [topic])[0]
+        rows, _ = retriever.dense.search(q[: retriever.dim_trunc], k=per_topic)
+        by_topic.append([int(r) for r in rows])
+
+    # Round-robin interleave, then look the rows up as chunks.
+    order: list[int] = []
+    for i in range(max((len(x) for x in by_topic), default=0)):
+        for lst in by_topic:
+            if i < len(lst):
+                order.append(lst[i])
+    if not order:
+        return []
+
+    seen, picked = set(), []
+    for start in range(0, len(order), 900):
+        batch = [r for r in order[start:start + 900] if r not in seen]
+        seen.update(batch)
+        if not batch:
+            continue
+        ph = ",".join("?" * len(batch))
+        found = {r["vector_row"]: r for r in conn.execute(
+            f"""SELECT c.chunk_id, c.arxiv_id, c.text, c.vector_row
+                FROM chunks c
+                WHERE c.vector_row IN ({ph}) AND c.kind='body'
+                  AND length(c.text) BETWEEN 600 AND 1500""", batch)}
+        picked += [found[r] for r in batch if r in found]
+        if len(picked) >= n * 2:
+            break
+
+    # One passage per paper: several chunks from one paper yield overlapping questions.
+    out, papers = [], set()
+    for row in picked:
+        if row["arxiv_id"] in papers:
+            continue
+        papers.add(row["arxiv_id"])
+        out.append(row)
+    rng.shuffle(out)
+    return out[:n]
 
 
 def clean_question(raw: str) -> str | None:
@@ -131,13 +198,14 @@ def score_pairs(cross_encoder, query: str, texts: list[str], batch: int = 32) ->
 
 async def run_cycles(cfg, conn, retriever, cross_encoder, *, n: int = 50,
                      k: int = 20, n_random_neg: int = 6, model: str | None = None,
-                     seed: int = 0, progress=None) -> dict:
+                     seed: int = 0, topics: list[str] | None = None, progress=None) -> dict:
     """Generate questions, retrieve, judge, and store. Returns a summary."""
     from lara.finetune import judgements as J
     from lara.serve.generate import stream_answer
 
     rng = random.Random(seed)
-    rows = sample_chunks(conn, n * 2, seed)
+    rows = (sample_chunks_by_topic(conn, retriever, topics, n * 2, seed)
+            if topics else sample_chunks(conn, n * 2, seed))
     stats = {"cycles": 0, "questions": 0, "rejected": 0, "stored": 0,
              "source_missed": 0, "positives": 0, "negatives": 0, "styles": {}}
     cycles: list[Cycle] = []

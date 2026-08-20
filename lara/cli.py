@@ -415,8 +415,14 @@ def explore(
     k: int = typer.Option(20, help="Passages retrieved per question"),
     device: str = typer.Option(None, help="Override device; default auto-detects"),
     seed: int = typer.Option(0),
+    topics: str = typer.Option(None, help="Semicolon-separated topics to focus sampling on"),
 ) -> None:
-    """Generate questions, retrieve, and judge — harvesting training pairs."""
+    """Generate questions, retrieve, and judge — harvesting training pairs.
+
+    `--topics` seeds passages from papers about those subjects instead of uniformly at
+    random, which is how you deepen coverage of a specific area rather than thinning it
+    across the whole corpus.
+    """
     import asyncio
 
     from lara.finetune import explore as EX
@@ -458,7 +464,11 @@ def explore(
 
     p = reporter()
     next(p)
-    stats = asyncio.run(EX.run_cycles(cfg, conn, retr, ce, n=n, k=k, seed=seed, progress=p))
+    topic_list = [t.strip() for t in (topics or "").split(";") if t.strip()]
+    if topic_list:
+        console.print(f"focusing on {len(topic_list)} topics: " + ", ".join(topic_list))
+    stats = asyncio.run(EX.run_cycles(cfg, conn, retr, ce, n=n, k=k, seed=seed,
+                                      topics=topic_list or None, progress=p))
     console.print(
         f"\n[green]{stats['cycles']} cycles[/green] · {stats['stored']:,} new judgements "
         f"({stats['positives']} pos / {stats['negatives']} neg) · "
