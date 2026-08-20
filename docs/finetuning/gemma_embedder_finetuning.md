@@ -326,6 +326,65 @@ admits more pairs per query than the default 8, which raises the baseline pair_a
 
 ---
 
+### More data, whitening, and a metric that measures the right thing (2026-08-20)
+
+Three things changed at once, each addressing a specific objection to the earlier result:
+
+1. **6.7x more data.** A topic-focused `explore` run over Muon, spectral optimization,
+   equilibrium propagation, RAG and embeddings took the judgement set from 11,789 to
+   **20,351 across 788 queries**, and the triple set from 3,599 to **24,297 from 772
+   queries**. Source-chunk recall on that run was 48 %, so 365 of the new positives are
+   passages retrieval could not find at all.
+2. **Whitening**, fitted on 400 k corpus vectors — no retraining, one 768x768 matrix.
+3. **Within-query rank correlation**, because the pooled figure was measuring the wrong
+   comparison (see §5).
+
+5 folds, split by query, batch 512, Muon 3e-5, early stopping. Mean +/- std over folds:
+
+| | pair_acc | pooled rho | within-query rho |
+|---|---|---|---|
+| base, raw | 0.9124 ± 0.0089 | **0.6697 ± 0.0318** | **0.4544 ± 0.0210** |
+| base, whitened | **0.9303 ± 0.0068** | 0.6151 ± 0.0322 | 0.4016 ± 0.0285 |
+| tuned, raw | 0.9099 ± 0.0072 | 0.6600 ± 0.0278 | 0.4372 ± 0.0183 |
+| tuned, whitened | 0.9190 ± 0.0066 | 0.6235 ± 0.0323 | 0.4092 ± 0.0227 |
+
+Per-fold deltas, which say more than the means:
+
+| intervention | pair_acc | pooled rho | within-query rho |
+|---|---|---|---|
+| fine-tune | −0.0025 (1/5 folds better) | −0.0097 (1/5) | **−0.0172 (0/5)** |
+| whitening | **+0.0179 (5/5)** | −0.0545 (0/5) | −0.0528 (0/5) |
+| fine-tune *on top of* whitening | −0.0113 (0/5) | | |
+
+**The fine-tune fails again, and "not enough signal" is now ruled out.** That was the
+second of the three candidate causes listed above. Nearly seven times the data, a properly
+swept learning rate and a four-times larger batch produce a model that is *worse* on every
+metric that matters: within-query rank correlation degraded in **five folds out of five**.
+Margin error meanwhile improved from 0.5625 to 0.3823 — the objective is being fitted
+harder than ever. Fitting the loss is still not learning the task, and the remaining
+explanation is the first one: MarginMSE regresses on score gaps, and ranking is not what it
+optimises.
+
+**Whitening is the one thing that worked, and it did so unanimously.** +0.0179 pairwise
+accuracy in 5 folds out of 5, roughly four times the fold-to-fold spread, for a transform
+that costs no training and no re-embedding. It also lowers both rank correlations in 0/5
+folds — consistently — which is the expected consequence of rescaling a geometry whose gaps
+the teacher's scale was fitted to.
+
+**The two do not compose.** Applying the fine-tune on top of whitening *costs* 0.0113
+pairwise accuracy, in five folds out of five. Whitening alone is the best configuration
+measured.
+
+**Do not adopt whitening on these numbers either — not yet.** Every metric on this page is
+agreement with the cross-encoder that produced the labels, so "whitening improves pair_acc"
+means "whitening agrees more with the reranker", which is exactly the circularity §6 warns
+about. The independent test is the citation retrieval eval in `lara/finetune/evaluate.py`,
+scored against what human authors actually cited, and it has not been run on a whitened
+index. That is the next measurement, and it is cheap: whitening is post-hoc, so it needs no
+re-embedding, only re-scoring.
+
+---
+
 ## 6. Guarding against fooling yourself
 
 The generator, the judge and the student are all the same family of model, so this pipeline
