@@ -130,8 +130,15 @@ def _encode(model, texts: list[str], device: str, grad: bool = True) -> torch.Te
         return model(features)["sentence_embedding"]
 
 
-def evaluate(model, triples: list[Triple], device: str, batch: int = 48) -> dict:
-    """Pairwise metrics against the teacher."""
+def evaluate(model, triples: list[Triple], device: str, batch: int = 48,
+             whitener=None) -> dict:
+    """Pairwise metrics against the teacher.
+
+    ``whitener`` applies the corpus whitening transform to every embedding before the
+    similarities are taken, so a run can be scored in the space retrieval would actually
+    use. It is applied to queries and documents with the same matrix: they are compared to
+    each other, and transforming only one side would put them in different spaces.
+    """
     if not triples:
         return {"n": 0}
     model.eval()
@@ -141,6 +148,15 @@ def evaluate(model, triples: list[Triple], device: str, batch: int = 48) -> dict
         q = _encode(model, [QUERY_PREFIX + t.query for t in part], device, grad=False)
         p = _encode(model, [DOC_PREFIX + t.pos_text for t in part], device, grad=False)
         n = _encode(model, [DOC_PREFIX + t.neg_text for t in part], device, grad=False)
+        if whitener is not None:
+            import numpy as _np
+            qa = whitener(q.float().cpu().numpy())
+            pa = whitener(p.float().cpu().numpy())
+            na = whitener(n.float().cpu().numpy())
+            m_np = (qa * pa).sum(-1) - (qa * na).sum(-1)
+            student.extend([float(x) for x in _np.asarray(m_np)])
+            teacher.extend(t.margin for t in part)
+            continue
         qn = F.normalize(q.float(), dim=-1)
         m = (qn * F.normalize(p.float(), dim=-1)).sum(-1) \
           - (qn * F.normalize(n.float(), dim=-1)).sum(-1)
@@ -153,6 +169,27 @@ def evaluate(model, triples: list[Triple], device: str, batch: int = 48) -> dict
     rank = lambda a: np.argsort(np.argsort(a))  # noqa: E731
     rs, rt = rank(s), rank(t)
     spearman = float(np.corrcoef(rs, rt)[0, 1]) if len(s) > 2 else 0.0
+
+    # Within-query rank correlation, averaged over queries.
+    #
+    # `spearman` above pools every triple from every query into one ranking, which asks
+    # whether query A's margin is bigger than query B's — a comparison retrieval never
+    # makes. Ordering candidates *for one question* is the thing retrieval does, and it is
+    # a strictly harder problem: measured on the base model, pooled 0.695 against
+    # within-query 0.526 +/- 0.295, with 7% of queries scoring negative. Reporting only the
+    # pooled figure overstates the model and hides that spread.
+    by_q: dict[str, list[int]] = {}
+    for i, tr in enumerate(triples):
+        by_q.setdefault(tr.query_hash, []).append(i)
+    per_q = []
+    for idx in by_q.values():
+        if len(idx) < 4:
+            continue
+        a, b = s[idx], t[idx]
+        if float(np.std(a)) == 0.0 or float(np.std(b)) == 0.0:
+            continue
+        per_q.append(float(np.corrcoef(rank(a), rank(b))[0, 1]))
+
     return {
         "n": len(s),
         "pair_acc": float((s > 0).mean()),
@@ -160,6 +197,9 @@ def evaluate(model, triples: list[Triple], device: str, batch: int = 48) -> dict
         "mean_student_margin": float(s.mean()),
         "mean_teacher_margin": float(t.mean()),
         "spearman": round(spearman, 4),
+        "within_q": round(float(np.mean(per_q)), 4) if per_q else None,
+        "within_q_std": round(float(np.std(per_q)), 4) if per_q else None,
+        "n_queries_scored": len(per_q),
     }
 
 
