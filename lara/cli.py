@@ -1093,21 +1093,33 @@ def setup(
     for c, j in (("", "left"), ("option", "left"), ("index", "right"), ("+models", "right"),
                  ("p50", "right"), ("recall", "right"), ("note", "left")):
         t.add_column(c, justify=j, overflow="fold")
-    for opt, total, ok in plan.alternatives:
-        mark = "→" if opt.key == plan.option.key else ("" if ok else "✗")
-        style = "green" if opt.key == plan.option.key else ("" if ok else "dim")
+    # Every option is selectable. The memory columns are reported so you can judge the
+    # trade yourself; nothing is struck out for being large, because "it does not fit
+    # today" depends on the corpus you scope to and what else the machine is doing.
+    for opt, total, _ in plan.alternatives:
+        mark = "→" if opt.key == plan.option.key else ""
+        style = "green" if opt.key == plan.option.key else ""
         t.add_row(mark, f"[{style}]{opt.label}[/{style}]" if style else opt.label,
                   f"{opt.index_gb(n_chunks, plan.dim):.1f} GB", f"{total:.1f} GB",
                   f"{opt.p50_ms:.1f}ms", f"{opt.recall:.3f}", opt.note)
     console.print(t)
-    console.print(f"  [dim]✗ = does not fit the {plan.budget_gb:.0f} GB budget. "
-                  f"Measured with `lara bench-index`.[/dim]")
+    console.print(f"  [dim]→ = recommended for this machine. +models is what the index plus "
+                  f"resident models would need, against a {plan.budget_gb:.0f} GB budget; "
+                  f"anything larger needs the corpus scoped in step 4. Measured with "
+                  f"`lara bench-index`.[/dim]")
 
     chosen = plan.option
     if not non_interactive and not show:
         keys = [o.key for o, _, _ in plan.alternatives]
-        pick = typer.prompt(f"\n  backend [{'/'.join(keys)}]", default=plan.option.key)
-        chosen = SU.OPTIONS_BY_KEY.get(pick, plan.option)
+        while True:
+            pick = typer.prompt(f"\n  backend [{'/'.join(keys)}]", default=plan.option.key)
+            pick = pick.strip()
+            if pick in keys:
+                break
+            # Silently falling back to the default here meant a typo picked a backend you
+            # did not ask for, and nothing said so.
+            console.print(f"  [red]{pick!r} is not one of[/red] {', '.join(keys)}")
+        chosen = SU.OPTIONS_BY_KEY[pick]
         plan.option = chosen
 
     # ── 4. scoping ─────────────────────────────────────────────────────────────

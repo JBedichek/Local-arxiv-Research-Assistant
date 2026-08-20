@@ -75,7 +75,10 @@ class IndexOption:
 OPTIONS: tuple[IndexOption, ...] = (
     IndexOption("torch-fp16", "torch", "fp16", None, 512, 1.1, 1.000, False,
                 "exact; fastest on CUDA and the best exact option on CPU too"),
-    IndexOption("torch-int8", "torch", "int8", None, 256, 8.2, 0.996, True,
+    # needs_cuda is False despite the name: int8 needs *a GPU*, not specifically CUDA, and
+    # backends.py only rejects it on CPU. Flagging it CUDA-only hid a working option from
+    # every Apple Silicon machine, contradicting this row's own note.
+    IndexOption("torch-int8", "torch", "int8", None, 256, 8.2, 0.996, False,
                 "half the memory for 0.4% recall — CUDA/MPS only, 25x slower on CPU"),
     IndexOption("faiss-hnsw", "faiss", "fp16", "hnsw", 1280, 2.1, 0.979, False,
                 "approximate; fastest at scale but the largest, and slow to build"),
