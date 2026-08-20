@@ -10,6 +10,7 @@ from lara import config as config_mod
 from lara import device as ldev
 from lara import models as models_mod
 from lara import preflight as preflight_mod
+from lara import prompt as prompt_mod
 
 app = typer.Typer(add_completion=False, help="Local arXiv Research Assistant")
 console = Console()
@@ -1089,30 +1090,88 @@ def setup(
         prefer=prefer,
     )
     console.print("\n[bold]3. Retrieval backend[/bold]")
-    t = Table(show_header=True, header_style="bold")
-    for c, j in (("", "left"), ("option", "left"), ("index", "right"), ("+models", "right"),
-                 ("p50", "right"), ("recall", "right"), ("note", "left")):
-        t.add_column(c, justify=j, overflow="fold")
+    opts = [o for o, _, _ in plan.alternatives]
+    totals = {o.key: total for o, total, _ in plan.alternatives}
+    keys = [o.key for o in opts]
+    recommended = plan.option.key
+
     # Every option is selectable. The memory columns are reported so you can judge the
     # trade yourself; nothing is struck out for being large, because "it does not fit
     # today" depends on the corpus you scope to and what else the machine is doing.
-    for opt, total, _ in plan.alternatives:
-        mark = "→" if opt.key == plan.option.key else ""
-        style = "green" if opt.key == plan.option.key else ""
-        t.add_row(mark, f"[{style}]{opt.label}[/{style}]" if style else opt.label,
-                  f"{opt.index_gb(n_chunks, plan.dim):.1f} GB", f"{total:.1f} GB",
-                  f"{opt.p50_ms:.1f}ms", f"{opt.recall:.3f}", opt.note)
-    console.print(t)
-    console.print(f"  [dim]→ = recommended for this machine. +models is what the index plus "
-                  f"resident models would need, against a {plan.budget_gb:.0f} GB budget; "
-                  f"anything larger needs the corpus scoped in step 4. Measured with "
-                  f"`lara bench-index`.[/dim]")
+    def backend_table(cursor: int | None) -> Table:
+        t = Table(show_header=True, header_style="bold")
+        for c, j in (("", "left"), ("option", "left"), ("index", "right"),
+                     ("resident", "right"), ("generator left", "right"),
+                     ("p50", "right"), ("recall", "right"), ("note", "left")):
+            t.add_column(c, justify=j, overflow="fold")
+        for i, opt in enumerate(opts):
+            on_cursor = cursor is not None and i == cursor
+            mark = "❯" if on_cursor else ("→" if opt.key == recommended else "")
+            style = ("bold cyan" if on_cursor
+                     else "green" if opt.key == recommended else "")
+            cell = f"[{style}]{opt.label}[/{style}]" if style else opt.label
+            # Against the *scoped* index, not the full-corpus one. Every option overflows
+            # a laptop unscoped, so headroom computed there reads 0.0 for all of them and
+            # tells you nothing about the choice you are making.
+            scoped = opt.index_gb(int(n_chunks * gen_keep), plan.dim)
+            head = SU.generator_headroom_gb(device.budget_gb, scoped + plan.overhead_gb)
+            params = SU.generator_params_at_4bit(head)
+            gen = (f"{head:.1f} GB\n~{SU.format_params(params)} @4bit" if params >= 5e8
+                   else f"{head:.1f} GB\n[red]no room[/red]")
+            t.add_row(mark, cell,
+                      f"{opt.index_gb(n_chunks, plan.dim):.1f} GB",
+                      f"{totals[opt.key]:.1f} GB", gen,
+                      f"{opt.p50_ms:.1f}ms", f"{opt.recall:.3f}", opt.note)
+        return t
+
+    # Scoping shrinks only the index, and "unnecessary" leaves scope_keep at whatever the
+    # solver last computed — which is not 1.0 — so it has to be read as 1.0 here or a
+    # machine that needs no scoping is shown a shrunken index it will never build.
+    gen_keep = 1.0 if plan.scope == "unnecessary" else plan.scope_keep
+
+    # "+models" hid the fact that a third of the fixed cost is cache, not a model, and
+    # named no figure you could check. Spell the addends out instead.
+    fixed = [f"embedder {plan.embedder_gb:.1f}"]
+    if plan.reranker_gb:
+        fixed.append(f"cross-encoder reranker {plan.reranker_gb:.1f}")
+    fixed.append(f"tier-0 hot cache {plan.hot_tier_bytes / 1e9:.1f}")
+    width = "fp32" if device.accelerator == "cpu" else "half precision"
+    pool = ("Unified memory: retrieval and the generator share one pool."
+            if device.unified_memory else
+            "The index sits on one card; vLLM can shard a generator wider.")
+    legend = (
+        f"  [dim]→ = recommended for this machine.\n"
+        f"  resident = index + {' + '.join(fixed)} = "
+        f"{plan.overhead_gb:.1f} GB fixed, against a {plan.budget_gb:.0f} GB budget.\n"
+        f"  Encoders load in {width} on {device.accelerator} and are not int-quantised, "
+        f"so those two figures double on CPU.\n"
+        f"  generator left = what remains of the {plan.budget_gb:.0f} GB budget "
+        f"{'at the step-4 keep fraction of ' + format(gen_keep, '.0%') if gen_keep < 1 else 'with the whole corpus resident'}"
+        f", and the largest 4-bit model that fits it once KV cache and activations take "
+        f"their {SU.KV_OVERHEAD:.2f}x. {pool}\n"
+        f"  Anything larger than the budget needs the corpus scoped in step 4. Latency "
+        f"and recall measured with `lara bench-index`.[/dim]")
 
     chosen = plan.option
-    if not non_interactive and not show:
-        keys = [o.key for o, _, _ in plan.alternatives]
+    if non_interactive or show:
+        console.print(backend_table(None))
+        console.print(legend)
+    elif prompt_mod.interactive():
+        console.print(legend)
+        console.print("  [dim]↑/↓ to move, enter to choose, esc to keep the "
+                      "recommendation.[/dim]")
+        start = keys.index(recommended)
+        picked = prompt_mod.select(len(opts), backend_table, console=console,
+                                   initial=start)
+        chosen = opts[picked] if picked is not None else plan.option
+        plan.option = chosen
+        console.print(f"  backend: [bold]{chosen.key}[/bold]")
+    else:
+        # Not a terminal — piped input, CI, TERM=dumb. Typing still has to work.
+        console.print(backend_table(None))
+        console.print(legend)
         while True:
-            pick = typer.prompt(f"\n  backend [{'/'.join(keys)}]", default=plan.option.key)
+            pick = typer.prompt(f"\n  backend [{'/'.join(keys)}]", default=recommended)
             pick = pick.strip()
             if pick in keys:
                 break

@@ -10,7 +10,8 @@ Pipeline (PLAN.md §5, latency budget §7)::
                                           │
                          tier 2: exact fp16-768 rescore from mmap    ─▶ 50
                                           │
-                         cross-encoder Qwen3-Reranker-4B (~40 ms)    ─▶ 8
+                     cross-encoder Qwen3-Reranker-0.6B-seq-cls       ─▶ 8
+                              (~33 ms for 24 pairs)
 
 Tier 0 (the open paper and its citation neighbourhood, pinned at full precision) is a
 filtered case of tier 1 rather than a separate index: restrict to a row subset and the

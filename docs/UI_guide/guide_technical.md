@@ -18,7 +18,7 @@ query ──embed (20ms)──┬─▶ tier 1: exact GPU matmul over MRL-256   
                                     │
                     tier 2: exact fp16-768 rescore from mmap  0.2ms  ─▶ 48
                                     │
-                    cross-encoder bge-reranker-v2-m3          41ms   ─▶ k
+                    cross-encoder Qwen3-Reranker-0.6B-seq-cls 33ms   ─▶ k
 ```
 
 Tier 1 is exact, not approximate. Measured against real vectors, a GPU matmul beats CPU

@@ -31,9 +31,59 @@ from lara.serve import devices as DV
 #: Corpus the published dataset ships with, used for planning before vectors exist locally.
 REFERENCE_CHUNKS = 28_723_432
 
-#: Steady-state cost of everything that is not the tier-1 index, in GB.
-EMBEDDER_GB = 1.2
-RERANKER_GB = 1.2
+#: Parameter counts from the model cards. Resident cost is params x dtype width, so a
+#: model costs twice as much on CPU as on a GPU -- lara.device.model_dtype loads encoders
+#: at bf16 on CUDA, fp16 on MPS and fp32 on CPU, and neither model is int-quantised.
+#:
+#: These were flat 1.2 GB constants, which happened to be the fp16 figure for the reranker
+#: and the *fp32* figure for the embedder: on a GPU the planner overstated the embedder by
+#: 2x, and on CPU it understated the reranker by the same factor.
+EMBEDDER_PARAMS = 308_000_000        # google/embeddinggemma-300m
+RERANKER_PARAMS = 596_000_000        # tomaarsen/Qwen3-Reranker-0.6B-seq-cls
+
+
+def dtype_bytes(accelerator: str) -> int:
+    """Bytes per weight, as encoders are actually loaded on this accelerator."""
+    return 4 if accelerator == "cpu" else 2
+
+
+def model_gb(params: int, accelerator: str) -> float:
+    return params * dtype_bytes(accelerator) / 1e9
+
+
+#: Bits per weight assumed for a quantised generator (Q4_K_M, AWQ, GPTQ — all ~4).
+GENERATOR_QUANT_BITS = 4
+
+#: KV cache and activations, as a multiplier on weights. Same convention as
+#: ``devices.fits``: a 20 GB checkpoint does not run in 20 GB. It is a heuristic, not a
+#: measurement — real KV scales with context length and batch size, and quantising the
+#: weights does not quantise the cache.
+KV_OVERHEAD = 1.35
+
+
+def generator_headroom_gb(budget_gb: float, resident_gb: float) -> float:
+    """What is left for the generator once retrieval has taken its share.
+
+    On unified memory the index, the encoders and the generator all draw from one pool,
+    so every GB the index takes is a GB the generator cannot have. On discrete GPUs the
+    subtraction is conservative — the index sits on one card while vLLM can shard across
+    all of them — but reporting the optimistic figure would promise headroom that a
+    single-GPU machine does not have.
+    """
+    return max(0.0, budget_gb - resident_gb)
+
+
+def generator_params_at_4bit(headroom_gb: float) -> float:
+    """Largest generator, in parameters, whose 4-bit weights plus KV cache fit."""
+    return max(0.0, headroom_gb / KV_OVERHEAD) * 1e9 / (GENERATOR_QUANT_BITS / 8)
+
+
+def format_params(n: float) -> str:
+    """Parameter count as people name models: 0.6B, 8B, 70B."""
+    b = n / 1e9
+    if b < 1:
+        return f"{b:.1f}B"
+    return f"{b:.0f}B" if b >= 10 else f"{b:.1f}B"
 
 #: Below this much *total* RAM, a full-corpus index stops being realistic on any backend.
 SMALL_MACHINE_GB = 16.0
@@ -108,6 +158,10 @@ class Plan:
     overhead_advice: list[str] = field(default_factory=list)
     disable_cross_encoder: bool = False
     hot_tier_bytes: int = 2_000_000_000
+    #: The addends behind ``overhead_gb``, kept so the wizard can show its working
+    #: rather than presenting one opaque figure.
+    embedder_gb: float = 0.0
+    reranker_gb: float = 0.0
 
     @property
     def index_gb(self) -> float:
@@ -130,9 +184,18 @@ class Plan:
         return self.option.index_gb(self.scoped_chunks, self.dim)
 
 
-def overhead_gb(hot_tier_bytes: int = 2_000_000_000, cross_encoder: bool = True) -> float:
-    """Everything resident that is not the tier-1 index."""
-    return EMBEDDER_GB + (RERANKER_GB if cross_encoder else 0.0) + hot_tier_bytes / 1e9
+def overhead_gb(hot_tier_bytes: int = 2_000_000_000, cross_encoder: bool = True,
+                accelerator: str = "cpu") -> float:
+    """Everything resident that is not the tier-1 index.
+
+    ``accelerator`` defaults to the *conservative* case: fp32 on CPU is the largest the
+    encoders ever get, so a caller that does not know its device is never told it has
+    more room than it really has.
+    """
+    over = model_gb(EMBEDDER_PARAMS, accelerator) + hot_tier_bytes / 1e9
+    if cross_encoder:
+        over += model_gb(RERANKER_PARAMS, accelerator)
+    return over
 
 
 def keep_fraction_for(budget_gb: float, overhead: float, option: IndexOption,
@@ -162,7 +225,7 @@ def plan_index(device: DV.Device | None = None, n_chunks: int = 0, dim: int = 25
     # single_device_gb, not budget_gb: the index is one tensor on one card and is
     # never sharded, so the sum across GPUs is the wrong number to plan against.
     budget = device.single_device_gb
-    over = overhead_gb(hot_tier_bytes, cross_encoder)
+    over = overhead_gb(hot_tier_bytes, cross_encoder, device.accelerator)
     cuda = device.accelerator == "cuda"
     reasons: list[str] = []
 
@@ -250,7 +313,7 @@ def plan_index(device: DV.Device | None = None, n_chunks: int = 0, dim: int = 25
                 "open paper's neighbourhood, so this costs latency on citation follows, "
                 "not correctness.")
         if drop_ce or hot != hot_tier_bytes:
-            new_over = overhead_gb(hot, cross_encoder and not drop_ce)
+            new_over = overhead_gb(hot, cross_encoder and not drop_ce, device.accelerator)
             advice.append(f"Together those bring fixed costs to {new_over:.1f} GB.")
             over = new_over
             keep = keep_fraction_for(budget, over, chosen, n_chunks, dim,
@@ -259,7 +322,10 @@ def plan_index(device: DV.Device | None = None, n_chunks: int = 0, dim: int = 25
     return Plan(device=device, n_chunks=n_chunks, dim=dim, option=chosen,
                 budget_gb=budget, overhead_gb=over, scope=scope, scope_keep=keep,
                 reasons=reasons, alternatives=alts, overhead_advice=advice,
-                disable_cross_encoder=drop_ce, hot_tier_bytes=hot)
+                disable_cross_encoder=drop_ce, hot_tier_bytes=hot,
+                embedder_gb=model_gb(EMBEDDER_PARAMS, device.accelerator),
+                reranker_gb=(0.0 if drop_ce or not cross_encoder
+                             else model_gb(RERANKER_PARAMS, device.accelerator)))
 
 
 # ── writing the config ────────────────────────────────────────────────────────────

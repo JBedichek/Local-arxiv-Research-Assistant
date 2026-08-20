@@ -153,22 +153,34 @@ index:
   rerank:
     tier2_candidates: 200                # exact fp16 rescore from mmap
     final_k: 20
-    # D13 (revised): bge-reranker-v2-m3, NOT Qwen3-Reranker-4B.
+    # D13 (revised again): one reranker, and it is the *seq-cls* Qwen3 0.6B.
     #
-    # Qwen3-Reranker scores via yes/no LM logits, which sentence-transformers' CrossEncoder
-    # does not implement -- it builds a Qwen3ForSequenceClassification whose score.weight
-    # is RANDOMLY INITIALISED. It returns plausible floats and ranks documents, so the
-    # failure is invisible without a behavioural check: measured, it gave a self-attention
-    # passage 0.865 and a recipe for frying onions 0.862.
+    # THE REPO NAME MATTERS MORE THAN THE FAMILY. Qwen3-Reranker natively scores via
+    # yes/no LM logits, which sentence-transformers' CrossEncoder does not implement --
+    # it builds a Qwen3ForSequenceClassification whose score.weight is RANDOMLY
+    # INITIALISED. That returns plausible floats and dutifully ranks documents, so the
+    # failure is invisible without a behavioural check: measured, `Qwen/Qwen3-Reranker-0.6B`
+    # gave a self-attention passage 0.865 and a recipe for frying onions 0.862.
+    #
+    # `tomaarsen/*-seq-cls` are conversions with a *trained* classification head, which is
+    # why they work where the upstream repo does not. Do not "simplify" this back to
+    # Qwen/Qwen3-Reranker-0.6B -- it is the same model by name and noise by behaviour.
     #
     # Measured on a relevant-vs-irrelevant separation probe:
     #   Qwen/Qwen3-Reranker-0.6B              broken   0.865 vs 0.862    67ms/50
     #   tomaarsen/Qwen3-Reranker-4B-seq-cls   marginal 0.893 vs 0.695   333ms/50
-    #   tomaarsen/Qwen3-Reranker-0.6B-seq-cls ok       0.799 vs 0.376    68ms/50
-    #   BAAI/bge-reranker-v2-m3               ok       0.401 vs 0.000    40ms/50  <- chosen
+    #   tomaarsen/Qwen3-Reranker-0.6B-seq-cls ok       0.799 vs 0.376    68ms/50  <- chosen
+    #   BAAI/bge-reranker-v2-m3               ok       0.401 vs 0.000    40ms/50
+    #
+    # 0.6B-seq-cls over bge: a wider separation margin (0.423 vs 0.401) for 28ms/50 more,
+    # and it keeps the stack on one model family. 4B-seq-cls is 5x the latency for a
+    # margin that is worse, not better.
+    #
+    # load_cross_encoder runs assert_reranker_works at load time (verify=True by default),
+    # so an untrained head fails loudly at startup rather than degrading ranking to noise.
     cross_encoder:
       enabled: true
-      model: BAAI/bge-reranker-v2-m3
+      model: tomaarsen/Qwen3-Reranker-0.6B-seq-cls
       device: 1
       candidates: 24               # 24 costs 20ms vs 40ms for 50; tier 2 already ranks well
       batch_size: 24
