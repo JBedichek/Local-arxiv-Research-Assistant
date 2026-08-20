@@ -540,6 +540,39 @@ def mnrl(q: torch.Tensor, pos: torch.Tensor, neg: torch.Tensor,
     return F.cross_entropy(logits, target)
 
 
+def query_disjoint_batches(triples: list[Triple], batch_size: int,
+                           rng: random.Random) -> list[list[Triple]]:
+    """Batches in which no query appears twice.
+
+    In-batch negatives assume every other row is genuinely irrelevant. That is false here:
+    one query contributes up to 32 triples, so two triples of the same query put a *real*
+    positive for that query into its own negative set. Measured on a random batch of 512,
+    137 rows — 27 % — collided that way, and InfoNCE spends those rows teaching the model
+    to push away passages it should be retrieving.
+
+    MarginMSE never cared, because each triple carried its own negative and the batch was
+    only a gradient-smoothing device. Switching to a batch-is-the-negatives loss makes the
+    sampler part of the objective.
+
+    Round-robin over per-query queues, so a query with many triples contributes to many
+    batches but never twice to one.
+    """
+    by_q: dict[str, list[Triple]] = {}
+    for t in triples:
+        by_q.setdefault(t.query_hash, []).append(t)
+    queues = list(by_q.values())
+    for q in queues:
+        rng.shuffle(q)
+    batches: list[list[Triple]] = []
+    while True:
+        live = [q for q in queues if q]
+        if len(live) < batch_size:
+            break                      # a short final batch would have fewer negatives
+        rng.shuffle(live)
+        batches.append([q.pop() for q in live[:batch_size]])
+    return batches
+
+
 def _encode_ids(model, feats: dict) -> torch.Tensor:
     return model(feats)["sentence_embedding"]
 
@@ -581,10 +614,11 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
         lr_muon, lr_adam, weight_decay = rec.lr_muon, rec.lr_adam, rec.weight_decay
     opt = SingleDeviceMuonWithAuxAdam(split_param_groups(model, _Cfg()))
 
-    steps = max(1, (len(triples) // rec.batch_size) * rec.epochs)
+    rng = random.Random(rec.seed)
+    epoch_batches = query_disjoint_batches(triples, rec.batch_size, rng)
+    steps = max(1, len(epoch_batches) * rec.epochs)
     warmup = max(1, int(steps * rec.warmup_frac))
     base = [g["lr"] for g in opt.param_groups]
-    rng = random.Random(rec.seed)
     micro = rec.micro_batch or rec.batch_size
     step, started = 0, time.time()
     best_loss, best_state, since_best, stopped = float("inf"), None, 0, False
@@ -601,9 +635,7 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
     for _ in range(rec.epochs):
         if stopped:
             break
-        rng.shuffle(triples)
-        for i in range(0, len(triples) - rec.batch_size + 1, rec.batch_size):
-            part = triples[i:i + rec.batch_size]
+        for part in query_disjoint_batches(triples, rec.batch_size, rng):
             scale = (step / warmup) if step < warmup else 0.5 * (
                 1 + math.cos(math.pi * min(1.0, (step - warmup) / max(1, steps - warmup))))
             for g, b in zip(opt.param_groups, base):
@@ -684,9 +716,21 @@ def mnrl_val_loss(model, triples: list[Triple], device: str, rec: "Recipe",
     reasons that have nothing to do with the model."""
     model.eval()
     total, n = 0.0, 0
+    # Same disjointness rule as training, and a fixed seed so the batches — and therefore
+    # the loss value — do not move between evaluations for reasons unrelated to the model.
+    #
+    # The batch must not exceed the number of distinct queries available: the disjoint
+    # sampler yields nothing at all when it cannot fill one, and a mean over zero batches
+    # is 0.0 — a "perfect" validation loss that silently stops training on the first
+    # evaluation. The inner split holds ~116 queries against a default batch of 128, so
+    # this is the normal case, not an edge one.
+    n_queries = len({t.query_hash for t in triples})
+    batch = max(8, min(batch, n_queries))
+    parts = query_disjoint_batches(triples, batch, random.Random(0))
+    if not parts:
+        return float("inf")            # unmeasurable, so never counts as an improvement
     with torch.no_grad():
-        for i in range(0, len(triples) - batch + 1, batch):
-            part = triples[i:i + batch]
+        for part in parts:
             q = _encode(model, [QUERY_PREFIX + t.query for t in part], device, grad=False)
             p = _encode(model, [doc_input(t.pos_text) for t in part], device, grad=False)
             ng = _encode(model, [doc_input(t.neg_text) for t in part], device, grad=False)

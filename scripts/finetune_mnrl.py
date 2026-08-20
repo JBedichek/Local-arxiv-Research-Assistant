@@ -28,7 +28,7 @@ print(f"{len(triples):,} triples / {len({t.query_hash for t in triples}):,} quer
 print(f"doc format: {triples[0].pos_text[:88]!r}", flush=True)
 
 rec = KF.Recipe(lr_muon=LR, lr_adam=LR/5, batch_size=512, micro_batch=64,
-                max_seq_length=512, epochs=4, patience=3, eval_every=5, temperature=0.05)
+                max_seq_length=512, epochs=4, patience=4, eval_every=10, temperature=0.05)
 model_name = cfg.get_in('embedding.model')
 rows = []
 
