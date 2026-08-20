@@ -1227,12 +1227,12 @@ def taste_recommend(reduce: str = Query(default="lse"), temp: float = Query(defa
 def models() -> JSONResponse:
     """Generators available from the HF cache (R6, R7)."""
     s = _state()
-    from lara.models import scan
+    from lara.models import survey
     from lara.serve import devices as DV
     from lara.serve import generator as GEN
 
     backend = GEN.effective_backend(s.cfg, DV.detect().accelerator)
-    found = scan(s.cfg.get_path("huggingface.home"), backend=backend)
+    found = survey(s.cfg.get_path("huggingface.home"), preferred=backend)
 
     # Which model vLLM is actually serving. The picker lists everything in the cache, but
     # only one is loaded (D5, single_resident), and sending any other name to vLLM is a
@@ -1257,16 +1257,14 @@ def models() -> JSONResponse:
         # model setting. Reading only the vLLM one reported "no default" on every Mac.
         "configured_default": GEN.model_for(
             backend, {**(serving.get("generator") or {}), "vllm": serving.get("vllm") or {}}),
+        # Everything a backend could serve, including ones whose backend is not
+        # installed: those carry `needs_install` and a hint naming what to do. Omitting
+        # them is what made a freshly downloaded model vanish with no explanation.
         "models": [
-            {
-                "repo": m.repo, "arch": m.arch, "size_gb": round(m.size_gb, 1),
-                "quantization": m.quantization,
-                "quant_options": m.runtime_quant_options(),
-                "loaded": m.repo in loaded,
-            }
-            for m in found if m.servable
+            {**m, "loaded": m["repo"] in loaded}
+            for m in found if m["backend"]
         ],
-        "rejected": len([m for m in found if not m.servable]),
+        "rejected": len([m for m in found if not m["backend"]]),
     })
 
 

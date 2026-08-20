@@ -2097,9 +2097,18 @@ async function loadModels() {
   try {
     const m = await api("/api/models");
     const live = new Set(m.loaded?.length ? m.loaded : [m.configured_default].filter(Boolean));
-    const opts = m.models.map((x) =>
-      `<option value="${x.repo}"${live.has(x.repo) ? " selected" : ""}>` +
-      `${x.repo} (${x.size_gb}GB)${live.has(x.repo) ? " — loaded" : " — not loaded"}</option>`);
+    /* A model whose backend is not installed stays listed but disabled: it is genuinely
+     * unusable until the runtime exists, and silently dropping it is what made a model
+     * the user had just downloaded appear nowhere at all. The label carries the fix. */
+    const opts = m.models.map((x) => {
+      const isLive = live.has(x.repo);
+      const state = x.needs_install ? ` — ${x.hint}`
+                  : isLive ? " — loaded"
+                  : " — not loaded";
+      return `<option value="${x.repo}"${isLive ? " selected" : ""}`
+           + `${x.needs_install ? " disabled" : ""}>`
+           + `${x.repo} (${x.size_gb}GB)${escapeHtml(state)}</option>`;
+    });
     /* With an empty cache the sentinel would be the *only* option, which makes it the
      * selection already — so choosing it fires no `change` event and the dialog never
      * opened. A disabled placeholder keeps the sentinel something you can change *to*. */
@@ -2124,7 +2133,9 @@ async function loadModels() {
 $("#model").addEventListener("change", (ev) => {
   if (ev.target.value === DL_SENTINEL) {
     // Restore the previous selection so the sentinel never becomes the active model.
-    ev.target.value = state.models.find((x) => x.loaded)?.repo || state.models[0]?.repo || "";
+    // Never fall back to one whose backend is missing — it cannot be served.
+    const usable = state.models.filter((x) => !x.needs_install);
+    ev.target.value = usable.find((x) => x.loaded)?.repo || usable[0]?.repo || "";
     openDownloadModal();
   }
   syncQuant();

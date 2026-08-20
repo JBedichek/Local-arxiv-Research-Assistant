@@ -197,3 +197,62 @@ def scan(hf_home: str | Path, min_bytes: int = MIN_WEIGHT_BYTES,
 
 def servable(hf_home: str | Path, backend: str | None = None) -> list[CachedModel]:
     return [m for m in scan(hf_home, backend=backend) if m.servable]
+
+
+#: Backends worth testing a cached model against. Ordered by how much work it is to make
+#: one usable, so the first hit is the best suggestion.
+SURVEY_BACKENDS = ("vllm", "mlx", "llamacpp")
+
+
+def survey(hf_home: str | Path, preferred: str | None = None) -> list[dict]:
+    """Every cached model, with the backends that could serve it.
+
+    Filtering to one backend hid models the machine already had. A Mac with mlx-lm
+    installed resolves to MLX, so a freshly downloaded GGUF vanished from the picker
+    entirely — no entry, no explanation, and the download dialog still cheerfully
+    reporting it as cached. Whether a runtime is *installed* is a separate question from
+    whether the weights are the right format, and conflating them removed the one piece
+    of information that would have explained the gap.
+
+    Each entry names the backend that would serve it, whether that backend is installed,
+    and why it is unusable if it is not.
+    """
+    from lara.serve import generator as GEN
+
+    by_repo: dict[str, dict] = {}
+    order = [b for b in ((preferred,) if preferred else ()) if b] + \
+            [b for b in SURVEY_BACKENDS if b != preferred]
+    for backend in order:
+        for m in scan(hf_home, backend=backend):
+            entry = by_repo.setdefault(m.repo, {
+                "repo": m.repo, "arch": m.arch, "size_gb": round(m.size_gb, 1),
+                "quantization": m.quantization,
+                "quant_options": m.runtime_quant_options(),
+                "backends": [], "reasons": m.reasons,
+            })
+            if m.servable:
+                entry["backends"].append(backend)
+
+    out: list[dict] = []
+    for entry in by_repo.values():
+        backends = entry.pop("backends")
+        installed = [b for b in backends if GEN.BACKENDS[b].available()]
+        # Prefer a backend that is both able and installed; fall back to naming one that
+        # would work if installed, which is actionable in a way that silence is not.
+        chosen = (installed or backends or [None])[0]
+        entry["backend"] = chosen
+        entry["servable"] = bool(installed)
+        entry["needs_install"] = bool(backends) and not installed
+        if entry["needs_install"]:
+            b = GEN.BACKENDS[backends[0]]
+            entry["hint"] = f"needs {b.label} — {b.install_hint}"
+        elif not backends:
+            entry["hint"] = "; ".join(entry["reasons"]) or "no backend can serve this"
+        else:
+            entry["hint"] = ""
+        # `reasons` came from whichever backend was scanned first and contradicts
+        # `backend` whenever a later one succeeded. It has been folded into `hint`.
+        entry.pop("reasons", None)
+        out.append(entry)
+    out.sort(key=lambda e: (not e["servable"], -e["size_gb"]))
+    return out
