@@ -8,8 +8,15 @@ version = "0.1.0"
 description = "Local arXiv Research Assistant — RAG over arXiv ML papers with local LLMs on vLLM"
 readme = "README.md"
 requires-python = ">=3.12"
-license = { text = "MIT" }
-authors = [{ name = "J. Bedichek" }]
+license = { file = "LICENSE" }
+authors = [{ name = "James Bedichek", email = "james.bedichek@gmail.com" }]
+classifiers = [
+  "License :: Other/Proprietary License",
+  # Rejected by PyPI on upload. This package is proprietary and must not be
+  # published to a public index; the classifier makes an accidental
+  # `twine upload` fail loudly instead of silently distributing it.
+  "Private :: Do Not Upload",
+]
 
 dependencies = [
   # Base = what it takes to SEARCH and READ a corpus that already exists. Anything only

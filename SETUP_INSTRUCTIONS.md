@@ -1,5 +1,11 @@
 # Setup
 
+> **Copyright © 2026 James Bedichek. All rights reserved.** This is proprietary software,
+> not open source. These instructions describe how to run it; they do not grant permission
+> to use it. Copying, modifying, redistributing, or commercial use require prior written
+> permission — see [`LICENSE`](LICENSE).
+
+
 From nothing to a running reader. Four commands do the work; the rest of this file explains
 what they do and what to change if something is unusual about your machine.
 

@@ -1,0 +1,83 @@
+Copyright (c) 2026 James Bedichek. All rights reserved.
+
+PROPRIETARY SOFTWARE — ALL RIGHTS RESERVED
+
+
+1. OWNERSHIP
+
+   This software, together with its source code, object code, documentation,
+   configuration, model weights produced by it, and all other materials in this
+   repository (collectively, the "Software"), is the proprietary property of
+   James Bedichek (the "Copyright Holder") and is protected by copyright law
+   and international treaties.
+
+
+2. NO LICENSE GRANTED
+
+   No license, express or implied, is granted to any person or entity by the
+   publication or availability of the Software. Being able to view, clone, or
+   download the Software does not grant any right to use it.
+
+   Without the prior written permission of the Copyright Holder, you may NOT:
+
+     (a) copy, reproduce, or store the Software, in whole or in part;
+     (b) modify, adapt, translate, or create derivative works from it;
+     (c) distribute, publish, sublicense, sell, rent, lease, or otherwise
+         transfer it to any third party;
+     (d) use it for any commercial purpose, or in any product or service,
+         whether or not that product or service is sold;
+     (e) use it to provide a hosted, managed, or network-accessible service;
+     (f) reverse engineer, decompile, or disassemble it, except to the extent
+         that applicable law expressly prohibits this restriction;
+     (g) remove, obscure, or alter this notice or any copyright, trademark, or
+         attribution notice contained in the Software.
+
+
+3. PERMISSIONS AND ENQUIRIES
+
+   Permission for any use not granted above — including commercial licensing,
+   evaluation, academic use, and redistribution — must be obtained in writing
+   in advance from the Copyright Holder:
+
+     James Bedichek
+     james.bedichek@gmail.com
+
+   Any permission granted is limited to what is stated in writing, is
+   non-transferable unless expressly stated otherwise, and does not waive any
+   other right reserved here.
+
+
+4. THIRD-PARTY COMPONENTS
+
+   The Software depends on third-party libraries, models, and datasets that are
+   NOT owned by the Copyright Holder and are NOT covered by this License. Each
+   remains subject to its own licence and terms, which take precedence over this
+   License in respect of that component. This includes, without limitation, the
+   Python dependencies declared in pyproject.toml, any model weights obtained
+   from third parties, and any corpus content derived from arXiv, whose
+   individual papers remain the copyright of their respective authors.
+
+   Nothing in this License grants any right in those third-party components, and
+   no representation is made here as to their suitability for any purpose,
+   commercial or otherwise.
+
+
+5. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+
+6. LIMITATION OF LIABILITY
+
+   IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR
+   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE,
+   ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+   DEALINGS IN THE SOFTWARE.
+
+
+7. RESERVATION OF RIGHTS
+
+   All rights not expressly granted in writing by the Copyright Holder are
+   reserved.

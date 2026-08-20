@@ -96,4 +96,23 @@ see every cached repo along with the reason it was rejected.
 
 ## License
 
-MIT
+**Copyright © 2026 James Bedichek. All rights reserved.**
+
+This is **proprietary software**, not open source. Being able to read this repository does
+not grant you any right to use it.
+
+Without prior written permission from the copyright holder you may **not**:
+
+- copy or reproduce it, in whole or in part
+- modify it or create derivative works
+- redistribute, publish, sublicense, or sell it
+- use it commercially, or in any product or service
+- run it as a hosted or network-accessible service
+
+For any permission — commercial licensing, evaluation, academic use, redistribution —
+contact **James Bedichek** at **james.bedichek@gmail.com**.
+
+See [`LICENSE`](LICENSE) for the full terms.
+
+Third-party dependencies, model weights, and arXiv paper content are **not** covered by
+this license and remain subject to their own terms.
