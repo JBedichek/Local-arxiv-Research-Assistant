@@ -30,6 +30,17 @@ WEB_ROOT = Path(__file__).resolve().parent.parent.parent / "web"
 app = FastAPI(title="Local arXiv Research Assistant", docs_url="/api/docs")
 state: AppState | None = None
 
+# Installed at import time from the environment rather than from config, because uvicorn
+# imports this module in its own process and the CLI's parsed config does not travel with
+# it. `lara serve` exports LARA_TOKEN after deciding whether one is required; anything
+# that imports the app directly — a test, an embedded runner — gets the same protection by
+# setting the same variable, and no protection if it sets nothing and serves loopback.
+_auth_token = os.environ.get("LARA_TOKEN", "").strip()
+if _auth_token:
+    from lara.serve.auth import TokenAuthMiddleware
+
+    app.add_middleware(TokenAuthMiddleware, token=_auth_token)
+
 
 @app.on_event("startup")
 def _startup() -> None:
@@ -95,6 +106,12 @@ def health() -> dict:
             "resident_gb": round(sc.resident_bytes() / 1e9, 2),
         },
     }
+
+
+@app.get("/healthz")
+def healthz() -> JSONResponse:
+    """Liveness, reachable without a token so a tunnel can probe it without a credential."""
+    return JSONResponse({"ok": True})
 
 
 @app.get("/api/paper/{arxiv_id:path}")

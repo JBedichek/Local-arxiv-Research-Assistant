@@ -1557,6 +1557,34 @@ def serve(
     host = host or cfg.get_in("serving.host", "127.0.0.1")
     port = port or int(cfg.get_in("serving.port", 8080))
 
+    # Fail closed. Binding off loopback without a token used to expose model downloads
+    # (using the operator's HF_TOKEN), free GPU inference, the arXiv crawler and every
+    # delete endpoint to anything that could route here. Refusing to start is the only
+    # version of this that survives a hurried evening.
+    from lara.serve import auth as AUTH
+
+    token = AUTH.resolve_token(cfg)
+    if AUTH.require_token_for(host, cfg) and not token:
+        fresh = AUTH.generate_token()
+        console.print(
+            f"[red]refusing to serve on {host} without authentication.[/red]\n\n"
+            f"Every endpoint is reachable by anyone who can route here, including model "
+            f"downloads that use your HF_TOKEN, generation on your GPU, and the endpoints "
+            f"that delete your library.\n\nSet a token and try again:\n\n"
+            f"  [bold]export LARA_TOKEN={fresh}[/bold]\n\n"
+            f"or put it in config.local.yaml under serving.auth.token, then open\n"
+            f"  http://{host}:{port}/?token=$LARA_TOKEN\n\n"
+            f"[dim]To bind loopback-only instead, drop --host. To disable this check "
+            f"deliberately, set serving.auth.mode: off[/dim]"
+        )
+        raise typer.Exit(1)
+    if token:
+        os.environ["LARA_TOKEN"] = token          # the app builds its middleware from this
+        console.print(f"[green]authentication on[/green] — open "
+                      f"http://{host}:{port}/?token=<your token> once per browser")
+    elif not AUTH.is_loopback(host):
+        console.print("[yellow]serving without authentication[/yellow] (auth.mode: off)")
+
     gen = None
     if not no_llm and cfg.get_in("serving.generator.autostart", True):
         from lara.serve import devices as DV

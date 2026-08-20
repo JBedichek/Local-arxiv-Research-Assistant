@@ -192,6 +192,17 @@ hot_tier:
   lru_papers: 20
 
 serving:
+  # Authentication. `auto` means: not required on loopback, MANDATORY anywhere else —
+  # `lara serve --host 0.0.0.0` refuses to start without a token rather than coming up
+  # unprotected. `always` demands one even on loopback (shared machine); `off` disables
+  # the check, and exists so that wanting the old behaviour has to be said in writing.
+  #
+  # The token itself belongs in config.local.yaml or, better, in $LARA_TOKEN so it is
+  # never written to disk. Generate one with: python -c "import secrets;print(secrets.token_urlsafe(32))"
+  auth:
+    mode: auto           # auto | always | off
+    token: null
+
   # 127.0.0.1 keeps the reader on this machine only. Set 0.0.0.0 to reach it from other
   # devices on the LAN (or run `lara serve --host 0.0.0.0`).
   #

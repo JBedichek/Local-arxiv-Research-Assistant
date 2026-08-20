@@ -1,0 +1,147 @@
+"""Authentication for the reader, and the rule that stops it being forgotten.
+
+Every endpoint was reachable by anyone who could route to the host, and the surface is
+not merely "read my papers": ``/api/model/download`` pulls arbitrary Hugging Face repos
+onto the disk using the operator's ``HF_TOKEN``, ``/api/ask`` is free inference on their
+GPU, ``/api/fetch`` makes their machine crawl arXiv, and the memory and taste endpoints
+delete their library. On a home LAN that was a documented trade. On a café network, a
+conference network, or a tunnel to the internet it is not a trade, it is a mistake.
+
+**The design decision that matters is fail-closed.** A token is *required* whenever the
+server binds to anything other than loopback, and `lara serve --host 0.0.0.0` without one
+refuses to start rather than coming up unprotected. Security that depends on remembering
+a flag is security that lasts until the first hurried evening.
+
+Three ways to present the token, because three different callers need it:
+
+``Authorization: Bearer``  scripts and ``curl``
+``?token=``                the first click of a link you sent yourself
+``lara_auth`` cookie       every request after that, so the token leaves the URL
+
+The query parameter is accepted once and immediately traded for a cookie via a redirect,
+so the secret does not linger in browser history, in the Referer header of any outbound
+link, or in the server log of whatever the reader clicks next.
+
+Comparison is constant-time. The margin is theoretical over a LAN and free to obtain.
+"""
+
+from __future__ import annotations
+
+import hmac
+import os
+import secrets
+from urllib.parse import urlencode, urlsplit, urlunsplit
+
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
+
+COOKIE = "lara_auth"
+
+#: Reachable without a token: the health check, so a tunnel or a load balancer can prove
+#: the process is alive without holding a credential, and the login page itself.
+PUBLIC_PATHS = frozenset({"/healthz", "/login"})
+
+LOOPBACK = frozenset({"127.0.0.1", "::1", "localhost", ""})
+
+
+def is_loopback(host: str | None) -> bool:
+    return (host or "").strip() in LOOPBACK
+
+
+def generate_token() -> str:
+    """A token worth having: 32 bytes of urandom, URL-safe."""
+    return secrets.token_urlsafe(32)
+
+
+def resolve_token(cfg) -> str | None:
+    """The configured token. Environment wins, so it need never be written to disk."""
+    env = os.environ.get("LARA_TOKEN")
+    if env and env.strip():
+        return env.strip()
+    try:
+        tok = cfg.get_in("serving.auth.token")
+    except Exception:
+        tok = None
+    return tok.strip() if isinstance(tok, str) and tok.strip() else None
+
+
+def require_token_for(host: str, cfg) -> bool:
+    """Whether this bind address demands a token.
+
+    ``serving.auth.mode`` is ``auto`` by default: off on loopback, mandatory everywhere
+    else. ``always`` demands one even on loopback, for a shared machine. ``off`` disables
+    the check entirely and exists so that someone who genuinely wants the old behaviour
+    has to say so in writing.
+    """
+    mode = "auto"
+    try:
+        mode = (cfg.get_in("serving.auth.mode") or "auto").strip().lower()
+    except Exception:
+        pass
+    if mode == "off":
+        return False
+    if mode == "always":
+        return True
+    return not is_loopback(host)
+
+
+class TokenAuthMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app, token: str) -> None:
+        super().__init__(app)
+        self.token = token
+
+    def _ok(self, presented: str | None) -> bool:
+        # compare_digest rather than ==, and on bytes, so a unicode token cannot raise.
+        return bool(presented) and hmac.compare_digest(
+            presented.encode("utf-8"), self.token.encode("utf-8"))
+
+    async def dispatch(self, request, call_next):
+        if request.url.path in PUBLIC_PATHS:
+            return await call_next(request)
+
+        if self._ok(request.cookies.get(COOKIE)):
+            return await call_next(request)
+
+        header = request.headers.get("authorization", "")
+        if header.lower().startswith("bearer ") and self._ok(header[7:].strip()):
+            return await call_next(request)
+
+        q = request.query_params.get("token")
+        if self._ok(q):
+            # Trade the query parameter for a cookie and drop it from the URL, so the
+            # token does not survive in history or leak through Referer.
+            parts = urlsplit(str(request.url))
+            kept = [(k, v) for k, v in request.query_params.multi_items() if k != "token"]
+            clean = urlunsplit((parts.scheme, parts.netloc, parts.path,
+                                urlencode(kept), parts.fragment))
+            resp = RedirectResponse(clean, status_code=303)
+            resp.set_cookie(COOKIE, self.token, httponly=True, samesite="lax",
+                            max_age=60 * 60 * 24 * 365,
+                            secure=request.url.scheme == "https")
+            return resp
+
+        if "text/html" in request.headers.get("accept", ""):
+            return HTMLResponse(_LOGIN_HTML, status_code=401)
+        return JSONResponse({"error": "authentication required"}, status_code=401)
+
+
+_LOGIN_HTML = """<!doctype html><meta charset=utf-8>
+<title>lara — sign in</title>
+<style>
+ body{font:15px/1.55 system-ui,sans-serif;background:#0f1216;color:#e8ecf4;
+      display:grid;place-items:center;height:100vh;margin:0}
+ form{background:#171b21;border:1px solid #262c35;border-radius:10px;padding:26px 28px;
+      width:min(92vw,380px)}
+ h1{font-size:15px;margin:0 0 4px;letter-spacing:.08em;text-transform:uppercase;color:#8b95a5}
+ p{color:#8b95a5;font-size:13px;margin:0 0 16px}
+ input{width:100%;box-sizing:border-box;padding:9px 11px;border-radius:7px;
+       border:1px solid #262c35;background:#0f1216;color:#e8ecf4;font:inherit}
+ button{margin-top:12px;width:100%;padding:9px;border:0;border-radius:7px;
+        background:#4aa8ff;color:#08111f;font:inherit;font-weight:600;cursor:pointer}
+</style>
+<form method=get action="/">
+  <h1>lara</h1>
+  <p>This reader is password protected. Paste the access token to continue.</p>
+  <input name=token type=password autofocus autocomplete=current-password placeholder="access token">
+  <button type=submit>Sign in</button>
+</form>"""
