@@ -614,7 +614,16 @@ async def fetch_fulltext(arxiv_id: str) -> JSONResponse:
     row = s.paper(arxiv_id)
     if row is None:
         raise HTTPException(404, f"{arxiv_id} not in corpus")
-    if row["fulltext_status"] == "ok":
+
+    # `fulltext_status='ok'` means the chunks were indexed, NOT that the HTML needed to
+    # render the paper is on disk. Those are the same fact only on a machine that did
+    # the crawl: the published `core` tier ships chunks and vectors while the raw HTML
+    # lives in `archive` (~40 GB), so a normal install has 368k papers marked ok and no
+    # renderable bytes for any of them. Returning early on the status alone meant the
+    # reader asked for full text, was told "already have it", re-requested the paper,
+    # got the same empty html, and sat on a spinner forever showing just the abstract.
+    already_indexed = row["fulltext_status"] == "ok" and (row["n_chunks"] or 0) > 0
+    if already_indexed and s.raw_html_path(arxiv_id) is not None:
         return JSONResponse({"status": "ok", "cached": True})
     if arxiv_id in _fetching:
         # Opening the same paper twice must not start two crawls of it.
@@ -648,6 +657,11 @@ async def fetch_fulltext(arxiv_id: str) -> JSONResponse:
             try:
                 if result.raw and result.source:
                     fetcher.write_raw(arxiv_id, result.source, result.raw)
+                # The chunks and their vectors are already there; this fetch existed only
+                # to put renderable HTML on disk. Re-persisting would duplicate rows and
+                # re-embedding would spend GPU time reproducing vectors we already have.
+                if already_indexed:
+                    return int(row["n_chunks"] or 0)
                 n = ft.persist(conn, result)
                 # Just this paper's chunks — an unfiltered run would drain the whole
                 # crawl backlog and turn one click into a multi-minute request.

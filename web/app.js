@@ -95,10 +95,20 @@ async function fetchFullText(id) {
     const d = await r.json();
     if (d.status === "ok") {
       const fresh = await api(`/api/paper/${encodeURIComponent(id)}`);
-      if (state.paper === id && fresh.html) {
+      if (state.paper !== id) return;            // reader moved on while we waited
+      if (fresh.html) {
         $("#paper").innerHTML = fresh.html;
         applyHeatmap();
         setStatus(`fetched ${d.chunks || fresh.n_chunks} chunks via ${d.source || "cache"}`);
+      } else {
+        /* "ok" with nothing to render. The status tracks indexed chunks, not renderable
+         * HTML, so this means the fetch could not put a document on disk. Say so instead
+         * of leaving the spinner up forever, which is what it used to do. */
+        const el = $("#paper").querySelector(".fetching");
+        if (el) el.innerHTML =
+          `Indexed, but no renderable copy could be retrieved. ` +
+          `<a href="https://arxiv.org/abs/${id}" target="_blank" rel="noopener">Open on arXiv</a>`;
+        setStatus("full text not renderable", "error");
       }
     } else if (d.status === "in_progress") {
       setTimeout(() => fetchFullText(id), 2500);
