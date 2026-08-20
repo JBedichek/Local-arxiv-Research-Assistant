@@ -271,6 +271,61 @@ Three things worth trying next, in order:
 
 ---
 
+### The learning-rate sweep at batch 512 (2026-08-19)
+
+The obvious objection to the k-fold result was that the learning rate was wrong: 5e-5 was
+chosen by backing away from a 2e-3 run that destroyed the encoder, not by measurement. So
+the whole range was swept at a much larger batch, with early stopping deciding the length
+of each run.
+
+`lara lr-sweep` — 14,041 triples from 450 queries (`--max-per-query 32`), batch **512**
+reached by gradient accumulation over micro-batches of 64, Muon, cosine schedule, up to 4
+epochs, early stopping on an inner query-split. Scored on 25 % of queries held out from
+every run. `lr_adam` scales with `lr_muon` at the recipe's 5:1 ratio, so the sweep varies
+one thing.
+
+Baseline on the held-out queries: pair_acc **0.9066**, spearman **0.6977**, margin_mae
+**0.5670**.
+
+| muon lr | steps | early stop | pair_acc | spearman | margin_mae |
+|---|---:|---|---|---|---|
+| 1e-5 | 68 | no | 0.9106 (+0.0040) | **0.6994 (+0.0017)** | 0.5334 (−0.0335) |
+| 3e-5 | 68 | no | 0.9128 (+0.0062) | 0.6933 (−0.0044) | 0.4832 (−0.0838) |
+| 1e-4 | 45 | yes | 0.8930 (−0.0136) | 0.6631 (−0.0346) | **0.4430 (−0.1240)** |
+| 3e-4 | 25 | yes | 0.9089 (+0.0023) | 0.6801 (−0.0176) | 0.4474 (−0.1196) |
+| 1e-3 | 20 | yes | **0.9143 (+0.0076)** | 0.6859 (−0.0118) | 0.4568 (−0.1102) |
+| 3e-3 | 20 | yes | 0.8744 (−0.0323) | 0.6079 (−0.0898) | 0.4646 (−0.1024) |
+
+**No learning rate makes the model better at ranking.** Rank correlation fell at five of
+six, and the one that rose did so by +0.0017 — against a fold-to-fold standard deviation of
+±0.0287 measured in the k-fold run, so about a sixteenth of the noise. It is also the
+lowest rate in the sweep, the one that moves the weights least. Pairwise accuracy's best
+showing, +0.0076, sits inside a ±0.0328 spread the same way.
+
+Margin error improved at **every** rate, monotonically with LR up to 1e-4 and then
+plateauing. That is the quantity MarginMSE minimises.
+
+So the shape of the k-fold result survives a 4× larger batch and two and a half orders of
+magnitude of learning rate: **the optimised quantity improves and the ranking metrics do
+not.** That rules out the learning rate as the explanation, which is what this sweep was
+for. The remaining candidate is the one listed first above — the objective is a regression
+on score gaps, and ranking is not what it optimises.
+
+Two details worth carrying forward:
+
+- **3e-3 damages the encoder** (−0.0323 pair_acc, −0.0898 spearman) even at batch 512. The
+  original 2e-3 failure was not purely a small-batch artefact; Muon's per-matrix update
+  normalisation makes high rates dangerous on a pretrained encoder regardless of batch.
+- **Early stopping fired at four of six rates**, always at the higher ones, and always well
+  before the cosine schedule annealed. The `epochs`-as-cap warning above still applies: the
+  1e-3 run stopped at step 20 of 68 with the LR still near peak.
+
+These numbers are not directly comparable to the k-fold table above. `--max-per-query 32`
+admits more pairs per query than the default 8, which raises the baseline pair_acc from
+0.82 to 0.91 by including easier pairs. Compare shapes, not absolute values.
+
+---
+
 ## 6. Guarding against fooling yourself
 
 The generator, the judge and the student are all the same family of model, so this pipeline

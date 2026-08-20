@@ -472,6 +472,81 @@ def explore(
     conn.close()
 
 
+@app.command("lr-sweep")
+def lr_sweep(
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    lrs: str = typer.Option("1e-5,3e-5,1e-4,3e-4,1e-3", help="Muon LRs, comma-separated"),
+    batch_size: int = typer.Option(512, help="Optimiser batch (reached by accumulation)"),
+    micro_batch: int = typer.Option(64, help="Sequences per forward pass; 0 = no accumulation"),
+    epochs: int = typer.Option(4),
+    max_per_query: int = typer.Option(32, help="Triples per query when building the set"),
+    patience: int = typer.Option(3, help="Evals without improvement before stopping (0=off)"),
+    eval_every: int = typer.Option(5, help="Steps between validation passes"),
+    val_frac: float = typer.Option(0.25, help="Held-out query fraction for scoring"),
+    device: str = typer.Option(None, help="Override device; default auto-detects"),
+    out: str = typer.Option(None, help="Write the sweep table as JSON"),
+) -> None:
+    """Sweep the Muon learning rate at a fixed recipe, scored on held-out queries.
+
+    Every run starts from the same pretrained checkpoint on the same query-split, so the
+    only variable is the learning rate. Early stopping runs against an inner split of the
+    training half, never against the slice the results are reported on.
+    """
+    import json as _json
+
+    from lara.finetune import kfold as KF
+    from lara.store import db
+
+    cfg = config_mod.load(config)
+    conn = db.connect(cfg.get_path("paths.metadata_db"))
+    triples = KF.make_triples(conn, max_per_query=max_per_query)
+    n_q = len({t.query_hash for t in triples})
+    grid = [float(x) for x in lrs.split(",") if x.strip()]
+
+    rec = KF.Recipe(batch_size=batch_size, micro_batch=micro_batch, epochs=epochs,
+                    patience=patience, eval_every=eval_every)
+    per_epoch = int(len(triples) * (1 - val_frac) * (1 - rec.inner_val_frac)) // batch_size
+    console.print(
+        f"[bold]{len(triples):,}[/bold] triples from {n_q:,} queries · "
+        f"batch {batch_size} (micro {micro_batch or batch_size}) · "
+        f"~{per_epoch} steps/epoch x {epochs} epochs · {len(grid)} learning rates"
+    )
+    if per_epoch < 4:
+        console.print(
+            "[yellow]few steps per epoch[/yellow] — at this batch size the sweep is mostly "
+            "measuring noise. Raise --max-per-query or lower --batch-size."
+        )
+
+    def reporter():
+        while True:
+            s = yield
+            if s.get("early_stop"):
+                console.print(f"      [yellow]early stop[/yellow] step {s['step']}  "
+                              f"best val {s['best_val']:.4f}")
+                continue
+            v = s.get("val_loss")
+            console.print(f"      step {s['step']:>4}/{s['steps']}  loss {s['loss']:8.4f}  "
+                          f"lr {s['lr']:.2e}" + (f"  val {v:7.4f}" if v is not None else ""))
+
+    p = reporter(); next(p)
+    rows = []
+    for lr in grid:
+        console.print(f"\n[bold]muon lr {lr:.1e}[/bold]")
+        rows += KF.sweep(triples, cfg.get_in("embedding.model"), device, rec, [lr],
+                         val_frac=val_frac, progress=p)
+        console.print("  " + _json.dumps({k: rows[-1][k] for k in
+                                          ("steps", "early_stopped", "d_pair_acc",
+                                           "d_spearman", "d_margin_mae")}))
+
+    console.print("\n" + KF.format_sweep(rows))
+    if out:
+        _P = __import__("pathlib").Path(out)
+        _P.parent.mkdir(parents=True, exist_ok=True)
+        _P.write_text(_json.dumps(rows, indent=1))
+        console.print(f"\nwrote {out}")
+    conn.close()
+
+
 @app.command("fit-check")
 def fit_check(
     config: str = typer.Option(None, help="Path to config.yaml"),

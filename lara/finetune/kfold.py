@@ -180,6 +180,12 @@ class Recipe:
     lr_muon: float = 5e-5          # was 2e-3 — 40x lower
     lr_adam: float = 1e-5          # was 2e-5
     batch_size: int = 128          # was 16, then 64 — steadier gradient still
+    # Sequences per forward pass. `batch_size` is the OPTIMISER batch and is reached by
+    # accumulating gradients over micro-batches, because one step encodes three sequences
+    # per triple — query, positive, negative — so batch 512 is 1,536 sequences and does
+    # not fit alongside its own backward pass on a 96 GB card. Accumulation makes the
+    # optimiser batch a free parameter instead of a memory limit; 0 disables it.
+    micro_batch: int = 64
     epochs: int = 4                # upper bound; early stopping decides the real number
     weight_decay: float = 0.01
     warmup_frac: float = 0.1
@@ -311,18 +317,27 @@ def train_on(triples: list[Triple], model_name: str, device: str, rec: Recipe,
             for g, b in zip(opt.param_groups, base):
                 g["lr"] = b * scale
 
-            with dev.autocast(device):
-                q = _encode(model, [QUERY_PREFIX + t.query for t in part], device)
-                p = _encode(model, [DOC_PREFIX + t.pos_text for t in part], device)
-                n = _encode(model, [DOC_PREFIX + t.neg_text for t in part], device)
-                tm = torch.tensor([t.margin for t in part], device=device)
-                loss = margin_mse(q.float(), p.float(), n.float(), tm, rec.margin_scale)
-
+            # Accumulate to the full optimiser batch. Each micro-batch's mean loss is
+            # weighted by its share of the batch, so the accumulated gradient equals the
+            # gradient of the mean over the whole batch — not the mean of per-micro-batch
+            # gradients, which differ whenever the last micro-batch is short.
+            micro = rec.micro_batch or len(part)
             opt.zero_grad(set_to_none=True)
-            loss.backward()
+            total = 0.0
+            for j in range(0, len(part), micro):
+                sub_part = part[j:j + micro]
+                with dev.autocast(device):
+                    q = _encode(model, [QUERY_PREFIX + t.query for t in sub_part], device)
+                    p = _encode(model, [DOC_PREFIX + t.pos_text for t in sub_part], device)
+                    n = _encode(model, [DOC_PREFIX + t.neg_text for t in sub_part], device)
+                    tm = torch.tensor([t.margin for t in sub_part], device=device)
+                    loss = margin_mse(q.float(), p.float(), n.float(), tm, rec.margin_scale)
+                (loss * (len(sub_part) / len(part))).backward()
+                total += float(loss.detach()) * (len(sub_part) / len(part))
             torch.nn.utils.clip_grad_norm_(model.parameters(), rec.grad_clip)
             opt.step()
             step += 1
+            loss = torch.tensor(total)
 
             vl = None
             if val_triples and step % rec.eval_every == 0:
@@ -356,3 +371,82 @@ def train_on(triples: list[Triple], model_name: str, device: str, rec: Recipe,
     model.best_val_loss = best_loss if best_state is not None else None
     model.steps_trained = step
     return model
+
+
+def sweep(triples: list[Triple], model_name: str, device: str, rec: Recipe,
+          lrs: list[float], *, val_frac: float = 0.25, seed: int = 0,
+          progress=None) -> list[dict]:
+    """Learning-rate sweep at a fixed recipe, scored on held-out queries.
+
+    Each LR trains from the same pretrained checkpoint on the same split, so the only
+    difference between runs is the learning rate. The split is **by query**, matching the
+    outer folds: sharing a query across train and validation would let a run score well by
+    memorising a paraphrase of the thing it is being tested on.
+
+    ``lr_adam`` is scaled with ``lr_muon`` rather than held fixed. The two exist in a ratio
+    the recipe already chose (5:1); pinning Adam while sweeping Muon would silently change
+    that ratio across the sweep and confound "which learning rate" with "which balance
+    between the two optimisers".
+
+    Returns one record per LR, in the order given, each carrying the before/after metrics
+    on the held-out slice and what early stopping did.
+    """
+    train, val = inner_split(triples, val_frac, seed)
+    if not val:
+        raise ValueError("val split is empty — too few distinct queries")
+
+    from lara.index.embed import load_model
+
+    base = load_model(model_name, device=dev.resolve(device), max_seq_length=rec.max_seq_length)
+    before = evaluate(base, val, dev.resolve(device))
+    del base
+    dev.empty_cache(device)
+
+    ratio = rec.lr_adam / rec.lr_muon if rec.lr_muon else 0.2
+    out: list[dict] = []
+    for lr in lrs:
+        r = replace(rec, lr_muon=lr, lr_adam=lr * ratio, seed=seed)
+        # The inner split is carved from `train` only, so the sweep's validation slice
+        # never influences early stopping *and* never influences the reported number.
+        inner_train, inner_val = inner_split(train, rec.inner_val_frac, seed + 1)
+        model = train_on(list(inner_train), model_name, device, r,
+                         progress=progress, val_triples=inner_val)
+        after = evaluate(model, val, dev.resolve(device))
+        out.append({
+            "lr_muon": lr,
+            "lr_adam": lr * ratio,
+            "steps": getattr(model, "steps_trained", None),
+            "early_stopped": bool(getattr(model, "stopped_early", False)),
+            "best_val_loss": getattr(model, "best_val_loss", None),
+            "before": before,
+            "after": after,
+            "d_pair_acc": after["pair_acc"] - before["pair_acc"],
+            "d_spearman": (after["spearman"] - before["spearman"])
+                          if (after["spearman"] is not None and before["spearman"] is not None)
+                          else None,
+            "d_margin_mae": after["margin_mae"] - before["margin_mae"],
+        })
+        del model
+        dev.empty_cache(device)
+    return out
+
+
+def format_sweep(rows: list[dict]) -> str:
+    """One line per learning rate. Deltas, because the absolute numbers hide small moves."""
+    if not rows:
+        return "(no sweep rows)"
+    b = rows[0]["before"]
+    head = (f"baseline on held-out queries: pair_acc {b['pair_acc']:.4f}  "
+            f"spearman {b['spearman']:.4f}  margin_mae {b['margin_mae']:.4f}\n\n"
+            f"{'lr_muon':>9} {'steps':>6} {'stop':>5} "
+            f"{'pair_acc':>18} {'spearman':>18} {'margin_mae':>18}\n")
+    lines = []
+    for r in rows:
+        a = r["after"]
+        sp = f"{a['spearman']:.4f} ({r['d_spearman']:+.4f})" if r["d_spearman"] is not None else "n/a"
+        lines.append(
+            f"{r['lr_muon']:>9.1e} {str(r['steps']):>6} {'yes' if r['early_stopped'] else 'no':>5} "
+            f"{a['pair_acc']:.4f} ({r['d_pair_acc']:+.4f}) {sp:>18} "
+            f"{a['margin_mae']:.4f} ({r['d_margin_mae']:+.4f})"
+        )
+    return head + "\n".join(lines)
