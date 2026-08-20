@@ -166,7 +166,15 @@ def encode_batch(model, texts: list[str], device: str) -> torch.Tensor:
 
 
 def train(conn: sqlite3.Connection, cfg: TrainConfig, progress=None):
-    from muon import SingleDeviceMuonWithAuxAdam
+    try:
+        from muon import SingleDeviceMuonWithAuxAdam
+    except ImportError as exc:      # noqa: F401 - re-raised with instructions
+        raise ImportError(
+            "the Muon optimiser is not installed. It is not on PyPI under that name -- "
+            "`pip install muon` fetches an unrelated omics package that will import but "
+            "not provide SingleDeviceMuonWithAuxAdam. Install from source:\n"
+            "    pip install git+https://github.com/KellerJordan/Muon"
+        ) from exc
     from sentence_transformers import SentenceTransformer
 
     from lara.finetune import evaluate as EV

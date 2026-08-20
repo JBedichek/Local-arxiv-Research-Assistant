@@ -334,7 +334,15 @@ def train_on(triples: list[Triple], model_name: str, device: str, rec: Recipe,
     evaluations without improvement. The best checkpoint is restored before returning — not
     the last one, which is the whole point of measuring.
     """
-    from muon import SingleDeviceMuonWithAuxAdam
+    try:
+        from muon import SingleDeviceMuonWithAuxAdam
+    except ImportError as exc:      # noqa: F401 - re-raised with instructions
+        raise ImportError(
+            "the Muon optimiser is not installed. It is not on PyPI under that name -- "
+            "`pip install muon` fetches an unrelated omics package that will import but "
+            "not provide SingleDeviceMuonWithAuxAdam. Install from source:\n"
+            "    pip install git+https://github.com/KellerJordan/Muon"
+        ) from exc
     from sentence_transformers import SentenceTransformer
 
     from lara.finetune.train import margin_mse, split_param_groups
@@ -616,7 +624,15 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
     backward with the cached gradient. The result is the exact full-batch gradient at the
     memory cost of one micro-batch, paid for with a second forward pass.
     """
-    from muon import SingleDeviceMuonWithAuxAdam
+    try:
+        from muon import SingleDeviceMuonWithAuxAdam
+    except ImportError as exc:      # noqa: F401 - re-raised with instructions
+        raise ImportError(
+            "the Muon optimiser is not installed. It is not on PyPI under that name -- "
+            "`pip install muon` fetches an unrelated omics package that will import but "
+            "not provide SingleDeviceMuonWithAuxAdam. Install from source:\n"
+            "    pip install git+https://github.com/KellerJordan/Muon"
+        ) from exc
     from sentence_transformers import SentenceTransformer
 
     from lara.finetune.train import split_param_groups

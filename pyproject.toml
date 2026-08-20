@@ -51,6 +51,11 @@ dependencies = [
   # serving
   "fastapi>=0.115",
   "uvicorn[standard]>=0.32",
+  # Imported directly -- middleware, responses and run_in_threadpool -- not merely
+  # through FastAPI. It happens to be installed because FastAPI depends on it, which is
+  # exactly why this was missing: it has never once failed. Declared so the day FastAPI
+  # changes what it pins is not the day the reader stops importing.
+  "starlette>=0.40",
 ]
 
 [project.optional-dependencies]
@@ -82,6 +87,13 @@ ingest = ["pymupdf>=1.24"]
 # Generation backends. llama.cpp is a binary, not a package — `brew install llama.cpp`.
 vllm = ["vllm>=0.10; sys_platform == 'linux'"]
 serve = ["vllm>=0.10; sys_platform == 'linux'"]   # legacy alias for `vllm`
+# Fine-tuning the embedder (`lara finetune`) needs the Muon optimiser, which is NOT
+# declarable here: `pip install muon` fetches "Multimodal omics analysis framework", an
+# unrelated project that owns the name on PyPI. Installing it would satisfy the import
+# and then fail on the symbol, which is worse than not having it. Install from source:
+#     pip install git+https://github.com/KellerJordan/Muon
+# Everything except `lara finetune` works without it.
+finetune = []
 dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.7", "mypy>=1.13"]
 
 [project.scripts]
