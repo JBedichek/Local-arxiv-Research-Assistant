@@ -28,4 +28,6 @@ web/dist/
 
 # Local overrides
 config.local.yaml
+# `lara setup` timestamps a backup of the previous file before rewriting it.
+config.local.yaml.bak.*
 .env
