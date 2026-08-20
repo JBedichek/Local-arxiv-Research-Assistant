@@ -53,6 +53,7 @@
       <select id="heat-mode">
         <option value="answer">similar to the answer passage</option>
         <option value="query">similar to my question</option>
+        <option value="taste">matches my taste profile</option>
         <option value="off">off</option>
       </select>
     </label>
@@ -151,6 +152,14 @@
     </h2>
     <canvas id="graph"></canvas>
     <div id="graph-tip" hidden></div>
+
+    <div id="taste-pane" hidden>
+      <h3>For you
+        <small id="taste-count"></small>
+        <button type="button" id="taste-recommend" title="Passages from anywhere in the corpus">corpus</button>
+      </h3>
+      <div id="taste-list"></div>
+    </div>
   </section>
 
   <div class="splitter" id="split-left" title="Drag to resize · double-click to reset"></div>
@@ -193,7 +202,10 @@
   </section>
 </main>
 
-<button id="ask-float" hidden>Ask about this</button>
+<div id="sel-float" hidden>
+  <button id="ask-float" type="button">Ask about this</button>
+  <button id="taste-float" type="button" title="Add to your taste profile">★ Interesting</button>
+</div>
 <script type="module" src="/app.js"></script>
 </body>
 </html>

@@ -322,3 +322,92 @@ def set_prompt(root: Path, text: str | None) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, p)
+
+
+# ── taste profile ────────────────────────────────────────────────────────────────────
+
+TASTE_NAME = "taste.json"
+
+
+def _taste_path(root: Path) -> Path:
+    return Path(root) / TASTE_NAME
+
+
+def load_taste(root: Path) -> dict:
+    """Marks the reader made on passages they found interesting.
+
+    Kept in its own file rather than in ``library.json``. The library is fetched on every
+    page load to draw the tree; the taste profile is read when scoring a paper and written
+    when a passage is marked, and the two would otherwise contend on the same lock and the
+    same serialisation for no reason.
+    """
+    p = _taste_path(root)
+    if not p.exists():
+        return {"version": 1, "marks": []}
+    try:
+        data = json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError):
+        try:
+            p.rename(p.with_suffix(f".corrupt-{int(time.time())}.json"))
+        except OSError:
+            pass
+        return {"version": 1, "marks": []}
+    if not isinstance(data, dict):
+        return {"version": 1, "marks": []}
+    data.setdefault("marks", [])
+    return data
+
+
+def save_taste(root: Path, data: dict) -> None:
+    p = _taste_path(root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(".tmp")
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=1, ensure_ascii=False)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, p)
+
+
+def record_taste(root: Path, *, chunk_id: int, vector_row: int, arxiv_id: str = "",
+                 title: str = "", text: str = "", note: str = "") -> dict:
+    """Mark one passage as interesting. Marking the same chunk twice is not an error.
+
+    Re-marking updates the note and timestamp instead of adding a duplicate: the profile
+    is a set of positions in embedding space, and the same position twice would silently
+    double that interest's weight in every reduction that sums.
+    """
+    with _LOCK:
+        data = load_taste(root)
+        for m in data["marks"]:
+            if m.get("chunk_id") == chunk_id:
+                m["updated_utc"] = _now()
+                if note:
+                    m["note"] = note
+                save_taste(root, data)
+                return m
+        mark = {
+            "id": uuid.uuid4().hex[:12],
+            "chunk_id": int(chunk_id),
+            "vector_row": int(vector_row),
+            "arxiv_id": arxiv_id,
+            "title": title,
+            "text": (text or "")[:400],
+            "note": note or "",
+            "created_utc": _now(),
+            "updated_utc": _now(),
+        }
+        data["marks"].append(mark)
+        save_taste(root, data)
+        return mark
+
+
+def delete_taste(root: Path, mark_id: str) -> bool:
+    with _LOCK:
+        data = load_taste(root)
+        before = len(data["marks"])
+        data["marks"] = [m for m in data["marks"] if m["id"] != mark_id]
+        if len(data["marks"]) == before:
+            return False
+        save_taste(root, data)
+        return True

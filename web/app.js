@@ -81,6 +81,7 @@ async function openPaper(id, fragment, push = true) {
     setStatus("");
     loadGraph();
     loadLibrary();          // the server recorded this visit while serving the paper
+    renderTaste();          // "where should I jump" is per-paper
     if (fragment) scrollToAnchor(fragment);
     applyHeatmap();
   } catch (err) {
@@ -209,11 +210,13 @@ document.addEventListener("selectionchange", () => {
 function handleSelection() {
   const sel = document.getSelection();
   const text = sel && String(sel).trim();
-  const float = $("#ask-float");
+  const float = $("#sel-float");
   if (!text || text.length < 12 || !$("#paper").contains(sel.anchorNode)) {
     float.hidden = true;
     return;
   }
+  $("#taste-float").classList.remove("done");
+  $("#taste-float").textContent = "\u2605 Interesting";
   // Highlighting is not the same as asking. People select text to read it, to copy it, or
   // to keep their place; attaching it to the prompt automatically hijacks an ordinary
   // reading gesture. The passage is only staged as context once "Ask about this" is
@@ -245,7 +248,7 @@ function clearSelectionContext() {
   state.candidate = null;
   state.pendingHits = null;
   $("#selection-chip").hidden = true;
-  $("#ask-float").hidden = true;
+  $("#sel-float").hidden = true;
   // Collapse the document selection too. Without this the browser keeps the range, the
   // debounced selectionchange handler fires again, and the chip reappears — which is why
   // the dismiss button looked like it did nothing.
@@ -257,8 +260,29 @@ $("#ask-float").addEventListener("click", () => {
   if (!state.candidate) return;
   state.selection = state.candidate;      // promote only on explicit request
   showSelectionChip(state.selection);
-  $("#ask-float").hidden = true;
+  $("#sel-float").hidden = true;
   $("#question").focus();
+});
+
+/* Marking is deliberately NOT dismissing: a reader marking a passage is often about to
+ * ask about it too, and closing the popup would make the two actions mutually exclusive. */
+$("#taste-float").addEventListener("click", async () => {
+  if (!state.candidate || !state.paper) return;
+  const btn = $("#taste-float");
+  btn.textContent = "…";
+  try {
+    await api("/api/taste/mark", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ arxiv_id: state.paper, text: state.candidate }),
+    });
+    btn.textContent = "\u2605 Saved";
+    btn.classList.add("done");
+    loadTaste();
+    if (prefs.get("heatMode", "answer") === "taste") applyHeatmap();
+  } catch (err) {
+    btn.textContent = "failed";
+    setStatus(String(err.message || err), "error");
+  }
 });
 
 function retrieve(query, selection) {
@@ -1051,6 +1075,92 @@ $("#lib-tree")?.addEventListener("dragend", () => {
   $("#lib-tree")?.classList.remove("drop-root");
 });
 
+/* ================= taste profile ================= */
+
+/* The reader's marked passages, as a set of positions in embedding space. Deliberately a
+ * SET and not a centroid: summing cosine similarities is arithmetically identical to
+ * searching once with the summed vector, so "average my interests" and "add up their
+ * similarities" are the same operation, and both match the midpoint between optimisers and
+ * retrieval rather than either. The reductions that keep interests distinct — max, and the
+ * LogSumExp soft maximum the server defaults to — are the reason the marks are kept apart.
+ * See TASTE_REDUCTIONS in lara/serve/app.py. */
+
+let tasteMarks = 0;
+let tasteScope = "paper";       // paper | corpus
+
+async function loadTaste() {
+  try {
+    const d = await api("/api/taste");
+    tasteMarks = d.n || 0;
+  } catch {
+    tasteMarks = 0;
+  }
+  renderTaste();
+}
+
+function tasteBar(score, best) {
+  const w = Math.max(3, Math.round(46 * (best > 0 ? score / best : 0)));
+  return `<span class="bar" style="width:${w}px"></span>`;
+}
+
+async function renderTaste() {
+  const pane = $("#taste-pane"), list = $("#taste-list"), count = $("#taste-count");
+  if (!pane) return;
+  pane.hidden = tasteMarks === 0 && tasteScope === "paper";
+  if (count) count.textContent = tasteMarks ? `${tasteMarks} marked` : "";
+  if (!tasteMarks) {
+    list.innerHTML = `<p class="taste-empty">Highlight a passage you found interesting and
+      press <b>★ Interesting</b>. Once a few are saved, the passages worth jumping to
+      appear here.</p>`;
+    pane.hidden = false;
+    return;
+  }
+  $("#taste-recommend").classList.toggle("on", tasteScope === "corpus");
+
+  let data;
+  try {
+    data = tasteScope === "corpus"
+      ? await api("/api/taste/recommend?k=12")
+      : (state.paper ? await api(`/api/taste/paper/${encodeURIComponent(state.paper)}?k=10`)
+                     : { chunks: [] });
+  } catch {
+    list.innerHTML = `<p class="taste-empty">could not score against your profile</p>`;
+    return;
+  }
+  const chunks = data.chunks || [];
+  if (!chunks.length) {
+    list.innerHTML = `<p class="taste-empty">${
+      tasteScope === "corpus" ? "no matches yet" : "open a paper to see where to jump"}</p>`;
+    return;
+  }
+  const best = Math.max(...chunks.map((c) => c.score));
+  list.innerHTML = chunks.map((c) => `
+    <button class="taste-item" data-anchor="${escapeHtml(c.anchor || "")}"
+            data-start="${c.char_start}" data-end="${c.char_end}"
+            data-endanchor="${escapeHtml(c.anchor_end || c.anchor || "")}"
+            data-paper="${escapeHtml(c.arxiv_id || "")}">
+      ${tasteBar(c.score, best)}${escapeHtml((c.preview || "").slice(0, 96))}…
+      <div class="src">${c.score.toFixed(3)}${
+        c.title ? " · " + escapeHtml(c.title.slice(0, 40)) : ""}</div>
+    </button>`).join("");
+}
+
+$("#taste-list")?.addEventListener("click", async (ev) => {
+  const b = ev.target.closest(".taste-item");
+  if (!b) return;
+  const frag = `#${b.dataset.anchor}:${b.dataset.start}-${b.dataset.end}`;
+  if (b.dataset.paper && b.dataset.paper !== state.paper) {
+    await openPaper(b.dataset.paper, frag);
+  } else {
+    scrollToAnchor(frag);
+  }
+});
+
+$("#taste-recommend")?.addEventListener("click", () => {
+  tasteScope = tasteScope === "corpus" ? "paper" : "corpus";
+  renderTaste();
+});
+
 /* ================= system prompt ================= */
 
 let promptState = { default: "", custom: null };
@@ -1596,6 +1706,18 @@ async function applyHeatmap() {
   if (mode === "query" && !q) return;
   if (mode === "answer" && !anchorChunk) return;
 
+  // Taste has no per-question reference vector — the profile IS the reference — so it uses
+  // its own endpoint, which reduces a set of vectors rather than scoring against one.
+  if (mode === "taste") {
+    if (!tasteMarks) return;
+    try {
+      const d = await api(
+        `/api/taste/paper/${encodeURIComponent(state.paper)}?k=${Number(prefs.get("heatK", "5"))}`);
+      paintHeatmap(d.chunks || [], mode);
+    } catch { /* decoration only */ }
+    return;
+  }
+
   try {
     const data = await api("/api/heatmap", {
       method: "POST",
@@ -1634,7 +1756,8 @@ function paintHeatmap(chunks, mode) {
   legend.id = "heat-legend";
   legend.innerHTML =
     `<span class="ramp"></span> ${painted} passage${painted === 1 ? "" : "s"} shaded by
-     relevance to ${mode === "answer" ? "the answer passage" : "your question"}
+     relevance to ${ {answer: "the answer passage",
+                      taste: "your taste profile"}[mode] || "your question" }
      <button type="button" id="heat-jump">jump to top passage</button>`;
   $("#paper-meta").append(legend);
   $("#heat-jump").addEventListener("click", () => {
@@ -1660,6 +1783,8 @@ const HEAT_NOTES = {
   answer: "Shades passages similar to the excerpt that answered you — the surrounding "
         + "argument, caveats and ablations.",
   query:  "Shades passages similar to your question — other places the paper discusses it.",
+  taste:  "Shades passages matching what you have marked interesting. Needs no question, "
+        + "so it works the moment a paper opens.",
   off:    "No passage shading.",
 };
 
@@ -1704,6 +1829,7 @@ async function boot() {
   // and awaiting them here would delay the paper for two requests that nothing needs yet.
   loadLibrary();
   loadPrompt();
+  loadTaste();
 
   try {
     const b = await api("/api/breadth");

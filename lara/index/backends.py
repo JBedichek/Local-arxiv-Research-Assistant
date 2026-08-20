@@ -201,6 +201,38 @@ class FaissBackend(_Resident):
         top = np.argsort(-sims)[:min(k, sims.size)]
         return src_rows[top], sims[top].astype(np.float32)
 
+    def search_multi(self, queries: np.ndarray, k: int = 200, reduce: str = "lse",
+                     temp: float = 0.05):
+        """K searches, merged on the host.
+
+        faiss has no reduce-across-queries primitive, so this is approximate in a way the
+        torch path is not: a row that scores moderately against every reference but tops
+        none of their individual result lists is never seen. Widening each search by 4x
+        limits that, and `sum`/`mean` should be collapsed to one vector by the caller
+        anyway.
+        """
+        import numpy as _np
+
+        qs = _np.atleast_2d(_np.asarray(queries, dtype=_np.float32))
+        acc: dict[int, list[float]] = {}
+        for i in range(qs.shape[0]):
+            rows, scores = self.search(qs[i], k=k * 4)
+            for rr, sc in zip(rows, scores):
+                acc.setdefault(int(rr), []).append(float(sc))
+        if not acc:
+            return _np.empty(0, dtype=_np.int64), _np.empty(0, dtype=_np.float32)
+        ids = _np.fromiter(acc.keys(), dtype=_np.int64, count=len(acc))
+        if reduce == "max":
+            vals = _np.array([max(v) for v in acc.values()], dtype=_np.float32)
+        elif reduce in ("sum", "mean"):
+            vals = _np.array([(sum(v) / (len(v) if reduce == "mean" else 1))
+                              for v in acc.values()], dtype=_np.float32)
+        else:
+            vals = _np.array([temp * _np.log(_np.exp(_np.asarray(v) / temp).sum())
+                              for v in acc.values()], dtype=_np.float32)
+        order = _np.argsort(-vals)[:k]
+        return ids[order], vals[order]
+
     def paper_scores(self, query: np.ndarray, rows_by_paper: dict[str, np.ndarray],
                      top_n: int = 3) -> dict[str, float]:
         q = np.ascontiguousarray(np.atleast_2d(query).astype(np.float32))[0]
@@ -311,6 +343,58 @@ class TorchBackend(_Resident):
         top = torch.topk(scores, min(k, subset.numel()), dim=1)
         picked = subset[top.indices[0]].cpu().numpy()
         return self.to_global(picked), top.values[0].float().cpu().numpy()
+
+    def search_multi(self, queries: np.ndarray, k: int = 200, reduce: str = "lse",
+                     temp: float = 0.05):
+        """Score every row against K reference vectors and reduce to one score per row.
+
+        For a taste profile, `sum` and `mean` are not worth calling here: adding cosine
+        similarities is identical to searching once with the summed vector, so the caller
+        should collapse them and use `search`. What this exists for are the reductions that
+        do NOT collapse — `max` and `lse` — where distinct interests must stay distinct.
+
+        Measured on 29.6 M x 256 resident fp16: ~11 ms for one vector and ~16 ms for fifty,
+        because streaming the 15.1 GB matrix dominates and the extra columns ride along
+        almost free. LogSumExp costs more (~52 ms at fifty) — it is the exp/log over the
+        (block x K) block, not the matmul.
+        """
+        q = torch.from_numpy(np.ascontiguousarray(queries, dtype=np.float16)).to(self.device)
+        if q.ndim == 1:
+            q = q.unsqueeze(0)
+        q = torch.nn.functional.normalize(q.float(), dim=1).half()
+
+        best = torch.empty(self.n, device=self.device, dtype=torch.float32)
+        block = self.search_block
+        for s0 in range(0, self.n, block):
+            e0 = min(s0 + block, self.n)
+            sims = self._block_sims(q, s0, e0)                    # (rows, K) float32
+            if reduce == "max":
+                best[s0:e0] = sims.max(dim=1).values
+            elif reduce == "sum":
+                best[s0:e0] = sims.sum(dim=1)
+            elif reduce == "mean":
+                best[s0:e0] = sims.mean(dim=1)
+            else:
+                m = sims.max(dim=1, keepdim=True).values
+                best[s0:e0] = (m[:, 0] + temp * torch.log(
+                    torch.exp((sims - m) / temp).sum(dim=1)))
+            del sims
+        top = torch.topk(best, min(k, self.n))
+        return (self.to_global(top.indices.cpu().numpy()),
+                top.values.float().cpu().numpy())
+
+    def _block_sims(self, q: torch.Tensor, s0: int, e0: int) -> torch.Tensor:
+        """(rows, K) similarities for one block.
+
+        Dequantisation keys on `self.precision`, exactly as `_scores_for` does — the int8
+        rows are stored unnormalised and must be renormalised after the cast, or every
+        similarity comes out scaled by an arbitrary row norm.
+        """
+        raw = self.matrix[s0:e0]
+        if self.precision == "fp16":
+            return (raw @ q.T).float()
+        blk = torch.nn.functional.normalize(raw.float(), dim=1)
+        return blk @ q.T.float()
 
     def paper_scores(self, query: np.ndarray, rows_by_paper: dict[str, np.ndarray],
                      top_n: int = 3) -> dict[str, float]:
