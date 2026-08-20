@@ -339,6 +339,18 @@ lara bench-generate
 > is not MLX-converted, so each backend has its own `model` setting in `config.local.yaml`.
 > Pointing llama.cpp at a safetensors repo fails at load time.
 
+**Where to find each format.** `lara models` prints which one your machine needs, and the
+reader's download dialog links to these directly:
+
+| format | for | where |
+|---|---|---|
+| **GGUF** | llama.cpp, Ollama — **the default on Apple Silicon** | [all GGUF models](https://huggingface.co/models?library=gguf), or [bartowski](https://huggingface.co/bartowski) and [unsloth](https://huggingface.co/unsloth), who build them for most popular models. Take a `Q4_K_M` file to match the 4-bit sizing the wizard quotes |
+| **MLX** | Apple Silicon, opt-in via `--backend mlx` | [mlx-community](https://huggingface.co/mlx-community) — look for a `-4bit` suffix |
+| **safetensors** | vLLM (NVIDIA) | ordinary model pages; this is what most repos ship |
+
+On a Mac, **a plain safetensors repo will not load at all** — that includes the model page
+you get from searching Hugging Face for a model by name. Look for the GGUF build of it.
+
 If you already run Ollama or LM Studio, do nothing: the wizard probes the usual ports and
 adopts whatever is already answering. A server lara did not start is never stopped by it.
 

@@ -702,6 +702,7 @@ def dataset_file(name: str) -> FileResponse:
 @app.get("/api/device")
 def device_info() -> JSONResponse:
     """What this machine is, and which generation backend suits it."""
+    from lara.models import wants_format
     from lara.serve import devices as DV
 
     d = DV.detect()
@@ -718,6 +719,9 @@ def device_info() -> JSONResponse:
         "backend": d.backend, "backend_reason": d.backend_reason, "notes": d.notes,
         "generator_headroom_gb": headroom,
         "generator_max_params_4bit": max_params,
+        # Which weight format this machine's runtime can actually load, so the download
+        # dialog can say so before someone fetches 8 GB of the wrong one.
+        "wants_format": wants_format(d.backend),
     })
 
 
@@ -745,18 +749,30 @@ def model_resolve(req: ResolveRequest) -> JSONResponse:
     }
     if r.exists and r.size_gb:
         body["fit"] = DV.fits(r.size_gb, dev)
-    # Warn rather than block: an architecture our allowlist does not know may still be
-    # servable by a newer vLLM, and refusing the download would be a worse failure than
-    # letting someone try.
-    from lara.models import VLLM_ARCHS
-    if r.arch and r.arch not in VLLM_ARCHS:
-        body["warning"] = (
-            f"{r.arch} is not in the vLLM allowlist this build knows about. It may still "
-            "work; the model picker will list it once downloaded."
-        )
-    if r.n_gguf and not r.n_safetensors:
-        body["warning"] = ("GGUF-only repo. vLLM cannot serve these here (D4) — use "
-                           "llama.cpp or Ollama, which is also the right choice on a Mac.")
+    # Warn rather than block: an architecture an allowlist does not know may still be
+    # servable, and refusing the download would be a worse failure than letting someone
+    # try. Which warning applies depends entirely on the runtime that will load it.
+    from lara.models import FORMAT_HELP, VLLM_ARCHS, wants_format
+    fmt = wants_format(dev.backend)
+    body["backend"] = dev.backend
+    body["wants_format"] = fmt
+    if fmt == "gguf":
+        if not r.n_gguf:
+            body["warning"] = (
+                f"This repo has no GGUF weights, and {dev.backend} cannot load "
+                f"safetensors. {FORMAT_HELP['gguf']}")
+    elif fmt == "mlx":
+        if not r.repo.startswith("mlx-community/"):
+            body["warning"] = (f"This does not look like an MLX conversion. "
+                               f"{FORMAT_HELP['mlx']}")
+    else:
+        if r.arch and r.arch not in VLLM_ARCHS:
+            body["warning"] = (
+                f"{r.arch} is not in the vLLM allowlist this build knows about. It may "
+                "still work; the model picker will list it once downloaded.")
+        if r.n_gguf and not r.n_safetensors:
+            body["warning"] = ("GGUF-only repo, and this machine serves with vLLM, which "
+                               "cannot read GGUF (D4). Use a safetensors build.")
     return JSONResponse(body)
 
 

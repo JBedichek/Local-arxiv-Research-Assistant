@@ -60,11 +60,16 @@ def list_models(
     config: str = typer.Option(None, help="Path to config.yaml"),
     show_all: bool = typer.Option(False, "--all", help="Include unservable repos"),
 ) -> None:
-    """List HF-cached models vLLM can serve (R7)."""
+    """List HF-cached models this machine's generation backend can serve (R7)."""
+    from lara.serve import devices as DV
+
     cfg = config_mod.load(config)
     hf_home = cfg.get_path("huggingface.home")
-    found = models_mod.scan(hf_home)
+    dev = DV.detect()
+    found = models_mod.scan(hf_home, backend=dev.backend)
     usable = [m for m in found if m.servable]
+    console.print(f"[dim]backend [bold]{dev.backend}[/bold], which loads "
+                  f"[bold]{models_mod.wants_format(dev.backend)}[/bold] weights[/dim]")
 
     table = Table(show_header=True, header_style="bold")
     table.add_column("GB", justify="right")
@@ -1307,7 +1312,8 @@ def setup(
                       + (f" serving {model}" if model else "") + "[/dim]")
 
     if not base_url:
-        cached = [m for m in models_mod.scan(cfg.get_path("huggingface.home")) if m.servable]
+        cached = [m for m in models_mod.scan(cfg.get_path("huggingface.home"),
+                                             backend=device.backend) if m.servable]
         fitting = [m for m in cached if DV.fits(m.size_gb, device)["fits"]]
         if not cached:
             console.print("  [yellow]no servable model in the HF cache[/yellow] — "

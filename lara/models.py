@@ -1,4 +1,11 @@
-"""Scan the Hugging Face cache for models vLLM can actually serve (requirement R7).
+"""Scan the Hugging Face cache for models *this machine's backend* can serve (R7).
+
+**Which runtime is asking matters.** vLLM reads safetensors, llama.cpp reads GGUF, and
+MLX reads its own conversions; none of the three can load another's files. Judging the
+cache against vLLM unconditionally meant that on Apple Silicon — where the detected
+backend is llama.cpp, because vLLM has no Metal support — the picker hid every model
+the machine could actually run and listed the ones it could not.
+
 
 A naive listing of ``~/.cache/huggingface/hub`` is badly misleading. On this machine 390
 ``models--*`` repos are present but only 5 hold real weights — the rest are metadata-only
@@ -27,6 +34,35 @@ VLLM_ARCHS = {
 
 # Below this, a repo is a test stub or a partial download rather than a usable generator.
 MIN_WEIGHT_BYTES = 1_000_000_000
+
+#: Backends that read GGUF and nothing else. On Apple Silicon this is the detected
+#: default, because vLLM has no Metal backend (see lara/serve/devices.py).
+GGUF_BACKENDS = {"llama.cpp", "llamacpp", "ollama"}
+
+#: Where to find weights in each format, for error messages that end somewhere useful.
+FORMAT_HELP = {
+    "gguf": ("GGUF builds are at https://huggingface.co/models?library=gguf — "
+             "`bartowski` and `unsloth` publish them for most popular models."),
+    "mlx": ("MLX conversions are at https://huggingface.co/mlx-community."),
+    "safetensors": ("Standard Hugging Face repos are safetensors; most models ship "
+                    "this format by default."),
+}
+
+
+def wants_format(backend: str) -> str:
+    """The weight format a backend can actually load.
+
+    The three are not interchangeable and never have been: a repo vLLM serves is not a
+    GGUF file and is not MLX-converted. Scanning the cache without knowing which runtime
+    will read it produced a picker that, on a Mac, hid every model the machine could run
+    and listed the ones it could not.
+    """
+    b = (backend or "").lower()
+    if b in GGUF_BACKENDS:
+        return "gguf"
+    if b == "mlx":
+        return "mlx"
+    return "safetensors"
 
 
 @dataclass
@@ -63,7 +99,49 @@ def _snapshot_dir(repo_dir: Path) -> Path | None:
     return snaps[-1] if snaps else None
 
 
-def scan(hf_home: str | Path, min_bytes: int = MIN_WEIGHT_BYTES) -> list[CachedModel]:
+def _reasons_for(fmt: str, repo: str, arch: str | None,
+                 n_safet: int, n_gguf: int) -> list[str]:
+    """Why this repo cannot be served *by the runtime that will actually load it*."""
+    if fmt == "gguf":
+        # llama.cpp has its own architecture support matrix and GGUF repos frequently
+        # ship no config.json at all, so the vLLM allowlist says nothing useful here.
+        if not n_gguf:
+            return [f"no GGUF weights — this backend cannot load safetensors. "
+                    f"{FORMAT_HELP['gguf']}"]
+        return []
+    if fmt == "mlx":
+        # Repo naming is the only cheap signal: an MLX conversion is safetensors plus a
+        # weight layout mlx-lm understands, indistinguishable from a vLLM checkpoint by
+        # file listing alone. mlx-community is where essentially all of them live.
+        if not repo.startswith("mlx-community/"):
+            return [f"not an MLX conversion. {FORMAT_HELP['mlx']}"]
+        return []
+    reasons: list[str] = []
+    if arch is None:
+        reasons.append("no config.json / no architectures entry")
+    elif arch not in VLLM_ARCHS:
+        reasons.append(f"architecture {arch} not in the vLLM allowlist")
+    if not n_safet and n_gguf:
+        reasons.append("GGUF-only — vLLM cannot serve these (D4)")
+    if repo.startswith("mlx-community/"):
+        # These are safetensors with a stock architecture, so they pass every check
+        # above while being MLX-quantised weights vLLM cannot read.
+        reasons.append("MLX conversion — safetensors in a layout only mlx-lm reads")
+    return reasons
+
+
+def scan(hf_home: str | Path, min_bytes: int = MIN_WEIGHT_BYTES,
+         backend: str | None = None) -> list[CachedModel]:
+    """List cached models, judged against the backend that will serve them.
+
+    ``backend`` defaults to whatever this machine detects — llama.cpp on Apple Silicon,
+    vLLM on CUDA. Pass it explicitly to ask "what could I run *if* I switched runtime".
+    """
+    if backend is None:
+        from lara.serve import devices as DV
+        backend = DV.detect().backend
+    fmt = wants_format(backend)
+
     hub = Path(os.path.expanduser(str(hf_home))) / "hub"
     found: list[CachedModel] = []
     if not hub.is_dir():
@@ -99,13 +177,8 @@ def scan(hf_home: str | Path, min_bytes: int = MIN_WEIGHT_BYTES) -> list[CachedM
             except (json.JSONDecodeError, OSError):
                 pass
 
-        reasons: list[str] = []
-        if arch is None:
-            reasons.append("no config.json / no architectures entry")
-        elif arch not in VLLM_ARCHS:
-            reasons.append(f"architecture {arch} not in the vLLM allowlist")
-        if not safet and gguf:
-            reasons.append("GGUF-only (D4: vLLM is the sole backend, GGUF is excluded)")
+        repo = repo_dir.name[len("models--"):].replace("--", "/")
+        reasons = _reasons_for(fmt, repo, arch, len(safet), len(gguf))
         if weight_bytes < min_bytes:
             reasons.append(
                 f"only {weight_bytes / 1e9:.2f} GB of resolved weights — "
@@ -113,8 +186,7 @@ def scan(hf_home: str | Path, min_bytes: int = MIN_WEIGHT_BYTES) -> list[CachedM
             )
 
         found.append(CachedModel(
-            repo=repo_dir.name[len("models--"):].replace("--", "/"),
-            path=snap, arch=arch, weight_bytes=weight_bytes, quantization=quant,
+            repo=repo, path=snap, arch=arch, weight_bytes=weight_bytes, quantization=quant,
             n_safetensors=len(safet), n_gguf=len(gguf),
             servable=not reasons, reasons=reasons,
         ))
@@ -123,5 +195,5 @@ def scan(hf_home: str | Path, min_bytes: int = MIN_WEIGHT_BYTES) -> list[CachedM
     return found
 
 
-def servable(hf_home: str | Path) -> list[CachedModel]:
-    return [m for m in scan(hf_home) if m.servable]
+def servable(hf_home: str | Path, backend: str | None = None) -> list[CachedModel]:
+    return [m for m in scan(hf_home, backend=backend) if m.servable]

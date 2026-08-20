@@ -1865,6 +1865,35 @@ queueMicrotask(() => boot().catch((e) => {
 let dlResolved = null;
 let dlPoll = null;
 
+/* Where to actually find each format. A model name alone is not enough: "Qwen3-8B" names
+ * three different sets of files depending on who converted it, and only one of them will
+ * load here. Keyed by /api/device's wants_format. */
+const FORMAT_GUIDE = {
+  gguf: {
+    label: "GGUF",
+    placeholder: "e.g. unsloth/Qwen3-8B-GGUF, or paste a Hugging Face URL",
+    help: `Browse <a href="https://huggingface.co/models?library=gguf" target="_blank"
+             rel="noopener">all GGUF models on Hugging Face</a> — or go straight to
+           <a href="https://huggingface.co/bartowski" target="_blank" rel="noopener">bartowski</a>
+           and <a href="https://huggingface.co/unsloth" target="_blank" rel="noopener">unsloth</a>,
+           who publish GGUF builds of most popular models. Pick a <code>Q4_K_M</code> file
+           for the 4-bit sizing above; a plain safetensors repo will not load.`,
+  },
+  mlx: {
+    label: "MLX",
+    placeholder: "e.g. mlx-community/Qwen3-8B-4bit, or paste a Hugging Face URL",
+    help: `Browse <a href="https://huggingface.co/mlx-community" target="_blank"
+             rel="noopener">mlx-community</a>, which hosts essentially every MLX
+           conversion. Look for a <code>-4bit</code> suffix to match the sizing above.`,
+  },
+  safetensors: {
+    label: "safetensors",
+    placeholder: "e.g. Qwen/Qwen3-8B, or paste a Hugging Face URL",
+    help: `Standard Hugging Face repos ship this format, so most model pages work as-is.
+           GGUF builds will not load under vLLM.`,
+  },
+};
+
 function openDownloadModal() {
   $("#dl-modal").hidden = false;
   $("#dl-info").innerHTML = "";
@@ -1889,6 +1918,19 @@ function openDownloadModal() {
     } else {
       hint.innerHTML =
         `Run <code>lara setup</code> to have this dialog tell you what size fits.`;
+    }
+
+    /* The three weight formats are not interchangeable, and picking the wrong one is a
+     * multi-gigabyte mistake you only discover at load time. Say which one this machine
+     * needs, and where to find it, before the box is typed into. */
+    const fmt = $("#dl-format");
+    const backend = escapeHtml(d.backend || "the configured backend");
+    if (FORMAT_GUIDE[d.wants_format]) {
+      const g = FORMAT_GUIDE[d.wants_format];
+      fmt.innerHTML = `<strong>${backend} needs ${g.label} weights.</strong> ${g.help}`;
+      $("#dl-repo").placeholder = g.placeholder;
+    } else {
+      fmt.innerHTML = "";
     }
   }).catch(() => {});
 }
