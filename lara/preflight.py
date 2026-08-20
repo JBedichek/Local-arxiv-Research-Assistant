@@ -171,6 +171,32 @@ def check_gpu() -> list[Check]:
     return [Check("gpu", bool(gpus), f"{len(gpus)} visible: " + "; ".join(gpus))]
 
 
+def _weights_in_cache(model: str, hub_cache: Path) -> Path | None:
+    """The snapshot directory for ``model``, but only if it holds real weight files.
+
+    ``config.json`` alone is not enough and was what this used to check. A repo can be
+    in the cache as metadata — resolved once, or a download interrupted early — and
+    report itself cached while every byte of the model is still missing. Preflight then
+    passes and the multi-gigabyte download lands at ``lara serve`` instead, which is
+    exactly the surprise this check exists to prevent.
+    """
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        hit = try_to_load_from_cache(model, "config.json", cache_dir=str(hub_cache))
+    except Exception:
+        return None
+    if not isinstance(hit, str):
+        return None
+    snapshot = Path(hit).parent
+    for pattern in ("*.safetensors", "*.bin", "*.gguf", "*.pt"):
+        for f in snapshot.glob(pattern):
+            # Cache files are symlinks into blobs/. An aborted download leaves the link
+            # dangling, and exists() resolves it, so a broken link reads as absent.
+            if f.exists() and f.stat().st_size > 0:
+                return snapshot
+    return None
+
+
 def check_hf_access(cfg: Config) -> list[Check]:
     """Verify the gated embedding model can actually be fetched.
 
@@ -197,15 +223,8 @@ def check_hf_access(cfg: Config) -> list[Check]:
     card = f"https://huggingface.co/{model}"
     hub_cache = cfg.get_path("huggingface.home") / "hub"
 
-    try:
-        from huggingface_hub import try_to_load_from_cache
-        hit = try_to_load_from_cache(model, "config.json", cache_dir=str(hub_cache))
-    except Exception:
-        hit = None
-    # A str is a real cached file; None means unknown and _CACHED_NO_EXIST means the Hub
-    # was asked before and said no such file — neither proves the model is present.
-    if isinstance(hit, str):
-        return [Check(name, True, f"already cached under {hub_cache}")]
+    if _weights_in_cache(model, hub_cache) is not None:
+        return [Check(name, True, f"weights already in the cache under {hub_cache}")]
 
     if bool(cfg.get_in("huggingface.offline", False)):
         return [Check(
