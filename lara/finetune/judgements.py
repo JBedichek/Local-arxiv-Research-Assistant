@@ -122,9 +122,20 @@ def training_pairs(conn: sqlite3.Connection, min_per_query: int = 1,
     Prefers an LLM verdict where one exists — it was requested precisely because the
     cheap teacher was unsure — and falls back to the cross-encoder otherwise.
     """
+    # Title and section come along because the corpus is embedded contextually, as
+    # `title: {paper} > {section} | text: {chunk}`. Selecting bare `c.text` here is what
+    # made training show the model a document format serving never produces — measured at
+    # cosine 0.909 between the two renderings of one passage, against 0.741 for two
+    # unrelated ones. See docs/finetuning/gemma_embedder_finetuning.md.
     rows = conn.execute(
-        """SELECT j.query, j.query_hash, j.chunk_id, j.label, j.score, j.teacher, c.text
-           FROM judgements j JOIN chunks c ON c.chunk_id = j.chunk_id
+        """SELECT j.query, j.query_hash, j.chunk_id, j.label, j.score, j.teacher, c.text,
+                  p.title AS paper_title, s.title AS section_title
+           FROM judgements j
+           JOIN chunks c ON c.chunk_id = j.chunk_id
+           LEFT JOIN papers p ON p.arxiv_id = c.arxiv_id
+           LEFT JOIN sections s ON s.arxiv_id = c.arxiv_id
+                               AND s.version  = c.version
+                               AND s.anchor   = c.section_anchor
            WHERE j.label IS NOT NULL
            ORDER BY j.query_hash, (j.teacher='llm') DESC"""
     ).fetchall()
@@ -137,7 +148,8 @@ def training_pairs(conn: sqlite3.Connection, min_per_query: int = 1,
             continue           # an llm verdict already claimed this chunk
         q["seen"].add(r["chunk_id"])
         (q["pos"] if r["label"] else q["neg"]).append(
-            {"chunk_id": r["chunk_id"], "text": r["text"], "score": r["score"]}
+            {"chunk_id": r["chunk_id"], "text": r["text"], "score": r["score"],
+             "paper_title": r["paper_title"], "section_title": r["section_title"]}
         )
 
     out = []

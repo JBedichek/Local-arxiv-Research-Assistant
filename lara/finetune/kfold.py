@@ -61,9 +61,30 @@ class FoldResult:
     after: dict = field(default_factory=dict)
 
 
+def _render(item: dict, contextual: bool) -> str:
+    """The document string, in the format the reader will actually be searched in.
+
+    ``contextual=True`` reproduces `lara.index.embed.document_text`, which is what the
+    29.5 M corpus vectors were built with. False keeps the bare-chunk form the earlier runs
+    used, so old results stay reproducible.
+
+    The returned string is already a complete EmbeddingGemma document prompt, so callers
+    must not prepend DOC_PREFIX again — `doc_input` below is what enforces that.
+    """
+    if not contextual:
+        return item["text"]
+    from lara.index.embed import document_text
+    return document_text(item.get("paper_title"), item.get("section_title"), item["text"])
+
+
+def doc_input(text: str) -> str:
+    """Prepend the document prompt unless the text already carries one."""
+    return text if text.startswith("title:") else DOC_PREFIX + text
+
+
 def make_triples(conn: sqlite3.Connection, max_per_query: int = 8,
                  min_margin: float = 0.05, limit: int = 0,
-                 hard_frac: float = 0.5) -> list[Triple]:
+                 hard_frac: float = 0.5, contextual: bool = False) -> list[Triple]:
     """Pair every positive with a negative from the same query.
 
     ``min_margin`` drops pairs the teacher itself could barely separate: near-zero gaps
@@ -99,7 +120,9 @@ def make_triples(conn: sqlite3.Connection, max_per_query: int = 8,
                 margin = (p["score"] or 0) - (n["score"] or 0)
                 if margin < min_margin:
                     continue
-                out.append(Triple(group["query"], qh, p["text"], n["text"], float(margin)))
+                out.append(Triple(
+                    group["query"], qh,
+                    _render(p, contextual), _render(n, contextual), float(margin)))
                 made += 1
                 if made >= max_per_query:
                     break
@@ -146,8 +169,8 @@ def evaluate(model, triples: list[Triple], device: str, batch: int = 48,
     for i in range(0, len(triples), batch):
         part = triples[i:i + batch]
         q = _encode(model, [QUERY_PREFIX + t.query for t in part], device, grad=False)
-        p = _encode(model, [DOC_PREFIX + t.pos_text for t in part], device, grad=False)
-        n = _encode(model, [DOC_PREFIX + t.neg_text for t in part], device, grad=False)
+        p = _encode(model, [doc_input(t.pos_text) for t in part], device, grad=False)
+        n = _encode(model, [doc_input(t.neg_text) for t in part], device, grad=False)
         if whitener is not None:
             import numpy as _np
             qa = whitener(q.float().cpu().numpy())
@@ -232,6 +255,9 @@ class Recipe:
     max_seq_length: int = 320
     grad_clip: float = 1.0
     margin_scale: float = 10.0
+    # InfoNCE scale for MultipleNegativesRankingLoss. 0.05 == logits x20, matching
+    # `embedding.temperature` used for the citation objective in train.py.
+    temperature: float = 0.05
     compile_mode: str | None = None   # off by default: folds are short, compile is not free
     seed: int = 0
 
@@ -289,8 +315,8 @@ def validation_loss(model, triples: list[Triple], device: str, rec: Recipe,
         for i in range(0, len(triples), batch):
             part = triples[i:i + batch]
             q = _encode(model, [QUERY_PREFIX + t.query for t in part], device, grad=False)
-            p = _encode(model, [DOC_PREFIX + t.pos_text for t in part], device, grad=False)
-            ng = _encode(model, [DOC_PREFIX + t.neg_text for t in part], device, grad=False)
+            p = _encode(model, [doc_input(t.pos_text) for t in part], device, grad=False)
+            ng = _encode(model, [doc_input(t.neg_text) for t in part], device, grad=False)
             tm = torch.tensor([t.margin for t in part], device=device)
             loss = margin_mse(q.float(), p.float(), ng.float(), tm, rec.margin_scale)
             total += float(loss) * len(part)
@@ -368,8 +394,8 @@ def train_on(triples: list[Triple], model_name: str, device: str, rec: Recipe,
                 sub_part = part[j:j + micro]
                 with dev.autocast(device):
                     q = _encode(model, [QUERY_PREFIX + t.query for t in sub_part], device)
-                    p = _encode(model, [DOC_PREFIX + t.pos_text for t in sub_part], device)
-                    n = _encode(model, [DOC_PREFIX + t.neg_text for t in sub_part], device)
+                    p = _encode(model, [doc_input(t.pos_text) for t in sub_part], device)
+                    n = _encode(model, [doc_input(t.neg_text) for t in sub_part], device)
                     tm = torch.tensor([t.margin for t in sub_part], device=device)
                     loss = margin_mse(q.float(), p.float(), n.float(), tm, rec.margin_scale)
                 (loss * (len(sub_part) / len(part))).backward()
@@ -490,3 +516,181 @@ def format_sweep(rows: list[dict]) -> str:
             f"{a['margin_mae']:.4f} ({r['d_margin_mae']:+.4f})"
         )
     return head + "\n".join(lines)
+
+
+# ── MultipleNegativesRankingLoss, with GradCache ─────────────────────────────────────
+
+def mnrl(q: torch.Tensor, pos: torch.Tensor, neg: torch.Tensor,
+         temperature: float = 0.05) -> torch.Tensor:
+    """InfoNCE over in-batch negatives plus the mined hard negative.
+
+    This is `MultipleNegativesRankingLoss`, the loss Google's own EmbeddingGemma guide
+    recommends, and it optimises *order* rather than the magnitude of a score gap — which
+    is what every metric the MarginMSE runs failed on was measuring.
+
+    Candidates for row i are all B positives and all B mined negatives, with the correct
+    answer at index i. So a batch of 512 supplies 1,023 negatives per query: 511 other
+    queries' positives, which are easy, plus 512 reranker-rejected passages, which are the
+    hard ones. Batch size stops being a smoothing knob and becomes the supply of negatives.
+    """
+    q = F.normalize(q, dim=-1)
+    cand = F.normalize(torch.cat([pos, neg], dim=0), dim=-1)   # (2B, D)
+    logits = (q @ cand.T) / temperature                        # (B, 2B)
+    target = torch.arange(q.size(0), device=q.device)
+    return F.cross_entropy(logits, target)
+
+
+def _encode_ids(model, feats: dict) -> torch.Tensor:
+    return model(feats)["sentence_embedding"]
+
+
+def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Recipe",
+                  progress=None, val_triples: list[Triple] | None = None):
+    """Train with MultipleNegativesRankingLoss at a batch size memory cannot hold.
+
+    **Gradient accumulation is wrong for this loss.** Under MarginMSE each triple carries
+    its own negative, so accumulating eight micro-batches of 64 reproduces the 512 gradient
+    exactly. Under InfoNCE the batch *is* the negative set, and the same accumulation
+    computes eight independent 64-way problems — a weaker objective wearing a large batch's
+    clothing.
+
+    So this uses GradCache instead. Encode every micro-batch under ``no_grad`` and cache
+    the embeddings; compute the real 512-way loss on the cache and get its gradient with
+    respect to those embeddings; then re-encode each micro-batch with graph and seed
+    backward with the cached gradient. The result is the exact full-batch gradient at the
+    memory cost of one micro-batch, paid for with a second forward pass.
+    """
+    from muon import SingleDeviceMuonWithAuxAdam
+    from sentence_transformers import SentenceTransformer
+
+    from lara.finetune.train import split_param_groups
+
+    torch.manual_seed(rec.seed)
+    device = dev.resolve(device)
+    model = SentenceTransformer(model_name, device=device,
+                                model_kwargs={"dtype": torch.float32})
+    model.max_seq_length = rec.max_seq_length
+    model.train()
+    inner = model[0].auto_model
+    if hasattr(inner, "gradient_checkpointing_enable"):
+        inner.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False})
+    inner.config.use_cache = False
+
+    class _Cfg:
+        lr_muon, lr_adam, weight_decay = rec.lr_muon, rec.lr_adam, rec.weight_decay
+    opt = SingleDeviceMuonWithAuxAdam(split_param_groups(model, _Cfg()))
+
+    steps = max(1, (len(triples) // rec.batch_size) * rec.epochs)
+    warmup = max(1, int(steps * rec.warmup_frac))
+    base = [g["lr"] for g in opt.param_groups]
+    rng = random.Random(rec.seed)
+    micro = rec.micro_batch or rec.batch_size
+    step, started = 0, time.time()
+    best_loss, best_state, since_best, stopped = float("inf"), None, 0, False
+    val_triples = val_triples or []
+
+    def texts(part):
+        return ([QUERY_PREFIX + t.query for t in part],
+                [doc_input(t.pos_text) for t in part],
+                [doc_input(t.neg_text) for t in part])
+
+    def snapshot():
+        return {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
+
+    for _ in range(rec.epochs):
+        if stopped:
+            break
+        rng.shuffle(triples)
+        for i in range(0, len(triples) - rec.batch_size + 1, rec.batch_size):
+            part = triples[i:i + rec.batch_size]
+            scale = (step / warmup) if step < warmup else 0.5 * (
+                1 + math.cos(math.pi * min(1.0, (step - warmup) / max(1, steps - warmup))))
+            for g, b in zip(opt.param_groups, base):
+                g["lr"] = b * scale
+
+            chunks = [part[j:j + micro] for j in range(0, len(part), micro)]
+            feats = []
+            cached = {"q": [], "p": [], "n": []}
+            # Pass 1: embeddings only, no graph retained.
+            with torch.no_grad():
+                for sub_part in chunks:
+                    qs, ps, ns = texts(sub_part)
+                    f = [{k: v.to(device) for k, v in model.tokenize(x).items()}
+                         for x in (qs, ps, ns)]
+                    feats.append(f)
+                    with dev.autocast(device):
+                        for key, ff in zip(("q", "p", "n"), f):
+                            cached[key].append(_encode_ids(model, ff).float())
+
+            # The real full-batch loss, differentiated only w.r.t. the cached embeddings.
+            leaves = {k: torch.cat(v).detach().requires_grad_(True) for k, v in cached.items()}
+            loss = mnrl(leaves["q"], leaves["p"], leaves["n"], rec.temperature)
+            loss.backward()
+            grads = {k: leaves[k].grad for k in ("q", "p", "n")}
+
+            # Pass 2: re-encode with graph, seeded by the cached gradients.
+            opt.zero_grad(set_to_none=True)
+            off = 0
+            for sub_part, f in zip(chunks, feats):
+                n_i = len(sub_part)
+                with dev.autocast(device):
+                    outs = [_encode_ids(model, ff) for ff in f]
+                torch.autograd.backward(
+                    outs,
+                    grad_tensors=[grads[k][off:off + n_i].to(outs[0].dtype)
+                                  for k in ("q", "p", "n")],
+                )
+                off += n_i
+            torch.nn.utils.clip_grad_norm_(model.parameters(), rec.grad_clip)
+            opt.step()
+            step += 1
+
+            vl = None
+            if val_triples and step % rec.eval_every == 0:
+                vl = mnrl_val_loss(model, val_triples, device, rec)
+                if vl < best_loss - rec.min_delta:
+                    best_loss, best_state, since_best = vl, snapshot(), 0
+                else:
+                    since_best += 1
+
+            if progress is not None and step % 5 == 0:
+                progress.send({"step": step, "steps": steps, "loss": float(loss.detach()),
+                               "lr": opt.param_groups[0]["lr"], "val_loss": vl,
+                               "best_val": best_loss if best_state is not None else None,
+                               "elapsed": time.time() - started})
+            if val_triples and since_best >= rec.patience:
+                if progress is not None:
+                    progress.send({"step": step, "steps": steps, "early_stop": True,
+                                   "loss": float(loss.detach()), "best_val": best_loss,
+                                   "lr": opt.param_groups[0]["lr"],
+                                   "elapsed": time.time() - started})
+                stopped = True
+                break
+
+    if best_state is not None:
+        model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    model.eval()
+    model.stopped_early = stopped
+    model.best_val_loss = best_loss if best_state is not None else None
+    model.steps_trained = step
+    return model
+
+
+def mnrl_val_loss(model, triples: list[Triple], device: str, rec: "Recipe",
+                  batch: int = 128) -> float:
+    """Validation InfoNCE. Fixed batch, because the loss value depends on how many
+    negatives it was computed against and a ragged last batch would move the number for
+    reasons that have nothing to do with the model."""
+    model.eval()
+    total, n = 0.0, 0
+    with torch.no_grad():
+        for i in range(0, len(triples) - batch + 1, batch):
+            part = triples[i:i + batch]
+            q = _encode(model, [QUERY_PREFIX + t.query for t in part], device, grad=False)
+            p = _encode(model, [doc_input(t.pos_text) for t in part], device, grad=False)
+            ng = _encode(model, [doc_input(t.neg_text) for t in part], device, grad=False)
+            total += float(mnrl(q.float(), p.float(), ng.float(), rec.temperature))
+            n += 1
+    model.train()
+    return total / max(n, 1)
