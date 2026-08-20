@@ -385,6 +385,67 @@ re-embedding, only re-scoring.
 
 ---
 
+### Checked against Google's official recipe (2026-08-20)
+
+Compared with [the official EmbeddingGemma fine-tuning guide](https://ai.google.dev/gemma/docs/embeddinggemma/fine-tuning-embeddinggemma-with-sentence-transformers).
+Two discrepancies matter, and one of them is new.
+
+**1. The loss is the one Google does not recommend.** The guide's recipe is
+`MultipleNegativesRankingLoss` — symmetric InfoNCE over in-batch negatives, a *ranking*
+objective. We train with MarginMSE, a regression on teacher score gaps. This is exactly
+the first candidate cause listed above, arrived at independently: the official recipe
+optimises order, ours optimises magnitude, and order is what every failing metric measures.
+
+`lara/finetune/train.py` already contains `info_nce()` — symmetric InfoNCE over in-batch
+negatives, which is MultipleNegativesRankingLoss under another name. **It is defined and
+never called.** The recommended loss has been sitting in the repo unused while every pair
+experiment ran on MarginMSE.
+
+**2. Training and serving show the model different documents.** This one is ours, not a
+deviation from the guide.
+
+    serving   title: {paper title} > {section} | text: {chunk}     (lara/index/embed.py)
+    training  title: none | text: {chunk}                          (lara/finetune/kfold.py)
+
+Both are legitimate EmbeddingGemma document prompts — `model.prompts["document"]` is
+literally `'title: none | text: '`, and the contextual form is the intended way to use the
+title slot. The problem is that they are not the *same*, and `training_pairs()` selects
+bare `chunks.text` with no title or section to rebuild it with.
+
+Measured over 200 body chunks, encoding each one both ways:
+
+| | cosine |
+|---|---|
+| same chunk, serving format vs training format | **0.9088** (min 0.8262) |
+| two *different* chunks, both in serving format | 0.7409 |
+
+So the two renderings of one passage sit roughly a third of the way toward being unrelated
+passages. Whatever the fine-tune learns about `title: none | text: ...` transfers only
+partly to the format the 29.5 M corpus vectors are actually in. This is a second,
+independent reason for the transfer failure, and it is invisible to the k-fold metrics
+because k-fold encodes both sides in the *training* format and never touches the corpus.
+
+**3. Batch size is currently wasted, and stops being wasted the moment the loss changes.**
+The guide uses `per_device_train_batch_size=1`, which is a tutorial convenience. We use 512
+via gradient accumulation. Under MarginMSE the batch only smooths the gradient — every
+triple carries its own negative and the batch supplies none. Under MultipleNegativesRanking
+the batch *is* the negative supply, so 512 in-batch negatives goes from pointless to the
+main source of signal.
+
+**4. Sequence length disagrees with itself.** Model default 2048, corpus embedded at 512,
+k-fold trains at 320, `train.py` at 384. Chunks average 219 tokens with p95 432, so
+training truncates passages that serving keeps whole — the same train/serve gap as #2, in a
+different variable.
+
+**Deviations that are fine.** The optimiser is Muon rather than the guide's AdamW at 2e-5,
+which is deliberate and now swept. The prompts themselves are correct: `model.prompts` gives
+`query` = `'task: search result | query: '` and `document` = `'title: none | text: '`, and
+both match what the code uses verbatim. The module stack is intact — Transformer → Pooling →
+Dense → Dense → Normalize — and encoding through `sentence_embedding` applies all of it, so
+the later `F.normalize` is a harmless no-op rather than a double transform.
+
+---
+
 ## 6. Guarding against fooling yourself
 
 The generator, the judge and the student are all the same family of model, so this pipeline
