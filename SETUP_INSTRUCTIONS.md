@@ -17,6 +17,34 @@ trimmed), and which model to generate with.
 
 ---
 
+## Getting access (do this first)
+
+This repository is **private**. On a new machine, two commands are all you need — **no SSH
+key, no Personal Access Token to manage by hand**:
+
+```bash
+gh auth login --git-protocol https --web
+gh repo clone JBedichek/Local-arxiv-Research-Assistant
+```
+
+The first opens a browser, you approve once, and the token is saved to your system
+credential store. The second clones using it.
+
+You need [GitHub CLI](https://cli.github.com) (`brew install gh`, `winget install
+GitHub.cli`, or your package manager) and access granted by James Bedichek.
+
+> **The one thing that catches people:** `git clone https://github.com/…` fails with
+> `could not read Username` unless git has a credential helper. Being signed in to
+> github.com **in a browser does nothing for git**, and neither does `gh auth login` on its
+> own if you chose `ssh` at the protocol prompt. `--git-protocol https` above is what wires
+> git; `gh auth setup-git` fixes it afterwards if you already logged in with `ssh`. Since
+> 2021 GitHub rejects account passwords for git, so a password prompt wants a Personal
+> Access Token.
+
+Already using SSH keys, or on a headless machine? See [Access](#access) below.
+
+---
+
 ## The short version
 
 Pick your platform. Only the first two lines differ — everything from `lara dataset pull`
@@ -93,20 +121,16 @@ Everything below is detail.
 
 ### Access
 
-This repository is **private**. You need access granted by James Bedichek, and your machine
-needs credentials for it. Any one of these works:
+The two-command path is at the top of this file. The alternatives, if it does not suit you:
 
-```bash
-gh auth login && gh repo clone JBedichek/Local-arxiv-Research-Assistant   # simplest
-git clone git@github.com:JBedichek/Local-arxiv-Research-Assistant.git     # SSH key
-gh auth setup-git                                                        # then https works
-```
+| situation | what to run |
+|---|---|
+| You already use SSH keys | `git clone git@github.com:JBedichek/Local-arxiv-Research-Assistant.git` |
+| Logged in with `ssh` and want HTTPS too | `gh auth setup-git` |
+| Headless box, no browser | `gh auth login --with-token < token.txt` |
+| No `gh`, no SSH | clone over HTTPS and paste a Personal Access Token at the password prompt |
 
-**A plain `git clone https://…` fails with `could not read Username` unless a credential
-helper is configured** — being signed in to github.com in a browser, or even having run
-`gh auth login`, is not enough on its own; `gh auth setup-git` is what wires git itself.
-GitHub has not accepted account passwords for git operations since 2021, so if you are
-prompted, the password field wants a Personal Access Token.
+A Personal Access Token needs the `repo` scope to reach a private repository.
 
 - **Python 3.12+**
 - **Disk**: 50 GB for `core`, 95 GB with `full`. Check with `df -h .`, or
