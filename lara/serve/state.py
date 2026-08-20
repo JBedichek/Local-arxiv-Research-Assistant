@@ -128,7 +128,9 @@ class AppState:
         lex = icfg["lexical"]
         # D22: if a keep-set exists, only those rows go into tier 1. BM25 and tier 2 stay
         # whole-corpus, so a scoped index narrows semantic recall rather than coverage.
-        self.scope = SC.Scope.load(self.cfg.get_path("disk.root"))
+        # Builds the keep-set from corpus.scope the first time, then reuses it. Falls
+        # back to whatever is on disk (possibly nothing) if it cannot.
+        self.scope = SC.ensure(self.cfg, log=lambda m: print(f"[scope] {m}", flush=True))
         resident = self.scope.rows if self.scope is not None else None
         # Pass the thread-local factory, not a connection — see Retriever.__init__.
         self.retriever = R.Retriever(

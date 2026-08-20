@@ -17,7 +17,8 @@ import os
 import sys
 from collections.abc import Callable
 
-UP, DOWN, ENTER, ESCAPE, OTHER = "up", "down", "enter", "escape", "other"
+UP, DOWN, LEFT, RIGHT = "up", "down", "left", "right"
+ENTER, ESCAPE, OTHER = "enter", "escape", "other"
 
 
 def interactive(stream=None) -> bool:
@@ -67,7 +68,8 @@ def _read_key_posix() -> str:
             rest += more
         if not rest:
             return ESCAPE
-        return {b"[A": UP, b"[B": DOWN, b"OA": UP, b"OB": DOWN}.get(rest, OTHER)
+        return {b"[A": UP, b"[B": DOWN, b"[C": RIGHT, b"[D": LEFT,
+                b"OA": UP, b"OB": DOWN, b"OC": RIGHT, b"OD": LEFT}.get(rest, OTHER)
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, saved)
 
@@ -83,7 +85,7 @@ def _read_key_windows() -> str:
     if ch == "\x1b":
         return ESCAPE
     if ch in ("\x00", "\xe0"):        # arrows are a two-character sequence here
-        return {"H": UP, "P": DOWN}.get(msvcrt.getwch(), OTHER)
+        return {"H": UP, "P": DOWN, "M": RIGHT, "K": LEFT}.get(msvcrt.getwch(), OTHER)
     return OTHER
 
 
@@ -95,12 +97,17 @@ def read_key() -> str:
 
 
 def select(count: int, render: Callable[[int], object], *, console,
-           initial: int = 0) -> int | None:
+           initial: int = 0, horizontal: Callable[[int], bool] | None = None) -> int | None:
     """Move a cursor over ``count`` rows and return the chosen index.
 
     ``render(cursor)`` returns whatever rich should draw for that cursor position.
     Returns ``None`` if the user pressed escape, which callers should read as "keep
     what was already selected" rather than as an error.
+
+    ``horizontal(delta)``, if given, receives -1 or +1 on the left/right arrows and
+    returns whether anything changed. It exists so a second dimension — a slider whose
+    value feeds back into ``render`` — can share one keyboard loop rather than needing
+    a second prompt after this one returns.
     """
     from rich.live import Live
 
@@ -120,6 +127,9 @@ def select(count: int, render: Callable[[int], object], *, console,
                 cursor = (cursor - 1) % count
             elif key == DOWN:
                 cursor = (cursor + 1) % count
+            elif key in (LEFT, RIGHT) and horizontal is not None:
+                if not horizontal(-1 if key == LEFT else 1):
+                    continue
             else:
                 continue
             live.update(render(cursor))

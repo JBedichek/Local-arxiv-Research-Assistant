@@ -378,7 +378,8 @@ def render(overrides: dict, device: DV.Device, plan: Plan | None = None) -> str:
         notes.append(f"# Budget:   {plan.budget_gb:.0f} GB usable, "
                      f"{plan.overhead_gb:.1f} GB for models and cache")
         if plan.scope != "unnecessary":
-            notes.append(f"# Scoping:  {plan.scope} — see `lara corpus scope`")
+            notes.append(f"# Scoping:  keeping {plan.effective_keep:.0%} resident — "
+                         f"built automatically from corpus.scope on first start")
     head = HEADER.format(
         when=time.strftime("%Y-%m-%d %H:%M:%S"),
         machine=f"{device.system}/{device.machine}, {device.accelerator}, "
@@ -443,7 +444,8 @@ def overrides_for(plan: Plan, *, model: str | None = None,
                   quantization: str | None = None,
                   base_url: str | None = None,
                   disk_root: str | None = None,
-                  devices: list[int] | str | None = None) -> dict:
+                  devices: list[int] | str | None = None,
+                  topics: list[str] | None = None) -> dict:
     """Build the override dict the wizard writes. Only non-default keys are included."""
     index: dict = {"backend": plan.option.backend, "precision": plan.option.precision}
     if plan.option.faiss_kind:
@@ -463,6 +465,15 @@ def overrides_for(plan: Plan, *, model: str | None = None,
             "generator_max_params_4bit": int(plan.generator_params_4bit),
         },
     }
+    # Scoping is a load-time decision (see lara/index/scope.py), so it belongs in the
+    # config rather than in a command the user is told to go and run. The server builds
+    # the keep-set from these on first start and caches it.
+    if topics and plan.effective_keep < 1.0:
+        out["corpus"] = {"scope": {
+            "topics": list(topics),
+            "keep": round(plan.effective_keep, 4),
+            "expand_min_citations": 3,
+        }}
     if disk_root:
         out["disk"] = {"root": disk_root}
     if devices is not None:

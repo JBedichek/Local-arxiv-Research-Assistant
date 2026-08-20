@@ -292,3 +292,82 @@ def cut_preview(conn: sqlite3.Connection, topic_vecs: np.ndarray,
         "kept_edge": rows_for(kept_edge),
         "dropped_edge": rows_for(dropped_edge),
     }
+
+
+def inputs(cfg, topics: list[str], device: str | None = None):
+    """Embed the topics and load the paper-level index they are scored against.
+
+    Shared by ``lara corpus scope`` and by the automatic build below, so the two cannot
+    drift into scoring against different vectors.
+    """
+    from lara.index import embed as emb
+    from lara.index.vectors import VectorStore
+    from lara import device as ldev
+    from lara.store import db
+
+    ecfg = cfg.get_in("embedding")
+    conn = db.connect(cfg.get_path("paths.metadata_db"))
+    papers = VectorStore(
+        cfg.get_path("paths.papers_fp16"), cfg.get_path("paths.papers_int8"),
+        dim_full=int(ecfg["dim_full"]), dim_trunc=int(ecfg["dim_truncated"]),
+    )
+    if papers.rows() == 0:
+        conn.close()
+        raise RuntimeError("no paper-level vectors — run `lara embed-papers` first")
+
+    edev = ldev.resolve(device) if device else ldev.first(ecfg.get("devices"))
+    model = emb.load_model(ecfg["model"], device=edev,
+                           max_seq_length=int(ecfg["max_seq_len"]))
+    vecs = emb.embed_queries(model, topics, dim_trunc=int(ecfg["dim_truncated"]))
+    row_to_id = {r["vector_row"]: r["arxiv_id"]
+                 for r in conn.execute("SELECT arxiv_id, vector_row FROM paper_vectors")}
+    return conn, vecs, papers.load_int8(), row_to_id, int(ecfg["dim_truncated"])
+
+
+def ensure(cfg, log=None) -> "Scope | None":
+    """Return the keep-set the config asks for, building it once if it does not exist.
+
+    Scoping is a load-time decision, so ``lara setup`` records the topics and fraction in
+    ``corpus.scope`` and this makes them real — rather than printing a command and
+    trusting the user to run it, which left every scoped machine one forgotten step away
+    from loading a corpus it could not fit.
+
+    A saved keep-set built from *different* topics or a different fraction is stale and
+    gets rebuilt; one that matches is reused, because building costs a model load and a
+    pass over every paper vector.
+
+    Never fatal. A corpus that has not been embedded yet, or a missing model, means no
+    scope — which is the same state as not having configured one, and the whole corpus
+    stays resident.
+    """
+    saved = Scope.load(cfg.get_path("disk.root"))
+    want = cfg.get_in("corpus.scope") or {}
+    topics = [t for t in (want.get("topics") or []) if str(t).strip()]
+    keep = float(want.get("keep") or 0)
+    if not topics or not 0 < keep < 1:
+        return saved
+
+    expand = int(want.get("expand_min_citations", 3))
+    if (saved is not None and saved.topics == topics
+            and abs(saved.fraction - keep) < 1e-9
+            and saved.expand_min_citations == expand):
+        return saved
+
+    if log:
+        log(f"building keep-set: {len(topics)} topic(s), keep={keep:.0%}")
+    try:
+        conn, vecs, paper_int8, row_to_id, dim = inputs(cfg, topics)
+    except Exception as e:                      # noqa: BLE001 - see docstring
+        if log:
+            log(f"could not build keep-set ({e}); keeping the whole corpus resident")
+        return saved
+    try:
+        sc = build(conn, vecs, topics, paper_int8, row_to_id, keep,
+                   expand_min_citations=expand, dim_truncated=dim)
+        sc.save(cfg.get_path("disk.root"))
+        if log:
+            log(f"keep-set: {sc.n_papers:,} papers, {sc.n_rows:,} chunks, "
+                f"{sc.resident_bytes() / 1e9:.2f} GB resident")
+        return sc
+    finally:
+        conn.close()

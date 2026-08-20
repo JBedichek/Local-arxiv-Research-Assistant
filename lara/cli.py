@@ -1129,7 +1129,34 @@ def setup(
     # Scoping shrinks only the index, and "unnecessary" leaves scope_keep at whatever the
     # solver last computed — which is not 1.0 — so it has to be read as 1.0 here or a
     # machine that needs no scoping is shown a shrunken index it will never build.
-    gen_keep = 1.0 if plan.scope == "unnecessary" else plan.scope_keep
+    #
+    # Backend and keep fraction are one decision, not two: the whole reason to shrink the
+    # corpus is to afford a backend and still have room to generate, and that trade is
+    # unreadable if you pick the backend on one screen and the fraction on the next.
+    # `gen_keep` is mutable state driven by the left/right arrows below.
+    KEEP_STEPS = [0.01, 0.02, 0.05, 0.10, 0.15, 0.20, 0.25, 0.33,
+                  0.50, 0.66, 0.75, 0.90, 1.00]
+    default_keep = 1.0 if plan.scope == "unnecessary" else plan.scope_keep
+    keep_idx = min(range(len(KEEP_STEPS)),
+                   key=lambda i: abs(KEEP_STEPS[i] - default_keep))
+    gen_keep = KEEP_STEPS[keep_idx]
+
+    def nudge_keep(delta: int) -> bool:
+        nonlocal keep_idx, gen_keep
+        new = min(max(keep_idx + delta, 0), len(KEEP_STEPS) - 1)
+        if new == keep_idx:
+            return False
+        keep_idx, gen_keep = new, KEEP_STEPS[new]
+        return True
+
+    def slider() -> str:
+        filled = round(gen_keep * 24)
+        bar = "█" * filled + "░" * (24 - filled)
+        chunks = int(n_chunks * gen_keep)
+        head = "[green]◀ ▶[/green]" if prompt_mod.interactive() else "   "
+        return (f"  {head} corpus kept resident  [cyan]{bar}[/cyan]  "
+                f"[bold]{gen_keep:>4.0%}[/bold]  ({chunks / 1e6:.1f}M of "
+                f"{n_chunks / 1e6:.1f}M chunks)")
 
     # "+models" hid the fact that a third of the fixed cost is cache, not a model, and
     # named no figure you could check. Spell the addends out instead.
@@ -1143,8 +1170,7 @@ def setup(
             if device.unified_memory else
             "The index sits on a single card; a generator can be sharded across all of "
             "them, so this is the cautious figure.")
-    basis = (f"at the {gen_keep:.0%} of the corpus step 4 will keep resident"
-             if gen_keep < 1 else "with the whole corpus resident")
+    basis = "at the share of the corpus the slider keeps resident"
 
     def legend_table() -> Table:
         g = Table(show_header=False, box=None, padding=(0, 2))
@@ -1173,23 +1199,31 @@ def setup(
                       f"  Speed and accuracy are measured — reproduce with "
                       f"`lara bench-index`.[/dim]")
 
+    def screen(cursor: int | None):
+        from rich.console import Group
+        return Group(backend_table(cursor), slider())
+
     chosen = plan.option
     if non_interactive or show:
-        console.print(backend_table(None))
+        console.print(screen(None))
         print_legend()
     elif prompt_mod.interactive():
         print_legend()
-        console.print("  [dim]↑/↓ to move, enter to choose, esc to keep the "
-                      "recommendation.[/dim]")
+        console.print("  [dim]↑/↓ choose a search engine · ◀/▶ move the slider · "
+                      "enter to confirm · esc for the recommendation.[/dim]")
         start = keys.index(recommended)
-        picked = prompt_mod.select(len(opts), backend_table, console=console,
-                                   initial=start)
+        picked = prompt_mod.select(len(opts), screen, console=console,
+                                   initial=start, horizontal=nudge_keep)
+        if picked is None:
+            gen_keep = default_keep      # esc restores the recommendation wholesale
         chosen = opts[picked] if picked is not None else plan.option
         plan.option = chosen
-        console.print(f"  backend: [bold]{chosen.key}[/bold]")
+        console.print(f"  search engine: [bold]{chosen.key}[/bold]   "
+                      f"corpus kept: [bold]{gen_keep:.0%}[/bold]")
     else:
-        # Not a terminal — piped input, CI, TERM=dumb. Typing still has to work.
-        console.print(backend_table(None))
+        # Not a terminal — piped input, CI, TERM=dumb. No slider, so both halves of the
+        # decision get a typed prompt.
+        console.print(screen(None))
         print_legend()
         while True:
             pick = typer.prompt(f"\n  backend [{'/'.join(keys)}]", default=recommended)
@@ -1201,22 +1235,44 @@ def setup(
             console.print(f"  [red]{pick!r} is not one of[/red] {', '.join(keys)}")
         chosen = SU.OPTIONS_BY_KEY[pick]
         plan.option = chosen
+        while True:
+            raw = typer.prompt("  fraction of the corpus to keep resident (0-1)",
+                               default=f"{gen_keep:.2f}")
+            try:
+                val = float(raw)
+            except ValueError:
+                console.print(f"  [red]{raw!r} is not a number[/red]")
+                continue
+            if 0 < val <= 1:
+                gen_keep = val
+                break
+            console.print("  [red]must be greater than 0 and at most 1[/red]")
 
-    # ── 4. scoping ─────────────────────────────────────────────────────────────
-    console.print("\n[bold]4. Corpus residency[/bold]")
-    for r in plan.reasons:
-        console.print(f"  {r}")
+    # The slider decided *how much* to keep; this decides *which* papers. Fold the
+    # chosen fraction back into the plan so the config, the header and the saved
+    # generator sizing all describe the machine you just configured.
+    plan.scope_keep = gen_keep
+    plan.scope = "unnecessary" if gen_keep >= 1.0 else "required"
+
+    # ── 4. what to keep ────────────────────────────────────────────────────────
+    console.print("\n[bold]4. Your interests[/bold]")
+    # Recomputed for whatever is selected now. plan.reasons was written for the
+    # *recommended* option during planning, so after you change the selection it
+    # cheerfully reports the memory cost of a backend you did not choose.
+    if gen_keep < 1.0:
+        console.print(f"  [dim]{chosen.label} over the whole corpus would need "
+                      f"{plan.index_gb + plan.overhead_gb:.1f} GB against a "
+                      f"{plan.budget_gb:.0f} GB budget.[/dim]")
     topics: list[str] = []
-    if plan.scope == "unnecessary":
-        console.print("  [green]Topic scoping not needed[/green] — keeping the whole "
-                      "corpus resident.")
+    if gen_keep >= 1.0:
+        console.print("  Keeping the whole corpus resident — no topics needed.")
     else:
-        colour = "red" if plan.scope == "required" else "yellow"
         console.print(
-            f"  [{colour}]Topic scoping {plan.scope}[/{colour}]. Keeping the top "
-            f"{plan.scope_keep:.0%} of papers by relevance to your interests would use "
-            f"[bold]{plan.scoped_index_gb:.1f} GB[/bold] instead of {plan.index_gb:.1f} GB "
-            f"({plan.scoped_chunks:,} chunks).")
+            f"  Keeping [bold]{gen_keep:.0%}[/bold] of papers means keeping the "
+            f"{gen_keep:.0%} most relevant to *you*: "
+            f"[bold]{plan.planned_index_gb:.1f} GB[/bold] resident instead of "
+            f"{plan.index_gb:.1f} GB ({int(n_chunks * gen_keep):,} chunks). Name the "
+            f"topics that matter and they are what survives the cut.")
         console.print("  [dim]Nothing is deleted: dropped papers stay searchable through "
                       "BM25 and open normally. Only their dense vectors leave RAM.[/dim]")
         if not non_interactive and not show:
@@ -1226,6 +1282,13 @@ def setup(
                 if not topic.strip():
                     break
                 topics.append(topic.strip())
+            if not topics:
+                # Without topics there is nothing to score against, so a keep fraction
+                # cannot be honoured. Saying so beats writing a config that silently
+                # keeps everything.
+                console.print("  [yellow]No topics given[/yellow] — keeping the whole "
+                              "corpus resident instead.")
+                plan.scope_keep, plan.scope = 1.0, "unnecessary"
 
     # ── 5. generator ───────────────────────────────────────────────────────────
     console.print("\n[bold]5. Generator[/bold]")
@@ -1276,6 +1339,7 @@ def setup(
         plan, model=model, quantization=quant, base_url=base_url,
         disk_root=str(cfg.get_path("disk.root")),
         devices=[int(g) for g in range(len(device.gpus))] if device.gpus else "auto",
+        topics=topics,
     )
     # Pin the filesystem the corpus actually lives on. Detectable, and the check that
     # catches a symlink quietly redirecting 30 GB onto the wrong disk.
@@ -1316,15 +1380,17 @@ def setup(
 
     console.print("\n[bold]next[/bold]")
     if not have:
-        console.print("  lara dataset fetch <source>        # get the corpus")
+        console.print("  lara dataset fetch <source>")
+    console.print("  lara serve")
     if topics:
-        args = " ".join(f'-t \"{t}\"' for t in topics)
-        console.print(f"  lara corpus scope {args} --keep {plan.scope_keep} --preview")
-        console.print("  [dim]…then re-run with --apply once the cut looks right[/dim]")
+        # The keep-set is built from the config on first start, so there is no command
+        # to run here. Say what will happen rather than handing over a chore.
+        console.print(f"  [dim]…which builds the {plan.effective_keep:.0%} keep-set from "
+                      f"{len(topics)} topic(s) the first time, then reuses it. Inspect or "
+                      f"override it with `lara corpus scope --preview`.[/dim]")
     elif plan.scope != "unnecessary":
-        console.print('  lara corpus scope -t "<your topic>" '
-                      f'--keep {plan.scope_keep} --preview')
-    console.print("  lara serve                         # start the reader")
+        console.print("  [dim]…no topics were given, so the whole corpus stays "
+                      "resident.[/dim]")
 
 
 @app.command("bench-index")
@@ -1429,28 +1495,18 @@ app.add_typer(corpus_app, name="corpus")
 
 
 def _scope_inputs(cfg, topics: list[str], device: str | None):
-    """Embed the topics and load the paper-level index they are scored against."""
-    from lara.index import embed as emb
-    from lara.index.vectors import VectorStore
-    from lara.store import db
+    """Embed the topics and load the paper-level index they are scored against.
 
-    ecfg = cfg.get_in("embedding")
-    conn = db.connect(cfg.get_path("paths.metadata_db"))
-    papers = VectorStore(
-        cfg.get_path("paths.papers_fp16"), cfg.get_path("paths.papers_int8"),
-        dim_full=int(ecfg["dim_full"]), dim_trunc=int(ecfg["dim_truncated"]),
-    )
-    if papers.rows() == 0:
-        console.print("[red]no paper-level vectors[/red] — run `lara embed-papers` first")
-        raise typer.Exit(1)
+    The work lives in ``scope.inputs`` so the server's automatic build and this command
+    score against the same vectors; this wrapper only turns its error into CLI output.
+    """
+    from lara.index import scope as SC
 
-    edev = ldev.resolve(device) if device else ldev.first(ecfg.get("devices"))
-    model = emb.load_model(ecfg["model"], device=edev,
-                           max_seq_length=int(ecfg["max_seq_len"]))
-    vecs = emb.embed_queries(model, topics, dim_trunc=int(ecfg["dim_truncated"]))
-    row_to_id = {r["vector_row"]: r["arxiv_id"]
-                 for r in conn.execute("SELECT arxiv_id, vector_row FROM paper_vectors")}
-    return conn, vecs, papers.load_int8(), row_to_id, int(ecfg["dim_truncated"])
+    try:
+        return SC.inputs(cfg, topics, device)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1) from e
 
 
 @corpus_app.command("scope")
