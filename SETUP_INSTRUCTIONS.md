@@ -25,7 +25,7 @@ onward is identical everywhere.
 **macOS — zsh**
 
 ```zsh
-git clone https://github.com/JBedichek/Local-arxiv-Research-Assistant.git
+gh repo clone JBedichek/Local-arxiv-Research-Assistant    # private — see Access below
 cd Local-arxiv-Research-Assistant
 
 python3 -m venv .venv && source .venv/bin/activate
@@ -39,7 +39,7 @@ lara serve                                  # reader on http://127.0.0.1:8080
 **Linux — bash**
 
 ```bash
-git clone https://github.com/JBedichek/Local-arxiv-Research-Assistant.git
+gh repo clone JBedichek/Local-arxiv-Research-Assistant    # private — see Access below
 cd Local-arxiv-Research-Assistant
 
 python3 -m venv .venv && source .venv/bin/activate
@@ -53,7 +53,7 @@ lara serve                                  # reader on http://127.0.0.1:8080
 **Windows — PowerShell**
 
 ```powershell
-git clone https://github.com/JBedichek/Local-arxiv-Research-Assistant.git
+gh repo clone JBedichek/Local-arxiv-Research-Assistant    # private — see Access below
 cd Local-arxiv-Research-Assistant
 
 py -3.12 -m venv .venv
@@ -91,6 +91,23 @@ Everything below is detail.
 
 ## 1. Requirements
 
+### Access
+
+This repository is **private**. You need access granted by James Bedichek, and your machine
+needs credentials for it. Any one of these works:
+
+```bash
+gh auth login && gh repo clone JBedichek/Local-arxiv-Research-Assistant   # simplest
+git clone git@github.com:JBedichek/Local-arxiv-Research-Assistant.git     # SSH key
+gh auth setup-git                                                        # then https works
+```
+
+**A plain `git clone https://…` fails with `could not read Username` unless a credential
+helper is configured** — being signed in to github.com in a browser, or even having run
+`gh auth login`, is not enough on its own; `gh auth setup-git` is what wires git itself.
+GitHub has not accepted account passwords for git operations since 2021, so if you are
+prompted, the password field wants a Personal Access Token.
+
 - **Python 3.12+**
 - **Disk**: 50 GB for `core`, 95 GB with `full`. Check with `df -h .`, or
   `Get-PSDrive C` in PowerShell, before starting.
@@ -104,7 +121,7 @@ Everything below is detail.
 ## 2. Install
 
 ```bash
-git clone https://github.com/JBedichek/Local-arxiv-Research-Assistant.git
+gh repo clone JBedichek/Local-arxiv-Research-Assistant    # private — see Access below
 cd Local-arxiv-Research-Assistant
 python3 -m venv .venv && source .venv/bin/activate
 ```
