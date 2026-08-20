@@ -36,6 +36,12 @@ dependencies = [
   # reading papers: lxml renders the cached LaTeXML, zstandard decompresses it
   "lxml>=5.3",
   "zstandard>=0.23",
+  # Opening an uncrawled paper fetches and parses it on demand, so the reader performs
+  # ingest even on a base install -- the `ingest` extra is for building a corpus in
+  # bulk, not for touching the network at all. aiolimiter is imported at module scope by
+  # lara.ingest.fulltext, so without it /api/fetch raises ModuleNotFoundError on the
+  # first paper that has no cached full text. Pure Python, no dependencies of its own.
+  "aiolimiter>=1.1",
   # embedding and search
   "numpy>=2.1",
   "huggingface-hub>=0.26",
@@ -67,9 +73,12 @@ cuda = ["faiss-gpu-cu12>=1.9"]
 cpu = ["faiss-cpu>=1.9"]
 
 # ── optional capabilities ─────────────────────────────────────────────────────
-# Building a corpus from scratch: crawling, PDF fallback, rate limiting. Not needed if
-# you downloaded one with `lara dataset pull`.
-ingest = ["aiolimiter>=1.1", "pymupdf>=1.24"]
+# Building a corpus from scratch, plus the PDF fallback. Not needed if you downloaded one
+# with `lara dataset pull`: the reader's on-demand fetch reads arXiv's HTML and ar5iv,
+# both of which the base install handles. pymupdf stays optional because it is ~30 MB and
+# only the last resort for the minority of papers with no HTML at all -- without it that
+# source is skipped and recorded, rather than failing the fetch.
+ingest = ["pymupdf>=1.24"]
 # Generation backends. llama.cpp is a binary, not a package — `brew install llama.cpp`.
 vllm = ["vllm>=0.10; sys_platform == 'linux'"]
 serve = ["vllm>=0.10; sys_platform == 'linux'"]   # legacy alias for `vllm`

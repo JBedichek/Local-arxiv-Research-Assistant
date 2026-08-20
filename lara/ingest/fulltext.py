@@ -162,6 +162,12 @@ class FullTextFetcher:
                     if not parsed.chunks:
                         errors.append(f"{source}:empty")
                         continue
+            except ImportError as exc:
+                # A missing optional parser is a setup gap, not a bad paper. Record what
+                # to install, or "pdf:parse:ModuleNotFoundError" is the only clue anyone
+                # ever sees.
+                errors.append(f"{source}:unavailable:{exc}")
+                continue
             except Exception as exc:  # malformed HTML, unusual LaTeXML output
                 errors.append(f"{source}:parse:{type(exc).__name__}")
                 continue
@@ -187,8 +193,19 @@ class FullTextFetcher:
 
 
 def parse_pdf(body: bytes) -> ParsedPaper:
-    """PDF fallback. Page-level anchors only — no DOM ids exist to hang precision on."""
-    import pymupdf
+    """PDF fallback. Page-level anchors only — no DOM ids exist to hang precision on.
+
+    pymupdf is in the ``ingest`` extra rather than the base install: it is ~30 MB and
+    only the last resort, after arXiv's own HTML and ar5iv have both failed. A base
+    install skips this source rather than failing the fetch.
+    """
+    try:
+        import pymupdf
+    except ImportError as exc:
+        raise ImportError(
+            "the PDF fallback needs pymupdf, which is in the `ingest` extra: "
+            "pip install -e '.[ingest]'. HTML sources do not need it."
+        ) from exc
 
     from lara.ingest.parse import Block, Chunk, chunk_blocks
 
