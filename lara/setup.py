@@ -445,7 +445,8 @@ def overrides_for(plan: Plan, *, model: str | None = None,
                   base_url: str | None = None,
                   disk_root: str | None = None,
                   devices: list[int] | str | None = None,
-                  topics: list[str] | None = None) -> dict:
+                  topics: list[str] | None = None,
+                  backend: str = "vllm") -> dict:
     """Build the override dict the wizard writes. Only non-default keys are included."""
     index: dict = {"backend": plan.option.backend, "precision": plan.option.precision}
     if plan.option.faiss_kind:
@@ -479,13 +480,31 @@ def overrides_for(plan: Plan, *, model: str | None = None,
     if devices is not None:
         out["embedding"] = {"devices": devices}
 
+    # The chosen model has to be written under the key the *serving backend* reads.
+    # generator.model_for looks at serving.vllm.default_model for vLLM and
+    # serving.<backend>.model for everything else, so writing it under vllm on a Mac
+    # left model_for returning None, from_config returning None, and no generator ever
+    # starting -- while the picker cheerfully listed the model as present but not loaded.
+    serving: dict = {}
+    generator: dict = {}
     vllm: dict = {}
-    if model:
-        vllm["default_model"] = model
-    if quantization:
-        vllm["default_quantization"] = quantization
     if base_url:
-        vllm["base_url"] = base_url
+        vllm["base_url"] = base_url             # the reader talks here whatever serves
+    if backend:
+        generator["backend"] = backend
+    if model:
+        if backend == "vllm":
+            vllm["default_model"] = model
+            if quantization:
+                vllm["default_quantization"] = quantization
+        else:
+            # Matches the schema generator.model_for reads: serving.generator.<name>.model,
+            # a sibling of `backend` rather than of `generator`.
+            generator[backend] = {"model": model}
     if vllm:
-        out["serving"] = {"vllm": vllm}
+        serving["vllm"] = vllm
+    if generator:
+        serving["generator"] = generator
+    if serving:
+        out["serving"] = serving
     return out

@@ -1297,6 +1297,14 @@ def setup(
 
     # ── 5. generator ───────────────────────────────────────────────────────────
     console.print("\n[bold]5. Generator[/bold]")
+    from lara.serve import generator as GEN
+
+    # Not device.backend: that is advisory prose and says "llama.cpp" on any Mac, while
+    # the runtime actually chosen prefers MLX when mlx-lm is installed. They name
+    # different weight formats, so the list of servable models has to follow the real one.
+    gen_backend = GEN.effective_backend(cfg, device.accelerator)
+    console.print(f"  [dim]backend [bold]{gen_backend}[/bold], which loads "
+                  f"{models_mod.wants_format(gen_backend)} weights[/dim]")
     running = _probe_generators()
     for label, url, _ in running:
         console.print(f"  [green]found running[/green] {label} at {url}")
@@ -1313,7 +1321,7 @@ def setup(
 
     if not base_url:
         cached = [m for m in models_mod.scan(cfg.get_path("huggingface.home"),
-                                             backend=device.backend) if m.servable]
+                                             backend=gen_backend) if m.servable]
         fitting = [m for m in cached if DV.fits(m.size_gb, device)["fits"]]
         if not cached:
             console.print("  [yellow]no servable model in the HF cache[/yellow] — "
@@ -1345,7 +1353,7 @@ def setup(
         plan, model=model, quantization=quant, base_url=base_url,
         disk_root=str(cfg.get_path("disk.root")),
         devices=[int(g) for g in range(len(device.gpus))] if device.gpus else "auto",
-        topics=topics,
+        topics=topics, backend=gen_backend,
     )
     # Pin the filesystem the corpus actually lives on. Detectable, and the check that
     # catches a symlink quietly redirecting 30 GB onto the wrong disk.

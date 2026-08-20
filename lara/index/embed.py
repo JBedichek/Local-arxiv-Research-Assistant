@@ -143,6 +143,18 @@ def embed_queries(model, queries: list[str], dim_trunc: int | None = None) -> np
         queries, prompt=QUERY_PROMPT, batch_size=len(queries),
         convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False,
     ).astype(np.float32)
+    # A non-finite embedding is not a degraded result, it is a broken one: every score
+    # computed from it is NaN, and NaN survives all the way to JSON serialisation, where
+    # it surfaces as a starlette stack trace naming neither the model nor the device.
+    # Overflow in a too-narrow dtype is the usual cause — see lara.device.autocast_dtype.
+    if not np.isfinite(vecs).all():
+        dtype = getattr(getattr(model, "_first_module", lambda: None)(), "auto_model", None)
+        dtype = getattr(getattr(dtype, "dtype", None), "__str__", lambda: "unknown")()
+        raise RuntimeError(
+            f"the embedder returned a non-finite vector on device "
+            f"{getattr(model, 'device', 'unknown')} with dtype {dtype}. This is almost "
+            f"always numeric overflow in half precision — check lara.device.autocast_dtype."
+        )
     if dim_trunc:
         vecs = vecs[:, :dim_trunc]
         vecs /= np.maximum(np.linalg.norm(vecs, axis=1, keepdims=True), 1e-12)

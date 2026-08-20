@@ -158,16 +158,31 @@ def empty_cache(device: str | None = None) -> None:
 def autocast_dtype(device: str | None = None) -> torch.dtype | None:
     """Mixed-precision dtype for a device, or ``None`` where autocast is not worth it.
 
-    bf16 on CUDA. **fp16 on MPS**, not bf16: Metal's bf16 support lands unevenly across
-    torch versions and silently falls back to fp32 in places, so fp16 is the honest choice.
-    ``None`` on CPU — autocast there is supported but routinely slower than plain fp32 for
-    models this size, and correctness beats a speedup that is not real.
+    **bf16 on MPS, not fp16.** This used to be fp16, on the reasoning that Metal's bf16
+    support was uneven and fell back to fp32 in places. The cost of that choice was not
+    a slowdown, it was silent corruption: ``embeddinggemma-300m`` is a Gemma model,
+    trained in bf16 with activation magnitudes that overflow fp16's 65504 ceiling, and
+    on MPS it returns an embedding that is **entirely NaN**. Every downstream score is
+    then NaN, and the reader fails at JSON serialisation with "Out of range float
+    values are not JSON compliant" — a stack trace pointing at starlette, three layers
+    from the cause.
+
+    The measurement that settled it (torch 2.13.0, M-series, 12 runs after warmup)::
+
+        fp16    NaN                     unusable
+        bf16    79.4 ms   0.62 GB       <- chosen
+        fp32    93.9 ms   1.23 GB
+
+    bf16 is both faster and half the size here, so the original concern no longer costs
+    anything even if the fallback still happens.
+
+    bf16 on CUDA. ``None`` on CPU — autocast there is supported but routinely slower
+    than plain fp32 for models this size, and correctness beats a speedup that is not
+    real.
     """
     kind = (device or backend()).split(":", 1)[0]
-    if kind == "cuda":
+    if kind in ("cuda", "mps"):
         return torch.bfloat16
-    if kind == "mps":
-        return torch.float16
     return None
 
 

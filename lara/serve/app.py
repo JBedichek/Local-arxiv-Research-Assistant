@@ -704,6 +704,7 @@ def device_info() -> JSONResponse:
     """What this machine is, and which generation backend suits it."""
     from lara.models import wants_format
     from lara.serve import devices as DV
+    from lara.serve import generator as GEN
 
     d = DV.detect()
     # Written by `lara setup`, which is the only thing that knows what the index costs.
@@ -716,12 +717,16 @@ def device_info() -> JSONResponse:
         "unified_memory": d.unified_memory, "total_ram_gb": d.total_ram_gb,
         "usable_ram_gb": d.usable_ram_gb, "gpus": d.gpus,
         "total_vram_gb": d.total_vram_gb, "budget_gb": d.budget_gb,
-        "backend": d.backend, "backend_reason": d.backend_reason, "notes": d.notes,
+        # d.backend is the advisory description; effective_backend is what will really
+        # run, which differs on a Mac with mlx-lm installed and wants a different format.
+        "backend": GEN.effective_backend(cfg, d.accelerator),
+        "backend_advisory": d.backend,
+        "backend_reason": d.backend_reason, "notes": d.notes,
         "generator_headroom_gb": headroom,
         "generator_max_params_4bit": max_params,
         # Which weight format this machine's runtime can actually load, so the download
         # dialog can say so before someone fetches 8 GB of the wrong one.
-        "wants_format": wants_format(d.backend),
+        "wants_format": wants_format(GEN.effective_backend(cfg, d.accelerator)),
     })
 
 
@@ -1224,8 +1229,10 @@ def models() -> JSONResponse:
     s = _state()
     from lara.models import scan
     from lara.serve import devices as DV
+    from lara.serve import generator as GEN
 
-    found = scan(s.cfg.get_path("huggingface.home"), backend=DV.detect().backend)
+    backend = GEN.effective_backend(s.cfg, DV.detect().accelerator)
+    found = scan(s.cfg.get_path("huggingface.home"), backend=backend)
 
     # Which model vLLM is actually serving. The picker lists everything in the cache, but
     # only one is loaded (D5, single_resident), and sending any other name to vLLM is a
@@ -1242,9 +1249,14 @@ def models() -> JSONResponse:
     except Exception:
         pass
 
+    serving = s.cfg.get_in("serving") or {}
     return JSONResponse({
         "loaded": loaded,
-        "configured_default": s.cfg.get_in("serving.vllm.default_model"),
+        "backend": backend,
+        # Per backend: the three formats are not interchangeable, so each keeps its own
+        # model setting. Reading only the vLLM one reported "no default" on every Mac.
+        "configured_default": GEN.model_for(
+            backend, {**(serving.get("generator") or {}), "vllm": serving.get("vllm") or {}}),
         "models": [
             {
                 "repo": m.repo, "arch": m.arch, "size_gb": round(m.size_gb, 1),
