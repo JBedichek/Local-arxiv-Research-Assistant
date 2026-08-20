@@ -19,6 +19,33 @@ trimmed), and which model to generate with.
 
 ## Getting access (do this first)
 
+**Two separate accounts are involved, and neither is optional**: Hugging Face for the
+embedding model, GitHub for this repository. Start with Hugging Face — that one is approved
+by someone else, so it is the step you cannot rush.
+
+### Hugging Face — the embedding model is gated
+
+The query encoder is [`google/embeddinggemma-300m`](https://huggingface.co/google/embeddinggemma-300m),
+a **gated** repository: you must accept Google's terms and be granted access before it can
+be downloaded. There is no way around this and no substitute model configured — **every
+search embeds its query with this model**, so until access is granted the reader cannot
+search at all. It is not only needed for building an index.
+
+1. Create an account: <https://huggingface.co/join>
+2. Open the model card: <https://huggingface.co/google/embeddinggemma-300m>
+3. Click **Acknowledge license** and complete the form.
+
+The Hub reports this repository's gating as `manual` — requests are reviewed rather than
+auto-approved on accepting the terms. It is usually quick, but **start it before you need
+it** rather than discovering it at a prompt. The model card reads "You have been granted
+access" once it is done, and you get an email.
+
+Authenticating the CLI comes later, in [step 2](#2-install) — the `hf` command ships with
+the project's dependencies, so it does not exist until after `pip install`. (If you want to
+do it sooner, `brew install hf` installs it standalone.)
+
+### GitHub — this repository
+
 This repository is **private**. On a new machine, two commands are all you need — **no SSH
 key, no Personal Access Token to manage by hand**:
 
@@ -47,51 +74,83 @@ Already using SSH keys, or on a headless machine? See [Access](#access) below.
 
 ## The short version
 
-Pick your platform. Only the first two lines differ — everything from `lara dataset pull`
-onward is identical everywhere.
+Pick your platform. Only the install lines differ — everything from `hf auth login` onward
+is identical everywhere.
+
+**Every block on this page is comment-free and safe to paste whole.** What each line does is
+in the table underneath.
 
 **macOS — zsh**
 
 ```zsh
-gh repo clone JBedichek/Local-arxiv-Research-Assistant    # private — see Access below
+gh repo clone JBedichek/Local-arxiv-Research-Assistant
 cd Local-arxiv-Research-Assistant
 
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e '.[mac]'                     # quotes required — zsh globs [...]
+pip install -e '.[mac]'
 
-lara dataset pull --tiers core              # ~50 GB, resumable, no account
-lara setup                                  # interactive; writes config.local.yaml
-lara serve                                  # reader on http://127.0.0.1:8080
+hf auth login
+lara dataset pull --tiers core
+lara setup
+lara serve
 ```
 
 **Linux — bash**
 
 ```bash
-gh repo clone JBedichek/Local-arxiv-Research-Assistant    # private — see Access below
+gh repo clone JBedichek/Local-arxiv-Research-Assistant
 cd Local-arxiv-Research-Assistant
 
 python3 -m venv .venv && source .venv/bin/activate
-pip install -e '.[cuda]'                    # NVIDIA. No GPU? use the CPU install in step 2
+pip install -e '.[cuda]'
 
-lara dataset pull --tiers core              # ~50 GB, resumable, no account
-lara setup                                  # interactive; writes config.local.yaml
-lara serve                                  # reader on http://127.0.0.1:8080
+hf auth login
+lara dataset pull --tiers core
+lara setup
+lara serve
 ```
 
 **Windows — PowerShell**
 
 ```powershell
-gh repo clone JBedichek/Local-arxiv-Research-Assistant    # private — see Access below
+gh repo clone JBedichek/Local-arxiv-Research-Assistant
 cd Local-arxiv-Research-Assistant
 
 py -3.12 -m venv .venv
-.\.venv\Scripts\Activate.ps1                # blocked? see the note below
-pip install -e '.[cpu]'                     # yes, even with an NVIDIA card — see the note
+.\.venv\Scripts\Activate.ps1
+pip install -e '.[cpu]'
 
-lara dataset pull --tiers core              # ~50 GB, resumable, no account
-lara setup                                  # interactive; writes config.local.yaml
-lara serve                                  # reader on http://127.0.0.1:8080
+hf auth login
+lara dataset pull --tiers core
+lara setup
+lara serve
 ```
+
+| line | what it does |
+|---|---|
+| `pip install -e '.[mac]'` | Apple Silicon — adds faiss-cpu and mlx-lm. **The quotes are required**: zsh expands `[...]` as a glob |
+| `pip install -e '.[cuda]'` | NVIDIA, CUDA 12. No GPU? use the CPU install in [step 2](#2-install) |
+| `pip install -e '.[cpu]'` | Linux without a GPU, and **all** Windows — yes, even with an NVIDIA card; see the note below |
+| `.\.venv\Scripts\Activate.ps1` | Refuses to run? That is PowerShell's execution policy — see the note below |
+| `hf auth login` | Hugging Face token for the gated embedder. Access must already be granted |
+| `lara dataset pull --tiers core` | ~50 GB, resumable, no account needed for the corpus itself |
+| `lara setup` | Interactive; writes `config.local.yaml` |
+| `lara serve` | Reader on <http://127.0.0.1:8080> |
+
+**`dataset pull` and `setup` both stop immediately if the embedder is out of reach**, so a
+missing Hugging Face signup costs you a second rather than a 50 GB download. `lara preflight`
+reports the same thing on demand.
+
+> **Why no `#` comments in any of these blocks.** zsh does not treat `#` as a comment
+> interactively — `interactive_comments` is off by default, unlike bash. A pasted line with a
+> trailing `# …` hands those words to the command as arguments, which surfaces as errors like
+> `fatal: Too many arguments.` If you want commented recipes from elsewhere to paste cleanly:
+>
+> ```zsh
+> echo 'setopt interactive_comments' >> ~/.zshrc && exec zsh
+> ```
+>
+> Full diagnosis in [`SETUP_TROUBLESHOOTING.md`](SETUP_TROUBLESHOOTING.md).
 
 > **Three things only Windows users hit.**
 >
@@ -132,6 +191,9 @@ The two-command path is at the top of this file. The alternatives, if it does no
 
 A Personal Access Token needs the `repo` scope to reach a private repository.
 
+- **A Hugging Face account with access to `google/embeddinggemma-300m`** — gated, granted by
+  request, and required for search to work at all. Start this first; see
+  [Getting access](#getting-access-do-this-first).
 - **Python 3.12+**
 - **Disk**: 50 GB for `core`, 95 GB with `full`. Check with `df -h .`, or
   `Get-PSDrive C` in PowerShell, before starting.
@@ -145,7 +207,7 @@ A Personal Access Token needs the `repo` scope to reach a private repository.
 ## 2. Install
 
 ```bash
-gh repo clone JBedichek/Local-arxiv-Research-Assistant    # private — see Access below
+gh repo clone JBedichek/Local-arxiv-Research-Assistant
 cd Local-arxiv-Research-Assistant
 python3 -m venv .venv && source .venv/bin/activate
 ```
@@ -153,10 +215,16 @@ python3 -m venv .venv && source .venv/bin/activate
 Pick exactly one platform extra:
 
 ```zsh
-pip install -e '.[mac]'      # Apple Silicon — adds faiss-cpu and mlx-lm
-pip install -e '.[cuda]'     # NVIDIA, CUDA 12
-pip install -e '.[cpu]'      # Linux with no GPU, and all Windows — see the note above
+pip install -e '.[mac]'
+pip install -e '.[cuda]'
+pip install -e '.[cpu]'
 ```
+
+| extra | for |
+|---|---|
+| `mac` | Apple Silicon — adds faiss-cpu and mlx-lm |
+| `cuda` | NVIDIA, CUDA 12 |
+| `cpu` | Linux with no GPU, and all Windows — see the note above |
 
 > **On macOS, the quotes are load-bearing.** zsh has been the default shell since Catalina,
 > and it expands `[...]` as a glob before pip ever sees it. Unquoted, `pip install -e .[mac]`
@@ -177,12 +245,66 @@ macOS is unaffected — the arm64 wheels carry no CUDA payload.
 Optional extras, only if you need them:
 
 ```bash
-pip install -e '.[ingest]'   # crawling and PDF parsing — only to BUILD a corpus
-pip install -e '.[vllm]'     # NVIDIA generation backend; large and CUDA-version-sensitive
+pip install -e '.[ingest]'
+pip install -e '.[vllm]'
 ```
+
+| extra | for |
+|---|---|
+| `ingest` | crawling and PDF parsing — only needed to **build** a corpus |
+| `vllm` | NVIDIA generation backend; large, and sensitive to your CUDA version |
 
 The base install is deliberately just what it takes to **search and read** a corpus that
 already exists, which is what most people do.
+
+### Authenticate with Hugging Face
+
+You requested access to [`google/embeddinggemma-300m`](https://huggingface.co/google/embeddinggemma-300m)
+back in [Getting access](#getting-access-do-this-first). Now log in so the download can use
+it. `hf` was installed with the dependencies above, so it is on your PATH inside the venv:
+
+```bash
+hf auth login
+```
+
+Paste an access token when prompted — create one at
+<https://huggingface.co/settings/tokens>. A **Read** token is sufficient; the fine-grained
+kind works too provided it has *Read access to contents of public gated repos*. The token is
+written to `~/.cache/huggingface/token` and every later download picks it up.
+
+> **The command is `hf`, not `huggingface-cli`.** From `huggingface-hub` 1.0 the old
+> entrypoint is deprecated and **no longer functional** — it exits with
+> `` `huggingface-cli` is deprecated and no longer works. Use `hf` instead. `` Guides
+> written before mid-2025 all use the old name. This project pins `huggingface-hub>=0.26`,
+> so which one you get depends on what pip resolved; `hf --version` settles it.
+
+Confirm the login and that gating actually cleared:
+
+```bash
+hf auth whoami
+hf download google/embeddinggemma-300m
+```
+
+`hf auth whoami` prints your username; "Not logged in" means the token did not stick.
+`hf download` pulls ~1.2 GB into `~/.cache/huggingface`.
+
+That download is optional — `lara` fetches the model on first use anyway, and
+`lara preflight` verifies access without downloading anything. Pulling it now simply gets
+the bytes out of the way while you are paying attention.
+
+| what you see | what it means |
+|---|---|
+| `401 Client Error` / `Not logged in` | no token — run `hf auth login` |
+| `GatedRepoError` / `403 Forbidden` | logged in, but access not granted yet — check the model card |
+| `Repository Not Found` | typo in the model id, or a token with no gated-repo scope |
+| `You have been granted access` on the model card | you are clear to proceed |
+
+**Access is per-account, not per-machine.** Once Google grants it, any machine you log into
+with that account can pull the model; you do not repeat the request.
+
+> **`lara preflight` does not currently check this.** It verifies disks, paths and GPUs but
+> not Hugging Face auth, so a missing token surfaces later as a failure on the first search
+> rather than up front.
 
 ### Generating answers
 
@@ -202,10 +324,13 @@ why Apple Silicon gets two purpose-built options instead.
 **On a Mac, try both.** MLX uses unified memory directly and is often faster; llama.cpp is
 more mature and has richer KV-cache options. Compare them on your own hardware:
 
+`lara backends` lists what is installed and what would be used. Then start one backend and,
+**in a second shell**, benchmark it — `bench-generate` reports median TTFT and tok/s:
+
 ```zsh
-lara backends                            # what is installed, and what would be used
-lara serve-llm --backend mlx             # then, in another shell:
-lara bench-generate                      # median TTFT and tok/s
+lara backends
+lara serve-llm --backend mlx
+lara bench-generate
 lara serve-llm --backend llamacpp
 lara bench-generate
 ```
@@ -245,9 +370,13 @@ reads. Both forms are on disk until you remove the tars, which the command tells
 do; `--no-extract` skips unpacking and prints the manual command instead.
 
 ```bash
-lara dataset pull --tiers core,full          # both
-lara dataset pull --list                     # see what is in the repo without downloading
+lara dataset pull --tiers core,full
+lara dataset pull --list
 ```
+
+The first pulls both tiers. The second lists what is in the repo without downloading it —
+and, being read-only, is the one `dataset pull` variant that does **not** require Hugging
+Face access to the embedder first.
 
 The corpus is **1,011,039 papers harvested / 377,093 in scope, 28.7 M chunks, 7.2 M citation
 edges**, covering `cs.LG`, `cs.CL`, `stat.ML` and `cs.NE` from 2015 on.
@@ -287,10 +416,16 @@ What it actually asks you:
 Useful variants:
 
 ```bash
-lara setup --show                # print the plan and the config it would write; changes nothing
-lara setup --non-interactive     # accept every recommendation
-lara setup --prefer speed        # or: memory, balanced (default)
+lara setup --show
+lara setup --non-interactive
+lara setup --prefer speed
 ```
+
+| variant | effect |
+|---|---|
+| `--show` | print the plan and the config it would write; changes nothing, and skips the Hugging Face gate so it works before access is granted |
+| `--non-interactive` | accept every recommendation |
+| `--prefer speed` | or `memory`, or `balanced` (the default) |
 
 Re-running is safe. It **replaces only the settings it manages and preserves everything else**,
 and backs up the previous file first.
@@ -319,9 +454,11 @@ care about resident:
 ```bash
 lara corpus scope -t "data selection for language models" \
                   -t "optimizers and learning rate schedules" \
-                  --keep 0.1 --preview      # shows the cut line, writes nothing
+                  --keep 0.1 --preview
 lara corpus scope -t "..." --keep 0.1 --apply
 ```
+
+`--preview` shows you the cut line and writes nothing; `--apply` commits it.
 
 At `keep=0.1` that is **1.5 GB instead of 15 GB**. Nothing is deleted: dropped papers stay
 fully searchable through BM25 and open normally — only their dense vectors leave RAM. Papers
@@ -336,10 +473,16 @@ it, and keeps the whole corpus.
 ## 5. Start
 
 ```bash
-lara serve                        # starts the generator too, then the reader on :8080
-lara serve --no-llm               # retrieval only; skip the generator
-lara serve --host 0.0.0.0         # reachable from your network — read the warning below
+lara serve
+lara serve --no-llm
+lara serve --host 0.0.0.0
 ```
+
+| variant | effect |
+|---|---|
+| *(no flags)* | starts the generator too, then the reader on `:8080` |
+| `--no-llm` | retrieval only; skip the generator |
+| `--host 0.0.0.0` | reachable from your network — **read the warning below first** |
 
 The generation server starts alongside the reader and is shut down with it. If one is
 already running, lara adopts it and leaves it alone on exit — it may be shared with
@@ -357,10 +500,16 @@ Open a paper by arXiv id, or type anything else to search. Highlight a passage a
 ## Verifying and fixing
 
 ```bash
-lara preflight        # disks, paths, GPU, and which config layers loaded
-lara status           # corpus counts
-lara bench-index      # measure the search backends yourself
+lara preflight
+lara status
+lara bench-index
 ```
+
+| command | reports |
+|---|---|
+| `lara preflight` | disks, paths, GPU, Hugging Face access, and which config layers loaded |
+| `lara status` | corpus counts |
+| `lara bench-index` | measures the search backends on your own hardware |
 
 `lara preflight` is the first thing to run when something is wrong. It reports what it
 checked and, where it can, how to fix it.
@@ -372,6 +521,10 @@ permanently. Deleting it returns you to the defaults.
 
 | symptom | cause |
 |---|---|
+| `GatedRepoError` on the first search | access to `embeddinggemma-300m` not granted yet — see [Authenticate with Hugging Face](#authenticate-with-hugging-face) |
+| `401` fetching the embedder | not logged in — `hf auth login` |
+| `huggingface-cli: deprecated and no longer works` | use `hf`; the old entrypoint was removed in `huggingface-hub` 1.0 |
+| `fatal: Too many arguments.` pasting a command | zsh does not strip `#` comments — see [`SETUP_TROUBLESHOOTING.md`](SETUP_TROUBLESHOOTING.md) |
 | `nvidia-smi` works but everything is slow | torch cannot see the GPU — preflight fails on this explicitly |
 | `Driver/library version mismatch` | reload the kernel module, or reboot; preflight prints the command |
 | Out of memory at startup | the index does not fit — re-run `lara setup`, or scope the corpus |

@@ -15,9 +15,25 @@ app = typer.Typer(add_completion=False, help="Local arXiv Research Assistant")
 console = Console()
 
 
+def _require_hf(cfg: config_mod.Config) -> None:
+    """Stop before anything expensive if the gated embedder is out of reach.
+
+    The embedder is needed to encode every query, so without it the reader cannot
+    search at all. Checking here costs one HTTP call; not checking costs a 50 GB
+    download followed by a confusing failure at first use.
+    """
+    try:
+        preflight_mod.require_hf_access(cfg)
+    except preflight_mod.HFAccessError as e:
+        console.print(f"\n[red]Hugging Face access required.[/red] {e}")
+        console.print("Re-check with [bold]lara preflight[/bold] once access is granted. "
+                      "To bypass deliberately: [bold]LARA_SKIP_HF_CHECK=1[/bold].")
+        raise typer.Exit(1)
+
+
 @app.command()
 def preflight(config: str = typer.Option(None, help="Path to config.yaml")) -> None:
-    """Verify disks, paths and GPUs before anything writes to disk."""
+    """Verify disks, paths, GPUs and Hugging Face access before anything writes to disk."""
     cfg = config_mod.load(config)
     checks, ok = preflight_mod.run(cfg)
 
@@ -1024,6 +1040,9 @@ def setup(
     from lara.serve import devices as DV
 
     cfg = config_mod.load(config)
+    # --show writes nothing, so let it report on a machine that has no access yet.
+    if not show:
+        _require_hf(cfg)
     device = DV.detect()
     ecfg = cfg.get_in("embedding")
 
@@ -1520,6 +1539,11 @@ def dataset_pull(
         console.print(f"[red]unknown tier(s)[/red] {', '.join(unknown)}; "
                       f"choose from {', '.join(DS.HF_TIER_PREFIXES)}")
         raise typer.Exit(1)
+
+    # The corpus itself is ungated, but a corpus with no encoder cannot be searched.
+    # Checking before ~50 GB moves is the whole point of checking at all.
+    if not list_only:
+        _require_hf(cfg)
 
     try:
         files = list_repo_files(repo, repo_type="dataset", revision=revision)

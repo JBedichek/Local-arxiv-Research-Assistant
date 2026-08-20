@@ -171,7 +171,104 @@ def check_gpu() -> list[Check]:
     return [Check("gpu", bool(gpus), f"{len(gpus)} visible: " + "; ".join(gpus))]
 
 
+def check_hf_access(cfg: Config) -> list[Check]:
+    """Verify the gated embedding model can actually be fetched.
+
+    ``google/embeddinggemma-300m`` is a *gated* repository: pulling it needs a Hugging
+    Face token belonging to an account Google has granted access to, and approval is
+    manual rather than automatic on accepting the terms. Nothing else in setup surfaces
+    that. Without this check the failure lands on the *first search* — after a 50 GB
+    corpus download — as a ``GatedRepoError`` raised from inside sentence-transformers,
+    which reads like a bug in the reader rather than a missing signup.
+
+    Three states pass, and none of them makes a network call it does not have to:
+    the model is already cached (gating is enforced at download time only), the config
+    asked for offline mode, or the Hub confirms this token has access.
+
+    A Hub that cannot be reached is reported as a pass with a note. Being offline is a
+    legitimate state and a flaky network is not a misconfiguration, so it would be wrong
+    to block setup on it — the same reasoning ``check_gpu`` applies to having no GPU.
+    """
+    model = str(cfg.get_in("embedding.model") or "").strip()
+    if not model:
+        return [Check("hf access", False, "embedding.model is unset in config.yaml")]
+
+    name = f"hf access {model}"
+    card = f"https://huggingface.co/{model}"
+    hub_cache = cfg.get_path("huggingface.home") / "hub"
+
+    try:
+        from huggingface_hub import try_to_load_from_cache
+        hit = try_to_load_from_cache(model, "config.json", cache_dir=str(hub_cache))
+    except Exception:
+        hit = None
+    # A str is a real cached file; None means unknown and _CACHED_NO_EXIST means the Hub
+    # was asked before and said no such file — neither proves the model is present.
+    if isinstance(hit, str):
+        return [Check(name, True, f"already cached under {hub_cache}")]
+
+    if bool(cfg.get_in("huggingface.offline", False)):
+        return [Check(
+            name, False,
+            f"huggingface.offline is true, but {model} is not in {hub_cache}. "
+            f"Cache it on a connected machine, or set huggingface.offline: false.",
+        )]
+
+    try:
+        from huggingface_hub import auth_check, get_token
+        from huggingface_hub.utils import GatedRepoError, RepositoryNotFoundError
+    except ImportError:
+        # auth_check landed in huggingface-hub 0.27; the floor in pyproject is 0.26.
+        return [Check(name, True, "not verified — huggingface_hub predates auth_check; "
+                                  "upgrade with `pip install -U huggingface-hub`")]
+
+    try:
+        auth_check(model)
+    except GatedRepoError:
+        if not get_token():
+            return [Check(name, False,
+                          f"gated, and no token found. Request access at {card} "
+                          f"(Acknowledge license), then run `hf auth login`.")]
+        return [Check(name, False,
+                      f"token found, but this account has not been granted access. "
+                      f"Request it at {card}; approval is manual, so it is not instant.")]
+    except RepositoryNotFoundError:
+        return [Check(name, False,
+                      f"not found, or invisible to this token. Check embedding.model, "
+                      f"and that the token has read access to public gated repos.")]
+    except Exception as e:
+        return [Check(name, True, f"not verified — could not reach the Hub "
+                                  f"({type(e).__name__}); it downloads on first use")]
+
+    who = ""
+    try:
+        from huggingface_hub import whoami
+        who = f" as {whoami()['name']}"
+    except Exception:
+        pass
+    return [Check(name, True, f"granted{who}; not cached yet, downloads on first use")]
+
+
+class HFAccessError(RuntimeError):
+    """The gated embedding model cannot be fetched with the current credentials."""
+
+
+def require_hf_access(cfg: Config) -> None:
+    """Gate expensive work on the embedder being reachable.
+
+    Called at the top of ``lara dataset pull`` and ``lara setup`` so a missing signup
+    costs a second instead of a 50 GB download. Escape hatch for anyone deliberately
+    working around it (an air-gapped mirror, a substituted encoder):
+    ``LARA_SKIP_HF_CHECK=1``.
+    """
+    if os.environ.get("LARA_SKIP_HF_CHECK"):
+        return
+    failed = [c for c in check_hf_access(cfg) if not c.ok]
+    if failed:
+        raise HFAccessError(failed[0].detail)
+
+
 def run(cfg: Config | None = None) -> tuple[list[Check], bool]:
     cfg = cfg or load()
-    checks = check_config(cfg) + check_disks(cfg) + check_gpu()
+    checks = check_config(cfg) + check_disks(cfg) + check_gpu() + check_hf_access(cfg)
     return checks, all(c.ok for c in checks)
