@@ -482,6 +482,123 @@ def explore(
     conn.close()
 
 
+@app.command("finetune-pairs")
+def finetune_pairs(
+    config: str = typer.Option(None, help="Path to config.yaml"),
+    out: str = typer.Option(None, help="Where to save the tuned model"),
+    lr_muon: float = typer.Option(3e-5),
+    batch_size: int = typer.Option(512, help="Optimiser batch; the negative supply"),
+    micro_batch: int = typer.Option(64, help="Sequences per forward pass"),
+    epochs: int = typer.Option(4),
+    max_per_query: int = typer.Option(32),
+    max_seq_length: int = typer.Option(512, help="Match what the corpus was embedded at"),
+    compile_mode: str = typer.Option("default", help="torch.compile mode; 'none' to disable"),
+    patience: int = typer.Option(4),
+    eval_every: int = typer.Option(10),
+    n_eval: int = typer.Option(800, help="Queries per independent eval task"),
+    device: str = typer.Option(None),
+    force: bool = typer.Option(False, "--force", help="Save even if the guard rejects it"),
+) -> None:
+    """Train once on ALL judgement pairs, then judge it on the independent eval.
+
+    k-fold measures whether a *recipe* generalises and deliberately throws every model
+    away; each fold trains on different data, so no fold's weights are the artifact. This
+    trains a single model on everything and keeps it — but only if it earns its place.
+
+    The gate is `lara/finetune/evaluate.py`, not the pairwise metrics. Those are agreement
+    with the cross-encoder that produced the labels, so a model can improve them by
+    learning its teacher's habits. Citation retrieval is scored against what human authors
+    actually cited, and paraphrase retrieval is the canary for catastrophic forgetting: a
+    model that wins on citations while losing there has traded general retrieval for a
+    narrow skill and would make the reader worse.
+    """
+    from pathlib import Path as _P
+
+    from lara.finetune import evaluate as EV
+    from lara.finetune import kfold as KF
+    from lara.index.embed import load_model
+    from lara.store import db
+
+    cfg = config_mod.load(config)
+    conn = db.connect(cfg.get_path("paths.metadata_db"))
+    model_name = cfg.get_in("embedding.model")
+
+    triples = KF.make_triples(conn, max_per_query=max_per_query, contextual=True)
+    n_q = len({t.query_hash for t in triples})
+    if len(triples) < batch_size * 4:
+        console.print(f"[red]only {len(triples):,} triples[/red] — run `lara explore` first")
+        raise typer.Exit(1)
+    rec = KF.Recipe(lr_muon=lr_muon, lr_adam=lr_muon / 5, batch_size=batch_size,
+                    micro_batch=micro_batch, epochs=epochs, max_seq_length=max_seq_length,
+                    patience=patience, eval_every=eval_every,
+                    compile_mode=None if compile_mode.lower() == "none" else compile_mode)
+    console.print(f"[bold]{len(triples):,}[/bold] triples from {n_q:,} queries · "
+                  f"MultipleNegativesRanking · batch {batch_size} · seq {max_seq_length}")
+
+    console.print("\n[bold]baseline[/bold] on the independent eval")
+    base = load_model(model_name, device=device, max_seq_length=max_seq_length)
+    before = EV.run(base, conn, n=n_eval)
+    console.print(EV.format_report(before))
+    del base
+    ldev.empty_cache(device)
+
+    train, val = KF.inner_split(triples, rec.inner_val_frac, seed=1)
+    console.print(f"\n[bold]training[/bold] on {len(train):,} triples "
+                  f"({len(val):,} held back for early stopping)")
+
+    def reporter():
+        while True:
+            st = yield
+            if st.get("early_stop"):
+                console.print(f"  [yellow]early stop[/yellow] step {st['step']} "
+                              f"best val {st['best_val']:.4f}")
+                continue
+            v = st.get("val_loss")
+            console.print(f"  step {st['step']:>4}/{st['steps']}  loss {st['loss']:7.4f}  "
+                          f"lr {st['lr']:.2e}" + (f"  val {v:7.4f}" if v is not None else "")
+                          + f"  {st['elapsed']/60:.0f}m")
+
+    pr = reporter(); next(pr)
+    model = KF.train_on_mnrl(list(train), model_name, device, rec,
+                             progress=pr, val_triples=val)
+    console.print(f"[green]trained[/green] {getattr(model, 'steps_trained', 0)} steps"
+                  + (" (early stopped)" if getattr(model, "stopped_early", False) else ""))
+
+    console.print("\n[bold]after training[/bold]")
+    after = EV.run(model, conn, n=n_eval)
+    console.print(EV.format_report(before, after))
+
+    # The same guard `lara finetune` uses, and for the same reason: re-embedding 29.5 M
+    # chunks costs hours and a worse encoder degrades every search until it is undone.
+    won = after["citation"]["mrr"] > before["citation"]["mrr"]
+    kept = after["paraphrase"]["mrr"] > before["paraphrase"]["mrr"] - 0.02
+    verdict = ("citation MRR "
+               f"{before['citation']['mrr']:.4f} -> {after['citation']['mrr']:.4f}, "
+               f"paraphrase MRR {before['paraphrase']['mrr']:.4f} -> "
+               f"{after['paraphrase']['mrr']:.4f}")
+    if not (won and kept) and not force:
+        console.print(f"\n[yellow]not saved[/yellow] — {verdict}\n"
+                      "Citation MRR must improve and paraphrase MRR must not fall more "
+                      "than 0.02. Re-embedding the corpus with a worse encoder costs "
+                      "hours and degrades every search until it is undone.\n"
+                      "[dim]--force overrides, if you want the weights to inspect.[/dim]")
+        conn.close()
+        raise typer.Exit(1)
+
+    dest = _P(out or (cfg.get_path("disk.root") / "models" / "embeddinggemma-pairs"))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    model.save(str(dest))
+    console.print(f"\n[green]saved[/green] {dest} — {verdict}")
+    console.print(
+        "\nAdopting it is a separate decision and not a cheap one:\n"
+        "  1. point [bold]embedding.model[/bold] at this path in config.local.yaml\n"
+        "  2. [bold]lara embed --restart[/bold] — re-embeds all 28.7 M chunks (~8 GPU-hours)\n"
+        "  3. refit the whitener, whose statistics belong to the old encoder\n"
+        "[dim]Until step 2 finishes the index and the encoder disagree, and search is wrong.[/dim]"
+    )
+    conn.close()
+
+
 @app.command("lr-sweep")
 def lr_sweep(
     config: str = typer.Option(None, help="Path to config.yaml"),

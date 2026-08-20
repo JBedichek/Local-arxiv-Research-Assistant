@@ -573,6 +573,29 @@ def query_disjoint_batches(triples: list[Triple], batch_size: int,
     return batches
 
 
+def length_sorted_chunks(part: list[Triple], micro: int) -> list[list[Triple]]:
+    """Split a batch into micro-batches of similar length.
+
+    Tokenisation pads each micro-batch to its longest member, and document lengths here
+    run mean 260 tokens against a p95 of 512. Measured on random micro-batches of 64, that
+    padding costs a factor of **1.98** — about half of every step is spent on positions
+    that are not there.
+
+    Sorting the batch by length before splitting puts similar-length documents together,
+    so each micro-batch pads to nearly its own mean instead of the batch-wide maximum.
+
+    **This does not change the loss.** The permutation is applied identically to queries,
+    positives and negatives, so row i still pairs with row i and the InfoNCE target is the
+    same diagonal over the same set. Only the grouping into forward passes changes, and
+    the loss is computed after concatenation.
+
+    Character length is used rather than token count: it correlates closely enough to sort
+    by, and tokenising the batch twice to save tokenising it once would be self-defeating.
+    """
+    order = sorted(part, key=lambda t: max(len(t.pos_text), len(t.neg_text)))
+    return [order[i:i + micro] for i in range(0, len(order), micro)]
+
+
 def _encode_ids(model, feats: dict) -> torch.Tensor:
     return model(feats)["sentence_embedding"]
 
@@ -609,6 +632,11 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
         inner.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
     inner.config.use_cache = False
+    if rec.compile_mode:
+        # dynamic=True for the same reason as the corpus embedder: length-sorted batches
+        # still present many shapes, and static compilation re-autotunes on each one and
+        # loses more than it gains. Measured 2.19x on this model in lara/index/embed.py.
+        model[0].auto_model = torch.compile(inner, mode=rec.compile_mode, dynamic=True)
 
     class _Cfg:
         lr_muon, lr_adam, weight_decay = rec.lr_muon, rec.lr_adam, rec.weight_decay
@@ -641,7 +669,7 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
             for g, b in zip(opt.param_groups, base):
                 g["lr"] = b * scale
 
-            chunks = [part[j:j + micro] for j in range(0, len(part), micro)]
+            chunks = length_sorted_chunks(part, micro)
             feats = []
             cached = {"q": [], "p": [], "n": []}
             # Pass 1: embeddings only, no graph retained.
