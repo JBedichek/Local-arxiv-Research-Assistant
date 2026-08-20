@@ -744,7 +744,7 @@ def model_resolve(req: ResolveRequest) -> JSONResponse:
         "repo": r.repo, "exists": r.exists, "gated": r.gated, "error": r.error,
         "params": r.params, "arch": r.arch, "quantization": r.quantization,
         "size_gb": r.size_gb, "n_safetensors": r.n_safetensors, "n_gguf": r.n_gguf,
-        "pipeline": r.pipeline,
+        "pipeline": r.pipeline, "variants": r.variants, "pick": r.pick,
         "already_cached": _dl(s).cache_dir(r.repo).exists() if r.repo else False,
     }
     if r.exists and r.size_gb:
@@ -786,6 +786,9 @@ def _dl(s):
 class DownloadRequest(BaseModel):
     repo: str
     size_gb: float = 0.0
+    #: Exact file paths of one GGUF quantisation. Without it a GGUF repo pulls every
+    #: quantisation it ships, which is 133 GB to obtain a 5 GB model.
+    files: list[str] | None = None
 
 
 @app.post("/api/model/download")
@@ -803,7 +806,8 @@ def model_download(req: DownloadRequest) -> JSONResponse:
         raise HTTPException(
             507, f"needs ~{req.size_gb:.0f} GB, only {free_gb:.0f} GB free on the model disk"
         )
-    job = _dl(s).start(repo, req.size_gb, token=os.environ.get("HF_TOKEN"))
+    job = _dl(s).start(repo, req.size_gb, token=os.environ.get("HF_TOKEN"),
+                       files=req.files)
     return JSONResponse({"repo": job.repo, "status": job.status})
 
 
@@ -1219,8 +1223,9 @@ def models() -> JSONResponse:
     """Generators available from the HF cache (R6, R7)."""
     s = _state()
     from lara.models import scan
+    from lara.serve import devices as DV
 
-    found = scan(s.cfg.get_path("huggingface.home"))
+    found = scan(s.cfg.get_path("huggingface.home"), backend=DV.detect().backend)
 
     # Which model vLLM is actually serving. The picker lists everything in the cache, but
     # only one is loaded (D5, single_resident), and sending any other name to vLLM is a

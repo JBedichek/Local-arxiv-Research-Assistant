@@ -1864,6 +1864,20 @@ queueMicrotask(() => boot().catch((e) => {
 
 let dlResolved = null;
 let dlPoll = null;
+/* Which GGUF quantisation is selected. Null for safetensors repos, which have one. */
+let dlQuant = null;
+/* /api/device, cached so the fit line can be recomputed when the selection changes. */
+let dlDevice = null;
+
+/* The selected variant, and the size/files that go with it. */
+function dlVariant(r) {
+  if (!r || !r.variants || !r.variants.length) return null;
+  return r.variants.find((v) => v.quant === dlQuant) || null;
+}
+function dlSize(r) {
+  const v = dlVariant(r);
+  return v ? v.size_gb : (r ? r.size_gb : 0);
+}
 
 /* Where to actually find each format. A model name alone is not enough: "Qwen3-8B" names
  * three different sets of files depending on who converted it, and only one of them will
@@ -1902,6 +1916,7 @@ function openDownloadModal() {
   $("#dl-repo").value = "";
   $("#dl-repo").focus();
   api("/api/device").then((d) => {
+    dlDevice = d;
     const where = d.unified_memory ? "unified RAM" : "VRAM";
     $("#dl-device").textContent =
       `${d.system}/${d.machine} · ${d.accelerator.toUpperCase()} · ${d.budget_gb} GB ${where}`
@@ -1940,6 +1955,74 @@ $("#dl-close").addEventListener("click", () => {
   clearInterval(dlPoll);
 });
 
+/* KV cache and activations on top of the weights — same 1.35x the setup wizard uses. */
+const KV_OVERHEAD = 1.35;
+
+function renderResolved(r) {
+  if (!r) return;
+  const row = (k, v, cls = "") =>
+    `<div class="row"><span class="k">${k}</span><span class="v ${cls}">${v}</span></div>`;
+  let html = row("repo", escapeHtml(r.repo));
+  if (r.params) html += row("parameters", (r.params / 1e9).toFixed(1) + "B");
+  if (r.arch) html += row("architecture", escapeHtml(r.arch));
+  if (r.quantization) html += row("quantization", escapeHtml(r.quantization));
+
+  /* A GGUF repo ships one file per quantisation — 25 of them, 133 GB, for an 8B model —
+   * so "download size" means nothing until one is chosen, and fetching the repo means
+   * fetching every alternative. Default to the 4-bit build the server picked; only the
+   * selected files are ever downloaded. */
+  if (r.variants && r.variants.length) {
+    const opts = r.variants.map((v) => {
+      const sel = v.quant === dlQuant ? " selected" : "";
+      const shards = v.files.length > 1 ? ` · ${v.files.length} parts` : "";
+      return `<option value="${escapeHtml(v.quant)}"${sel}>${escapeHtml(v.quant)}`
+           + ` — ${v.size_gb.toFixed(1)} GB${shards}</option>`;
+    }).join("");
+    html += `<div class="row"><span class="k">quantisation</span><span class="v">`
+          + `<select id="dl-quant">${opts}</select></span></div>`;
+  }
+
+  const size = dlSize(r);
+  html += row("download size",
+    size ? `~${size.toFixed(1)} GB` : (r.n_gguf ? "pick a quantisation above" : "unknown"));
+
+  /* Recomputed here rather than reusing r.fit, which the server calculated for the
+   * default quantisation and which goes stale the moment the selection changes. */
+  if (size && dlDevice && dlDevice.budget_gb) {
+    const need = size * KV_OVERHEAD;
+    const budget = dlDevice.budget_gb;
+    const where = dlDevice.unified_memory ? "unified RAM" : "VRAM";
+    const ok = need <= budget;
+    html += row("fits here",
+      ok ? `yes — needs ~${need.toFixed(1)} GB of ${budget} GB ${where}`
+         : `no — needs ~${need.toFixed(1)} GB but only ${budget} GB ${where}`,
+      ok ? "ok" : "bad");
+  } else if (r.fit) {
+    html += row("fits here",
+      r.fit.fits ? `yes — needs ~${r.fit.needed_gb} GB of ${r.fit.budget_gb} GB ${r.fit.where}`
+                 : `no — needs ~${r.fit.needed_gb} GB but only ${r.fit.budget_gb} GB ${r.fit.where}`,
+      r.fit.fits ? "ok" : "bad");
+  }
+
+  if (r.already_cached) html += row("status", "already in your cache", "ok");
+  if (r.warning) {
+    html += `<div class="row"><span class="k"></span>`
+          + `<span class="v warn">${escapeHtml(r.warning)}</span></div>`;
+  }
+  $("#dl-info").innerHTML = html;
+
+  const qsel = $("#dl-quant");
+  if (qsel) {
+    qsel.addEventListener("change", (e) => {
+      dlQuant = e.target.value;
+      renderResolved(dlResolved);   // size and fit both follow the selection
+    });
+  }
+  // Offered even when it does not fit: the estimate is conservative and the machine is
+  // the user's to judge.
+  $("#dl-start").hidden = !!r.already_cached;
+}
+
 $("#dl-form").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const q = $("#dl-repo").value.trim();
@@ -1952,32 +2035,12 @@ $("#dl-form").addEventListener("submit", async (ev) => {
       body: JSON.stringify({ query: q }),
     });
     dlResolved = r;
+    dlQuant = r.pick || (r.variants && r.variants.length ? r.variants[0].quant : null);
     if (!r.exists || r.error) {
       $("#dl-info").innerHTML = `<span class="bad">${escapeHtml(r.error || "not found")}</span>`;
       return;
     }
-    const row = (k, v, cls = "") =>
-      `<div class="row"><span class="k">${k}</span><span class="v ${cls}">${v}</span></div>`;
-    const fit = r.fit;
-    let html = row("repo", escapeHtml(r.repo));
-    if (r.params) html += row("parameters", (r.params / 1e9).toFixed(1) + "B");
-    if (r.arch) html += row("architecture", escapeHtml(r.arch));
-    if (r.quantization) html += row("quantization", escapeHtml(r.quantization));
-    html += row("download size",
-      r.size_gb ? `~${r.size_gb} GB`
-                : (r.n_gguf ? "varies by quantisation" : "unknown"));
-    if (fit) {
-      html += row("fits here",
-        fit.fits ? `yes — needs ~${fit.needed_gb} GB of ${fit.budget_gb} GB ${fit.where}`
-                 : `no — needs ~${fit.needed_gb} GB but only ${fit.budget_gb} GB ${fit.where}`,
-        fit.fits ? "ok" : "bad");
-    }
-    if (r.already_cached) html += row("status", "already in your cache", "ok");
-    if (r.warning) html += `<div class="row"><span class="k"></span><span class="v warn">${escapeHtml(r.warning)}</span></div>`;
-    $("#dl-info").innerHTML = html;
-    // Offered even when it does not fit: the estimate is conservative and the machine is
-    // the user's to judge.
-    $("#dl-start").hidden = r.already_cached;
+    renderResolved(r);
   } catch (err) {
     $("#dl-info").innerHTML = `<span class="bad">${escapeHtml(String(err.message || err))}</span>`;
   }
@@ -1988,9 +2051,16 @@ $("#dl-start").addEventListener("click", async () => {
   $("#dl-start").hidden = true;
   $("#dl-progress").hidden = false;
   try {
+    const variant = dlVariant(dlResolved);
     await api("/api/model/download", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ repo: dlResolved.repo, size_gb: dlResolved.size_gb }),
+      body: JSON.stringify({
+        repo: dlResolved.repo,
+        size_gb: dlSize(dlResolved),
+        // Only this quantisation's files. Omitted for safetensors repos, where the
+        // whole snapshot is the model.
+        files: variant ? variant.files : null,
+      }),
     });
   } catch (err) {
     $("#dl-progress-text").innerHTML = `<span class="bad">${escapeHtml(String(err.message || err))}</span>`;

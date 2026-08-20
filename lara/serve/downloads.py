@@ -28,6 +28,87 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9][\w.-]*/[\w.-]+$")
 # safetensors plus pickled duplicates doubles the download for nothing.
 ALLOW = ["*.json", "*.safetensors", "*.model", "*.txt", "*.jinja", "*.gguf"]
 
+#: Everything in a repo that is not model weights. Small, and llama.cpp wants the
+#: tokenizer/template files alongside a GGUF it did not build itself.
+ALLOW_METADATA = ["*.json", "*.model", "*.txt", "*.jinja"]
+
+#: A GGUF publisher ships one file per quantisation of the same model — 25 of them,
+#: 133 GB, for an 8B — so ``allow_patterns=["*.gguf"]`` fetches every alternative to get
+#: the one you wanted. Quantisation is part of the *filename*, not repo metadata, so it
+#: has to be parsed out of the file listing.
+QUANT_RE = re.compile(
+    r"(?:^|[-_.])((?:UD-)?(?:IQ|Q)\d+(?:_[A-Z0-9]+)*|BF16|FP16|F16|F32)(?=[-.]|$)",
+    re.IGNORECASE,
+)
+
+#: Multi-part quantisations: Qwen3-8B-Q4_K_M-00001-of-00002.gguf
+SHARD_RE = re.compile(r"-\d{5}-of-\d{5}$")
+
+#: Preference among 4-bit variants, best first. Q4_K_M is the near-universal default —
+#: the quality/size knee, and what "4-bit" means in practice for llama.cpp. K_S trades a
+#: little quality for size; the IQ (importance-matrix) forms are smaller again but slower
+#: on some hardware, so they rank below the plain K-quants.
+GGUF_4BIT_PREFERENCE = ["Q4_K_M", "Q4_K_S", "Q4_1", "Q4_0", "IQ4_NL", "IQ4_XS"]
+
+
+def quant_of(path: str) -> str | None:
+    """The quantisation label in a GGUF filename, e.g. ``Q4_K_M``.
+
+    Takes the *last* match: repo and model names contain digits and underscores of their
+    own, and the quant tag is conventionally the final component before any shard suffix.
+    """
+    stem = path.rsplit("/", 1)[-1]
+    if stem.lower().endswith(".gguf"):
+        stem = stem[: -len(".gguf")]
+    stem = SHARD_RE.sub("", stem)
+    found = QUANT_RE.findall(stem)
+    return found[-1].upper() if found else None
+
+
+def gguf_variants(files: list[dict]) -> list[dict]:
+    """Group a repo's GGUF files by quantisation, summing sharded ones.
+
+    ``files`` is the Hub tree listing: dicts with ``path`` and a size, which for LFS
+    objects lives under ``lfs.size`` rather than ``size``.
+    """
+    groups: dict[str, dict] = {}
+    for f in files:
+        path = f.get("path") or ""
+        if not path.lower().endswith(".gguf"):
+            continue
+        label = quant_of(path) or "unlabelled"
+        size = int((f.get("lfs") or {}).get("size") or f.get("size") or 0)
+        g = groups.setdefault(label, {"quant": label, "files": [], "size_gb": 0.0})
+        g["files"].append(path)
+        g["size_gb"] = round(g["size_gb"] + size / 1e9, 2)
+    out = list(groups.values())
+    out.sort(key=lambda g: g["size_gb"])
+    return out
+
+
+def pick_4bit(variants: list[dict]) -> str | None:
+    """The 4-bit quantisation to default to, or None if the repo ships no 4-bit build."""
+    have = {v["quant"] for v in variants}
+    for want in GGUF_4BIT_PREFERENCE:
+        if want in have:
+            return want
+    return None
+
+
+def tree(repo: str, token: str | None = None) -> list[dict]:
+    """The repo's file listing with sizes. Empty on any failure — callers degrade."""
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    try:
+        r = httpx.get(f"https://huggingface.co/api/models/{repo}/tree/main",
+                      headers=headers, timeout=20, follow_redirects=True,
+                      params={"recursive": "true"})
+    except httpx.RequestError:
+        return []
+    if r.status_code != 200:
+        return []
+    data = r.json()
+    return data if isinstance(data, list) else []
+
 
 def normalise(query: str) -> str | None:
     """Accept a bare id, a full URL, or a paste with surrounding whitespace."""
@@ -51,6 +132,11 @@ class Resolved:
     n_gguf: int = 0
     pipeline: str | None = None
     error: str | None = None
+    #: One entry per quantisation the repo ships, smallest first, with the file(s) that
+    #: make it up. Empty for safetensors repos.
+    variants: list[dict] = field(default_factory=list)
+    #: The 4-bit variant to default to, if the repo has one.
+    pick: str | None = None
 
 
 def resolve(query: str, token: str | None = None) -> Resolved:
@@ -90,13 +176,19 @@ def resolve(query: str, token: str | None = None) -> Resolved:
 
     params = int(safet.get("total") or 0)
     dtype_bytes = 1 if (cfg.get("quantization_config") or {}) else 2
+    variants: list[dict] = []
+    pick: str | None = None
     if params:
         size = params * dtype_bytes / 1e9
     elif gg and not st:
-        # A GGUF repo usually ships every quantisation of the same model, so usedStorage
-        # is the sum of a dozen alternatives — it reported 707 GB for an 8B model. There
-        # is no single honest number without picking a quant, so report none.
-        size = 0.0
+        # A GGUF repo ships every quantisation of the same model, so usedStorage is the
+        # sum of a dozen alternatives — it reported 707 GB for an 8B model. Size is only
+        # meaningful once a quantisation is chosen, so resolve them individually and
+        # quote the one we would actually download.
+        variants = gguf_variants(tree(repo, token))
+        pick = pick_4bit(variants)
+        chosen = next((v for v in variants if v["quant"] == pick), None)
+        size = chosen["size_gb"] if chosen else 0.0
     else:
         size = (d.get("usedStorage") or 0) / 1e9
 
@@ -105,7 +197,7 @@ def resolve(query: str, token: str | None = None) -> Resolved:
         arch=(cfg.get("architectures") or [None])[0],
         quantization=(cfg.get("quantization_config") or {}).get("quant_method"),
         size_gb=round(size, 1), n_safetensors=len(st), n_gguf=len(gg),
-        pipeline=d.get("pipeline_tag"),
+        pipeline=d.get("pipeline_tag"), variants=variants, pick=pick,
     )
 
 
@@ -150,13 +242,21 @@ class DownloadManager:
                 continue
         return total / 1e9
 
-    def start(self, repo: str, total_gb: float, token: str | None = None) -> Job:
+    def start(self, repo: str, total_gb: float, token: str | None = None,
+              files: list[str] | None = None) -> Job:
+        """Fetch ``repo``, or only ``files`` from it.
+
+        ``files`` carries the exact paths of one GGUF quantisation. Without it a GGUF
+        repo pulls every quantisation it ships — 133 GB to obtain the 5 GB you asked
+        for — because the wanted one is distinguishable only by filename.
+        """
         with self._lock:
             existing = self.jobs.get(repo)
             if existing and existing.status in ("starting", "downloading"):
                 return existing
             job = Job(repo=repo, total_gb=total_gb)
             self.jobs[repo] = job
+        patterns = (ALLOW_METADATA + list(files)) if files else ALLOW
 
         def work() -> None:
             from huggingface_hub import snapshot_download
@@ -172,7 +272,7 @@ class DownloadManager:
             try:
                 job.status = "downloading"
                 path = snapshot_download(
-                    repo, allow_patterns=ALLOW, max_workers=8,
+                    repo, allow_patterns=patterns, max_workers=8,
                     token=token, cache_dir=str(self.hf_home / "hub"),
                 )
                 job.path = path
