@@ -1877,6 +1877,19 @@ function openDownloadModal() {
     $("#dl-device").textContent =
       `${d.system}/${d.machine} · ${d.accelerator.toUpperCase()} · ${d.budget_gb} GB ${where}`
       + ` · backend: ${d.backend}`;
+    /* Both null until `lara setup` has run — say so rather than showing a blank line,
+     * since "no advice" and "your machine fits nothing" look identical otherwise. */
+    const hint = $("#dl-fits");
+    if (d.generator_max_params_4bit) {
+      const b = d.generator_max_params_4bit / 1e9;
+      hint.innerHTML =
+        `With your index loaded, about <strong>${b >= 10 ? b.toFixed(0) : b.toFixed(1)}B `
+        + `parameters at 4-bit</strong> fits in the ${d.generator_headroom_gb} GB left over. `
+        + `Bigger models still download — they just will not load alongside the corpus.`;
+    } else {
+      hint.innerHTML =
+        `Run <code>lara setup</code> to have this dialog tell you what size fits.`;
+    }
   }).catch(() => {});
 }
 
@@ -1966,6 +1979,8 @@ $("#dl-start").addEventListener("click", async () => {
  * no separate button competing for space in the top bar. */
 const DL_SENTINEL = "__download__";
 
+let dlAutoOpened = false;
+
 async function loadModels() {
   try {
     const m = await api("/api/models");
@@ -1973,10 +1988,24 @@ async function loadModels() {
     const opts = m.models.map((x) =>
       `<option value="${x.repo}"${live.has(x.repo) ? " selected" : ""}>` +
       `${x.repo} (${x.size_gb}GB)${live.has(x.repo) ? " — loaded" : " — not loaded"}</option>`);
+    /* With an empty cache the sentinel would be the *only* option, which makes it the
+     * selection already — so choosing it fires no `change` event and the dialog never
+     * opened. A disabled placeholder keeps the sentinel something you can change *to*. */
+    if (!m.models.length) {
+      opts.unshift(`<option value="" disabled selected>no model in cache</option>`);
+    }
     opts.push(`<option value="${DL_SENTINEL}">＋ Download new model…</option>`);
     state.models = m.models;
     $("#model").innerHTML = opts.join("");
     syncQuant();
+
+    /* Nothing to generate with, so the download dialog is the only useful next step.
+     * Once per page load: re-opening it after every poll would trap the user. */
+    if (!m.models.length && !dlAutoOpened) {
+      dlAutoOpened = true;
+      openDownloadModal();
+    }
+    if (m.models.length) dlAutoOpened = false;
   } catch { /* picker is optional for browsing */ }
 }
 

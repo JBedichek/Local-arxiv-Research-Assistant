@@ -1100,9 +1100,9 @@ def setup(
     # today" depends on the corpus you scope to and what else the machine is doing.
     def backend_table(cursor: int | None) -> Table:
         t = Table(show_header=True, header_style="bold")
-        for c, j in (("", "left"), ("option", "left"), ("index", "right"),
-                     ("resident", "right"), ("generator left", "right"),
-                     ("p50", "right"), ("recall", "right"), ("note", "left")):
+        for c, j in (("", "left"), ("search engine", "left"), ("index RAM", "right"),
+                     ("total RAM", "right"), ("room for AI model", "right"),
+                     ("speed", "right"), ("accuracy", "right"), ("trade-off", "left")):
             t.add_column(c, justify=j, overflow="fold")
         for i, opt in enumerate(opts):
             on_cursor = cursor is not None and i == cursor
@@ -1110,17 +1110,19 @@ def setup(
             style = ("bold cyan" if on_cursor
                      else "green" if opt.key == recommended else "")
             cell = f"[{style}]{opt.label}[/{style}]" if style else opt.label
-            # Against the *scoped* index, not the full-corpus one. Every option overflows
-            # a laptop unscoped, so headroom computed there reads 0.0 for all of them and
-            # tells you nothing about the choice you are making.
-            scoped = opt.index_gb(int(n_chunks * gen_keep), plan.dim)
-            head = SU.generator_headroom_gb(device.budget_gb, scoped + plan.overhead_gb)
+            # Every column is quoted at the size this machine will actually build. Mixing
+            # a full-corpus index with leftover-memory computed after scoping made two
+            # columns that could not both be true at once.
+            idx = opt.index_gb(int(n_chunks * gen_keep), plan.dim)
+            full = opt.index_gb(n_chunks, plan.dim)
+            idx_cell = (f"{idx:.1f} GB" if gen_keep >= 1
+                        else f"{idx:.1f} GB\n[dim]of {full:.1f} full[/dim]")
+            resident = idx + plan.overhead_gb
+            head = SU.generator_headroom_gb(device.budget_gb, resident)
             params = SU.generator_params_at_4bit(head)
             gen = (f"{head:.1f} GB\n~{SU.format_params(params)} @4bit" if params >= 5e8
                    else f"{head:.1f} GB\n[red]no room[/red]")
-            t.add_row(mark, cell,
-                      f"{opt.index_gb(n_chunks, plan.dim):.1f} GB",
-                      f"{totals[opt.key]:.1f} GB", gen,
+            t.add_row(mark, cell, idx_cell, f"{resident:.1f} GB", gen,
                       f"{opt.p50_ms:.1f}ms", f"{opt.recall:.3f}", opt.note)
         return t
 
@@ -1136,28 +1138,47 @@ def setup(
         fixed.append(f"cross-encoder reranker {plan.reranker_gb:.1f}")
     fixed.append(f"tier-0 hot cache {plan.hot_tier_bytes / 1e9:.1f}")
     width = "fp32" if device.accelerator == "cpu" else "half precision"
-    pool = ("Unified memory: retrieval and the generator share one pool."
+    pool = ("This machine shares one pool of memory between the search index and the AI "
+            "model, so every GB one takes is a GB the other cannot have."
             if device.unified_memory else
-            "The index sits on one card; vLLM can shard a generator wider.")
-    legend = (
-        f"  [dim]→ = recommended for this machine.\n"
-        f"  resident = index + {' + '.join(fixed)} = "
-        f"{plan.overhead_gb:.1f} GB fixed, against a {plan.budget_gb:.0f} GB budget.\n"
-        f"  Encoders load in {width} on {device.accelerator} and are not int-quantised, "
-        f"so those two figures double on CPU.\n"
-        f"  generator left = what remains of the {plan.budget_gb:.0f} GB budget "
-        f"{'at the step-4 keep fraction of ' + format(gen_keep, '.0%') if gen_keep < 1 else 'with the whole corpus resident'}"
-        f", and the largest 4-bit model that fits it once KV cache and activations take "
-        f"their {SU.KV_OVERHEAD:.2f}x. {pool}\n"
-        f"  Anything larger than the budget needs the corpus scoped in step 4. Latency "
-        f"and recall measured with `lara bench-index`.[/dim]")
+            "The index sits on a single card; a generator can be sharded across all of "
+            "them, so this is the cautious figure.")
+    basis = (f"at the {gen_keep:.0%} of the corpus step 4 will keep resident"
+             if gen_keep < 1 else "with the whole corpus resident")
+
+    def legend_table() -> Table:
+        g = Table(show_header=False, box=None, padding=(0, 2))
+        g.add_column(style="bold", no_wrap=True)
+        g.add_column(overflow="fold")
+        g.add_row("search engine", "which engine stores and searches the vectors")
+        g.add_row("index RAM", f"memory the search index alone needs, {basis}")
+        g.add_row("total RAM", f"index + {' + '.join(fixed)} — the {plan.overhead_gb:.1f} GB "
+                               f"of models and cache is always loaded, whatever you pick")
+        g.add_row("room for AI model",
+                  f"what is left of this machine's {plan.budget_gb:.0f} GB for the model "
+                  f"that writes answers, and the biggest one that fits if it is "
+                  f"4-bit quantised (KV cache and activations take {SU.KV_OVERHEAD:.2f}x "
+                  f"the weights on top)")
+        g.add_row("speed", "typical time for one search — lower is better")
+        g.add_row("accuracy", "share of the truly-best results returned; 1.000 is exact, "
+                              "0.979 means ~2 in 100 are missed")
+        return g
+
+    def print_legend() -> None:
+        console.print("  [dim]→ marks the recommendation. Any row can be chosen.[/dim]")
+        console.print(legend_table())
+        console.print(f"  [dim]The embedder and reranker load in {width} on "
+                      f"{device.accelerator} and are not further compressed, so those two "
+                      f"figures double on a CPU-only machine. {pool}\n"
+                      f"  Speed and accuracy are measured — reproduce with "
+                      f"`lara bench-index`.[/dim]")
 
     chosen = plan.option
     if non_interactive or show:
         console.print(backend_table(None))
-        console.print(legend)
+        print_legend()
     elif prompt_mod.interactive():
-        console.print(legend)
+        print_legend()
         console.print("  [dim]↑/↓ to move, enter to choose, esc to keep the "
                       "recommendation.[/dim]")
         start = keys.index(recommended)
@@ -1169,7 +1190,7 @@ def setup(
     else:
         # Not a terminal — piped input, CI, TERM=dumb. Typing still has to work.
         console.print(backend_table(None))
-        console.print(legend)
+        print_legend()
         while True:
             pick = typer.prompt(f"\n  backend [{'/'.join(keys)}]", default=recommended)
             pick = pick.strip()

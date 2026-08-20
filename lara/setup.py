@@ -183,6 +183,31 @@ class Plan:
     def scoped_index_gb(self) -> float:
         return self.option.index_gb(self.scoped_chunks, self.dim)
 
+    @property
+    def effective_keep(self) -> float:
+        """The keep fraction this machine will actually run with.
+
+        ``scope_keep`` is left at whatever the solver last computed even when scoping
+        turns out to be unnecessary, so reading it directly shrinks an index that is
+        never going to be shrunk.
+        """
+        return 1.0 if self.scope == "unnecessary" else self.scope_keep
+
+    @property
+    def planned_index_gb(self) -> float:
+        """Index size as configured — scoped if scoping applies, whole if it does not."""
+        return self.option.index_gb(int(self.n_chunks * self.effective_keep), self.dim)
+
+    @property
+    def generator_headroom_gb(self) -> float:
+        """Memory left for the generation model and its KV cache once retrieval is in."""
+        return max(0.0, self.budget_gb - (self.planned_index_gb + self.overhead_gb))
+
+    @property
+    def generator_params_4bit(self) -> float:
+        """Largest 4-bit generator this machine can hold alongside the index."""
+        return generator_params_at_4bit(self.generator_headroom_gb)
+
 
 def overhead_gb(hot_tier_bytes: int = 2_000_000_000, cross_encoder: bool = True,
                 accelerator: str = "cpu") -> float:
@@ -427,7 +452,17 @@ def overrides_for(plan: Plan, *, model: str | None = None,
     # preserve what you do not" is only safe if the wizard writes everything it decides.
     index["rerank"] = {"cross_encoder": {"enabled": not plan.disable_cross_encoder}}
 
-    out: dict = {"index": index, "hot_tier": {"max_bytes": int(plan.hot_tier_bytes)}}
+    # Saved so the reader can tell you what will fit without re-deriving it. The UI has
+    # no idea what the index costs, and asking a user to remember "about 8B at 4-bit"
+    # from a wizard they ran last month is not a plan.
+    out: dict = {
+        "index": index,
+        "hot_tier": {"max_bytes": int(plan.hot_tier_bytes)},
+        "hardware": {
+            "generator_headroom_gb": round(plan.generator_headroom_gb, 1),
+            "generator_max_params_4bit": int(plan.generator_params_4bit),
+        },
+    }
     if disk_root:
         out["disk"] = {"root": disk_root}
     if devices is not None:

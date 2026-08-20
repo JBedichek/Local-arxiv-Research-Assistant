@@ -705,12 +705,19 @@ def device_info() -> JSONResponse:
     from lara.serve import devices as DV
 
     d = DV.detect()
+    # Written by `lara setup`, which is the only thing that knows what the index costs.
+    # Absent until the wizard has run, so both keys can be null and the UI must cope.
+    cfg = _state().cfg
+    headroom = cfg.get_in("hardware.generator_headroom_gb")
+    max_params = cfg.get_in("hardware.generator_max_params_4bit")
     return JSONResponse({
         "system": d.system, "machine": d.machine, "accelerator": d.accelerator,
         "unified_memory": d.unified_memory, "total_ram_gb": d.total_ram_gb,
         "usable_ram_gb": d.usable_ram_gb, "gpus": d.gpus,
         "total_vram_gb": d.total_vram_gb, "budget_gb": d.budget_gb,
         "backend": d.backend, "backend_reason": d.backend_reason, "notes": d.notes,
+        "generator_headroom_gb": headroom,
+        "generator_max_params_4bit": max_params,
     })
 
 
