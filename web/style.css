@@ -649,3 +649,30 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
    so a long thread does not lose the entry you came in through. */
 .msg.restored .text { opacity: .88; }
 .msg.restored.focused { box-shadow: inset 3px 0 0 var(--accent, #7a6); }
+
+/* ── Context viewer and throughput ───────────────────────────────────────────
+   Collapsed by default: it answers a question you only sometimes have, and an
+   always-open accounting panel under every answer would bury the answer. */
+.ctx { margin-top: .45rem; font-size: .8rem; }
+.ctx > summary { cursor: pointer; opacity: .82; padding: .1rem 0; }
+.ctx > summary b { font-weight: 600; }
+.warn-inline { font-size: .74rem; padding: 0 .3rem; border-radius: 3px;
+               background: rgba(200,140,40,.22); }
+/* Proportional to the real context window, so "the excerpts filled it" is a shape
+   rather than a sum you have to do yourself. */
+.cbar { display: flex; height: 9px; border-radius: 5px; overflow: hidden;
+        margin: .4rem 0 .5rem; background: rgba(127,127,127,.12); }
+.cseg { display: block; height: 100%; }
+.cseg.cres { background: repeating-linear-gradient(45deg,
+             rgba(127,127,127,.35) 0 3px, transparent 3px 6px); }
+.cseg.cfree { background: transparent; }
+.ctable { width: 100%; border-collapse: collapse; }
+.ctable td { padding: .12rem .3rem; }
+.ctable td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.ctable tr.ctot td { border-top: 1px solid var(--rule); opacity: .75; }
+.cdot { display: inline-block; width: .55em; height: .55em; border-radius: 2px;
+        margin-right: .4em; vertical-align: baseline; }
+.ctx-note { opacity: .7; margin: .4rem 0 0; }
+.perf { margin-top: .35rem; font-size: .78rem; opacity: .72;
+        font-variant-numeric: tabular-nums; }
+.perf b { font-weight: 600; opacity: .95; }

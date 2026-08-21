@@ -1704,6 +1704,8 @@ async def ask(req: AskRequest) -> StreamingResponse:
                 custom_prompt = None
 
             answer = ""
+            gen_started = time.time()
+            first_token_at = None
             async for token in stream_answer(
                 # Deliberately req.query, not the rewrite: retrieval needed a
                 # self-contained query, but the answer must address the question the
@@ -1713,8 +1715,56 @@ async def ask(req: AskRequest) -> StreamingResponse:
                 model=req.model, temperature=req.temperature, max_tokens=req.max_tokens,
                 coverage=coverage, system=custom_prompt,
             ):
+                if first_token_at is None:
+                    first_token_at = time.time()
                 answer += token
                 yield f"event: token\ndata: {json.dumps(token)}\n\n"
+
+            # Context accounting and throughput, both from the generator itself rather
+            # than estimated here — see generate.count_tokens.
+            try:
+                from lara.serve import generate as GEN
+
+                vcfg = s.cfg.get_in("serving.vllm") or {}
+                base_url = vcfg.get("base_url", "http://127.0.0.1:8000/v1")
+                model_name = req.model or vcfg.get("default_model") or ""
+                parts = list(getattr(GEN.build_prompt, "last_parts", []) or [])
+                usage = getattr(GEN.stream_answer, "last_usage", None) or {}
+
+                counts = await GEN.count_tokens(base_url, model_name,
+                                                [t for _, t in parts]) if parts else None
+                limit = await GEN.context_limit(base_url, model_name) or int(
+                    vcfg.get("max_model_len", 32768))
+                ctx = {
+                    "limit": limit,
+                    "reserved": int(req.max_tokens),
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                    "completion_tokens": usage.get("completion_tokens"),
+                    "exact": counts is not None,
+                    "parts": [
+                        {"name": n, "chars": len(t),
+                         "tokens": (counts[i] if counts else round(len(t) / 4))}
+                        for i, (n, t) in enumerate(parts)
+                    ],
+                }
+                yield f"event: context\ndata: {json.dumps(ctx)}\n\n"
+
+                done_at = time.time()
+                out_tokens = usage.get("completion_tokens")
+                gen_s = done_at - (first_token_at or gen_started)
+                perf = {
+                    "ttft_ms": round(((first_token_at or done_at) - gen_started) * 1000),
+                    "completion_tokens": out_tokens,
+                    "prompt_tokens": usage.get("prompt_tokens"),
+                    # Measured from FIRST TOKEN, not from the request: including the
+                    # prefill in a decode rate makes a long prompt look like a slow model.
+                    "tok_per_sec": (round((out_tokens - 1) / gen_s, 1)
+                                    if out_tokens and out_tokens > 1 and gen_s > 0 else None),
+                    "generate_ms": round((done_at - gen_started) * 1000),
+                }
+                yield f"event: perf\ndata: {json.dumps(perf)}\n\n"
+            except Exception:
+                pass
 
             try:
                 from lara.serve import memory as MEM

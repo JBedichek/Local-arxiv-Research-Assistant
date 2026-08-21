@@ -145,7 +145,61 @@ def build_prompt(
                  "explicitly if the excerpts answer some parts but not others:\n"
                  + "\n".join(f"  - {p}" for p in parts) + "\n")
     tail += f"\nQuestion: {query.strip()}\n\nAnswer:"
+    # The parts, in prompt order, so the viewer shows what was actually sent rather than a
+    # reconstruction that can drift from it.
+    build_prompt.last_parts = [
+        ("system", SYSTEM), ("few-shot", FEWSHOT), ("history", history),
+        ("excerpts", excerpts), ("question", tail),
+    ]
     return prefix, tail
+
+
+async def count_tokens(base_url: str, model: str, texts: list[str]) -> list[int] | None:
+    """Exact token counts from the generator's tokenizer, or None if it cannot say.
+
+    Asking the server beats tokenizing locally: it is the tokenizer that will actually be
+    used, so the numbers match what the model sees rather than what a lookalike would.
+    Returns None rather than guessing — a context viewer that silently shows estimates as
+    facts is worse than one that admits it does not know.
+    """
+    import httpx
+
+    root = base_url.rstrip("/")
+    root = root[:-3] if root.endswith("/v1") else root
+    out: list[int] = []
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=3.0)) as client:
+            for t in texts:
+                if not t:
+                    out.append(0)
+                    continue
+                r = await client.post(f"{root}/tokenize", json={"model": model, "prompt": t})
+                if r.status_code != 200:
+                    return None
+                out.append(int(r.json().get("count", 0)))
+    except Exception:
+        return None
+    return out
+
+
+async def context_limit(base_url: str, model: str) -> int | None:
+    """The model's real context window, as the server reports it."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
+            r = await client.get(f"{base_url.rstrip('/')}/models")
+            if r.status_code != 200:
+                return None
+            for m in r.json().get("data", []):
+                if m.get("id") == model and m.get("max_model_len"):
+                    return int(m["max_model_len"])
+            for m in r.json().get("data", []):
+                if m.get("max_model_len"):
+                    return int(m["max_model_len"])
+    except Exception:
+        return None
+    return None
 
 
 async def stream_answer(
@@ -198,8 +252,11 @@ async def stream_answer(
         "temperature": temperature,
         "max_tokens": max_tokens,
         "stream": True,
+        # The server counts its own tokens; anything computed here would be a lookalike.
+        "stream_options": {"include_usage": True},
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    stream_answer.last_usage = None
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0)) as client:
         try:
@@ -217,6 +274,9 @@ async def stream_answer(
                         chunk = json.loads(data)
                     except json.JSONDecodeError:
                         continue
+                    if chunk.get("usage"):
+                        # The final frame carries exact prompt and completion counts.
+                        stream_answer.last_usage = chunk["usage"]
                     choice = (chunk.get("choices") or [{}])[0]
                     delta = choice.get("delta", {})
                     # Some builds stream reasoning in its own field; that is easy, we

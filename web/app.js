@@ -404,6 +404,10 @@ $("#ask-form").addEventListener("submit", async (ev) => {
           }
           body += JSON.parse(dm[1]);
           textEl.innerHTML = linkCitations(body, hits);
+        } else if (ev[1] === "context") {
+          renderContext(answerEl, JSON.parse(dm[1]));
+        } else if (ev[1] === "perf") {
+          renderPerf(answerEl, JSON.parse(dm[1]));
         } else if (ev[1] === "error") {
           textEl.innerHTML = `<span class="error">${escapeHtml(JSON.parse(dm[1]))}</span>`;
         }
@@ -2572,4 +2576,80 @@ function renderMath(escaped) {
         return src;                 // never worse than the raw source it replaced
       }
     });
+}
+
+/* ── Context viewer and throughput ────────────────────────────────────────────
+ *
+ * What went into the prompt, and how much room was left. Both numbers come from
+ * the generator's own tokenizer and its usage report, not from a local estimate:
+ * a viewer that presents guesses as facts is worse than one that says it cannot
+ * tell, so an inexact count is labelled rather than quietly shown.
+ *
+ * The bar is proportional to the model's real context window, so "excerpts filled
+ * most of it" is visible at a glance rather than something you work out from
+ * numbers. Free space is drawn too — the point of the panel is as much what was
+ * left unused as what was spent.
+ */
+const CTX_COLORS = { system: "#8a8", "few-shot": "#a99", history: "#89b",
+                     excerpts: "#c96", question: "#b8a" };
+
+function renderContext(msgEl, ctx) {
+  if (!msgEl || !ctx) return;
+  const host = msgEl.querySelector(".meta") || msgEl;
+  let box = msgEl.querySelector(".ctx");
+  if (!box) {
+    box = document.createElement("details");
+    box.className = "ctx";
+    host.append(box);
+  }
+  const limit = ctx.limit || 32768;
+  const used = ctx.prompt_tokens ??
+    ctx.parts.reduce((a, p) => a + (p.tokens || 0), 0);
+  const reserved = ctx.reserved || 0;
+  const free = Math.max(0, limit - used - reserved);
+  const pct = (n) => `${(100 * n / limit).toFixed(1)}%`;
+
+  const segs = ctx.parts.filter((p) => p.tokens > 0).map((p) =>
+    `<span class="cseg" style="width:${pct(p.tokens)};background:${CTX_COLORS[p.name] || "#999"}"
+           title="${escapeHtml(p.name)}: ${p.tokens} tokens"></span>`).join("");
+
+  const rows = ctx.parts.map((p) =>
+    `<tr><td><span class="cdot" style="background:${CTX_COLORS[p.name] || "#999"}"></span>` +
+    `${escapeHtml(p.name)}</td><td class="num">${p.tokens.toLocaleString()}</td>` +
+    `<td class="num dim">${pct(p.tokens)}</td>` +
+    `<td class="num dim">${p.chars.toLocaleString()} ch</td></tr>`).join("");
+
+  box.innerHTML =
+    `<summary>Context — <b>${used.toLocaleString()}</b> of ${limit.toLocaleString()} tokens` +
+    ` <span class="dim">(${pct(used)} used · ${free.toLocaleString()} free` +
+    `${reserved ? ` · ${reserved.toLocaleString()} reserved for the answer` : ""})</span>` +
+    `${ctx.exact ? "" : ' <span class="warn-inline">estimated</span>'}</summary>` +
+    `<div class="cbar">${segs}` +
+    `<span class="cseg cres" style="width:${pct(reserved)}" title="reserved for the answer"></span>` +
+    `<span class="cseg cfree" style="width:${pct(free)}" title="unused"></span></div>` +
+    `<table class="ctable"><tbody>${rows}` +
+    `<tr class="ctot"><td>reserved for answer</td><td class="num">${reserved.toLocaleString()}</td>` +
+    `<td class="num dim">${pct(reserved)}</td><td></td></tr>` +
+    `<tr class="ctot"><td>free</td><td class="num">${free.toLocaleString()}</td>` +
+    `<td class="num dim">${pct(free)}</td><td></td></tr></tbody></table>` +
+    (ctx.exact ? "" :
+      `<p class="ctx-note">The generator did not answer /tokenize, so these are ` +
+      `character-based estimates rather than real token counts.</p>`);
+}
+
+function renderPerf(msgEl, p) {
+  if (!msgEl || !p) return;
+  const host = msgEl.querySelector(".meta") || msgEl;
+  let el = msgEl.querySelector(".perf");
+  if (!el) {
+    el = document.createElement("div");
+    el.className = "perf";
+    host.append(el);
+  }
+  const bits = [];
+  if (p.ttft_ms != null) bits.push(`${p.ttft_ms} ms to first token`);
+  if (p.tok_per_sec != null) bits.push(`<b>${p.tok_per_sec}</b> tok/s`);
+  if (p.completion_tokens != null) bits.push(`${p.completion_tokens} out`);
+  if (p.prompt_tokens != null) bits.push(`${p.prompt_tokens.toLocaleString()} in`);
+  el.innerHTML = bits.join(" · ");
 }
