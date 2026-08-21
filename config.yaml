@@ -25,10 +25,8 @@ disk:
 
 paths:
   metadata_db:  ${disk.root}/meta.sqlite       # papers, sections, chunks, FTS5
-  chunk_text:   ${disk.root}/chunks/           # zstd parquet shards
   vectors_fp16: ${disk.root}/vectors/fp16.bin  # tier 2, mmap'd, 768-d
   vectors_int8: ${disk.root}/vectors/int8.bin  # tier 1, MRL-256
-  ann_index:    ${disk.root}/vectors/hnsw.faiss
   papers_fp16:  ${disk.root}/vectors/papers_fp16.bin   # paper-level, title+abstract
   papers_int8:  ${disk.root}/vectors/papers_int8.bin
   graph:        ${disk.root}/graph/            # CSR citation adjacency
@@ -47,7 +45,6 @@ corpus:
   # D1: Core scope, 2015+  (~330k papers, ~16M chunks)
   categories: [cs.LG, cs.CL, stat.ML, cs.NE]
   date_floor: "2015-01-01"
-  include_cross_lists: true
 
 ingest:
   # D2: abstracts for everything up front; full text lazily + background crawl.
@@ -55,9 +52,7 @@ ingest:
   # doubles as the nightly incremental path. Harvests the `cs` and `stat` sets in FULL;
   # the 2015 floor is applied to the v1 submission date at ingest, because OAI's `from=`
   # filters on last-modified datestamp instead. See lara/ingest/oai.py.
-  metadata_source: oai
   oai_endpoint: https://export.arxiv.org/oai2
-  oai_sets: [cs, stat]
   oai_min_interval_sec: 3.0        # arXiv's stated OAI guidance; ~1300 records per request
   fulltext:
     # Q11: 2-4 req/s, back off hard on 429. Tune `rate_per_sec` down if arXiv complains.
@@ -75,11 +70,8 @@ ingest:
       # Three consecutive 429s drops rate_per_sec by half and logs a warning.
       adaptive_throttle: true
     sources: [arxiv_html, ar5iv, pdf]   # tried in order
-    priority: citation_count             # curated top-30k crawled first
-    eager_top_n: 30000
   citations:
     # Q6: Semantic Scholar, unauthenticated to start. Verified working 2026-08-17.
-    provider: semanticscholar
     batch_endpoint: https://api.semanticscholar.org/graph/v1/paper/batch
     batch_size: 500                      # 377k papers ≈ 755 requests
     min_interval_sec: 1.1                # unauthenticated tier is a shared pool
@@ -90,7 +82,6 @@ chunking:
   target_chars: 1000
   overlap_frac: 0.15
   never_cross_sections: true
-  keep_kinds: [abstract, body, caption, equation, table, theorem, footnote]
 
 embedding:
   model: google/embeddinggemma-300m      # fully present in cache (1.2 GB), Matryoshka
@@ -118,8 +109,11 @@ embedding:
   # Documents carry a contextual prefix: "title: {paper} > {section} | text: {chunk}".
   # A free stand-in for contextual retrieval, which would otherwise cost one LLM call per
   # chunk. Queries use a DIFFERENT prompt -- EmbeddingGemma is asymmetric.
-  query_prefix: "task: search result | query: "
-  doc_prefix: "title: {title} > {section} | text: "
+  #
+  # The prefixes are NOT configurable, and used to look as though they were. They are
+  # QUERY_PREFIX and doc_prefix_for() in lara/index/embed.py, because the fine-tuning code
+  # has to build the identical string: a corpus embedded with one prefix and queried with
+  # another retrieves nothing, and two copies of the text drifted apart exactly that way.
 
 retrieval:
   # Hierarchical scope: answer from the open paper before searching 29.5M chunks.
@@ -228,6 +222,15 @@ index:
     max_terms: 3
     df_ceiling_frac: 0.005               # drop terms appearing in >0.5% of chunks
 
+# Written by `lara setup` into config.local.yaml, not set here: only the wizard knows what
+# the index costs on this machine, and the answer changes when you rescope the corpus.
+# The reader reports both through /api/device so the model picker can say what will fit
+# before you download 8 GB of the wrong thing. Absent until setup has run — both are null
+# on a fresh install, and the UI copes.
+hardware:
+  generator_headroom_gb: null       # RAM/VRAM left for the generator once the index loads
+  generator_max_params_4bit: null   # the largest model that fits in it, 4-bit quantised
+
 hot_tier:
   # Tier 0: pin the open paper + its 1-hop citation neighbourhood at full fp16.
   #
@@ -309,7 +312,6 @@ serving:
   vllm:
     # D4: GGUF ignored, vLLM only. Q4: rare switching — one model resident at a time.
     base_url: http://127.0.0.1:8000/v1
-    policy: single_resident              # stop the running server before starting another
     startup_timeout_sec: 300
     # null lets vLLM use whatever CUDA_VISIBLE_DEVICES exposes. Pin a card in
     # config.local.yaml when the embedder or reranker needs one kept clear.
@@ -325,9 +327,6 @@ serving:
     # menu changes it, and `lara serve-llm --model ...` overrides it per run.
     default_model: null
     default_quantization: null
-  sampling:
-    temperature: 0.2
-    top_p: 0.9
-    top_k: 50
-    max_tokens: 1024
-    repetition_penalty: 1.0
+  # How long the server may sit idle before it releases cached device memory. 0 disables
+  # the reaper. Read at startup; the reaper never fires while a query is in flight.
+  empty_cache_sec: 60

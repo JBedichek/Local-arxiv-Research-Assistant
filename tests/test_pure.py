@@ -14,6 +14,7 @@ property that decides whether anyone runs it.
 from __future__ import annotations
 
 import pathlib
+import re as _re
 
 import numpy as np
 import pytest
@@ -534,7 +535,7 @@ def test_expand_chunks_never_returns_the_same_chunk_twice():
 # nothing, so getting it wrong fails later and elsewhere, inside whichever worker was
 # reporting.
 
-import re as _re
+
 
 from lara.cli._base import console as _cli_console
 from lara.cli._progress import reporter as _reporter
@@ -675,3 +676,60 @@ def test_typed_prompt_rejects_a_fraction_that_is_not_a_number_or_out_of_range(mo
     monkeypatch.setattr(_SUI.typer, "prompt", lambda *a, **k: next(answers))
     _, keep = _quiet(lambda: c.run(allow_interactive=True))
     assert keep == 0.4
+
+
+# ── config keys with no reader ────────────────────────────────────────────────────
+#
+# Thirteen keys had accumulated in config.yaml that nothing read: paths pointing at
+# formats the project never shipped, ingest knobs replaced by CLI flags, embedding
+# prefixes that had moved into code. Each one is a trap -- it looks like a setting, so
+# editing it and re-running looks like it should change something.
+#
+# This is a name check, not a call-graph: a key is flagged only when its leaf name appears
+# nowhere in lara/, web/ or tests/ at all. That misses a key read under some other name,
+# and it never fires falsely.
+
+import yaml as _yaml
+
+#: Documented as unimplemented rather than pretending to work. The comment above them in
+#: config.yaml says tier 0 reserves nothing today, which makes them a note about intent
+#: instead of a setting that silently does nothing.
+_INTENTIONALLY_UNREAD = {
+    "hot_tier.pin_open_paper",
+    "hot_tier.pin_neighbors_hops",
+    "hot_tier.lru_papers",
+}
+
+_REPO = pathlib.Path(__file__).resolve().parent.parent
+
+
+def _config_leaves(node, prefix=""):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            path = f"{prefix}.{k}" if prefix else k
+            if isinstance(v, dict):
+                yield from _config_leaves(v, path)
+            else:
+                yield path
+
+
+def test_every_config_key_is_read_by_something():
+    cfg = _yaml.safe_load((_REPO / "config.yaml").read_text())
+    src = "\n".join(
+        p.read_text()
+        for d, glob in (("lara", "**/*.py"), ("web", "**/*.js"), ("tests", "**/*.py"))
+        for p in (_REPO / d).glob(glob)
+    )
+    orphans = []
+    for path in _config_leaves(cfg):
+        if path in _INTENTIONALLY_UNREAD:
+            continue
+        leaf = path.rsplit(".", 1)[-1]
+        if not _re.search(rf'(["\']{_re.escape(leaf)}["\']|\b{_re.escape(leaf)}\s*=|\.{_re.escape(leaf)}\b)', src):
+            orphans.append(path)
+    assert not orphans, (
+        "config.yaml declares keys whose name appears nowhere in the source:\n  "
+        + "\n  ".join(orphans)
+        + "\nEither wire it up, delete it, or add it to _INTENTIONALLY_UNREAD with a "
+          "comment in config.yaml saying it is not implemented."
+    )

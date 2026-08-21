@@ -34,11 +34,6 @@ OAI_NS = "http://www.openarchives.org/OAI/2.0/"
 RAW_NS = "http://arxiv.org/OAI/arXivRaw/"
 NS = {"o": OAI_NS, "r": RAW_NS}
 
-# arXiv OAI sets that contain our categories: cs.LG/cs.CL/cs.NE live in `cs`,
-# stat.ML lives in `stat`.
-DEFAULT_SETS = ("cs", "stat")
-
-
 @dataclass
 class Record:
     arxiv_id: str
