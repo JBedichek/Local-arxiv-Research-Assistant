@@ -39,8 +39,10 @@ import torch.nn.functional as F
 
 from lara import device as dev
 
-QUERY_PREFIX = "task: search result | query: "
-DOC_PREFIX = "title: none | text: "
+# Imported, not retyped: these must match what the corpus was embedded with, and four
+# hand-written copies had already drifted apart. See lara.index.embed.
+from lara.index.embed import DOC_PREFIX_UNTITLED as DOC_PREFIX  # noqa: E402
+from lara.index.embed import QUERY_PROMPT as QUERY_PREFIX  # noqa: E402
 
 
 @dataclass
@@ -59,6 +61,24 @@ class FoldResult:
     n_val: int
     before: dict = field(default_factory=dict)
     after: dict = field(default_factory=dict)
+
+
+def canon_query(q: str) -> str:
+    """A grouping key that survives trailing punctuation and casing.
+
+    `judgements.query_hash` is a SHA of the whitespace-normalised, lowercased question, and
+    the unique index on (query_hash, chunk_id, teacher) stops the same judgement being
+    stored twice. What it cannot catch is the same question stored under two hashes:
+    measured, "What optimizer does scaled dot-product attention use?" and the same string
+    without the "?" are distinct rows at cosine 0.998.
+
+    That matters more for MNRL than for storage. Two groups that are really one question
+    can land in the same batch, and then one group's positive is a false negative for the
+    other — exactly the failure `query_disjoint_batches` exists to prevent. Re-grouping
+    here fixes old and new rows alike and needs no migration, whereas changing `qhash`
+    itself would split every existing question from its future judgements.
+    """
+    return " ".join("".join(c if c.isalnum() or c.isspace() else " " for c in q).lower().split())
 
 
 def _render(item: dict, contextual: bool) -> str:
@@ -121,7 +141,7 @@ def make_triples(conn: sqlite3.Connection, max_per_query: int = 8,
                 if margin < min_margin:
                     continue
                 out.append(Triple(
-                    group["query"], qh,
+                    group["query"], canon_query(group["query"]),
                     _render(p, contextual), _render(n, contextual), float(margin)))
                 made += 1
                 if made >= max_per_query:
@@ -130,7 +150,20 @@ def make_triples(conn: sqlite3.Connection, max_per_query: int = 8,
                 break
         if limit and len(out) >= limit:
             break
-    return out
+
+    # Identical (query, positive, negative) can be produced more than once when a chunk is
+    # judged under two teachers or a question was harvested twice. 350 of 84,874 measured —
+    # small, but a duplicate triple is pure redundant compute and, under an in-batch loss,
+    # a guaranteed false negative if both copies land in one batch.
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[Triple] = []
+    for t in out:
+        key = (t.query_hash, t.pos_text, t.neg_text)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(t)
+    return unique
 
 
 def split_by_query(triples: list[Triple], k: int, seed: int = 0) -> list[list[int]]:
