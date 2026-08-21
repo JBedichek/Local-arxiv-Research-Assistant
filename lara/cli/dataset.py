@@ -7,6 +7,7 @@ from rich.table import Table
 
 from lara import config as config_mod
 from lara.cli._base import _require_hf, app, console
+from lara.cli._progress import reporter
 
 dataset_app = typer.Typer(help="Publish or fetch the built corpus over the LAN")
 app.add_typer(dataset_app, name="dataset")
@@ -24,13 +25,7 @@ def dataset_publish(
     root = cfg.get_path("disk.root")
     chosen = tuple(t.strip() for t in tiers.split(",") if t.strip())
 
-    def reporter():
-        while True:
-            e = yield
-            console.print(f"  hashing {e['file']} ({e['size']/1e9:.1f} GB)…")
-
-    p = reporter()
-    next(p)
+    p = reporter(lambda e: f"  hashing {e['file']} ({e['size']/1e9:.1f} GB)…")
     console.print("[yellow]Ingest should be stopped first[/yellow] — the corpus is written "
                   "continuously, and a digest taken over a growing file is wrong on arrival.")
     m = DS.publish(root, chosen, progress=p)

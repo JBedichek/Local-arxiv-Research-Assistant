@@ -525,3 +525,54 @@ def test_expand_chunks_never_returns_the_same_chunk_twice():
     out = AG.expand_chunks(_corpus(), [102, 103], before=2, after=1)
     ids = [o["chunk_id"] for o in out]
     assert len(ids) == len(set(ids))
+
+
+# ── CLI progress reporters ────────────────────────────────────────────────────────
+#
+# Ten commands used to hand-roll the same generator and prime it with next(). The
+# priming is the part worth a test: it must happen before the first send() and it prints
+# nothing, so getting it wrong fails later and elsewhere, inside whichever worker was
+# reporting.
+
+import re as _re
+
+from lara.cli._base import console as _cli_console
+from lara.cli._progress import reporter as _reporter
+
+_ANSI = _re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _lines(make, records):
+    _cli_console.begin_capture()
+    try:
+        p = make()
+        for r in records:
+            p.send(r)
+    finally:
+        out = _cli_console.end_capture()
+    return [_ANSI.sub("", ln) for ln in out.splitlines()]
+
+
+def test_reporter_is_already_primed():
+    # No next() at the call site: send() works on the first record.
+    assert _lines(lambda: _reporter(lambda s: f"step {s}"), [1, 2]) == ["step 1", "step 2"]
+
+
+def test_reporter_prints_nothing_when_render_returns_none():
+    # How a line that only matters sometimes stays an expression rather than a branch.
+    got = _lines(lambda: _reporter(lambda s: f"step {s}" if s % 2 else None), [0, 1, 2, 3])
+    assert got == ["step 1", "step 3"]
+
+
+def test_reporter_render_can_carry_state_across_records():
+    # The running-total pattern that `lara embed` reports with.
+    def make():
+        done = 0
+
+        def line(n):
+            nonlocal done
+            done += n
+            return f"{done} so far"
+        return _reporter(line)
+
+    assert _lines(make, [2, 3, 5]) == ["2 so far", "5 so far", "10 so far"]

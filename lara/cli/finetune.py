@@ -7,6 +7,7 @@ import typer
 from lara import config as config_mod
 from lara import device as ldev
 from lara.cli._base import app, console
+from lara.cli._progress import reporter
 
 
 @app.command()
@@ -21,15 +22,8 @@ def pairs(
     cfg = config_mod.load(config)
     conn = db.connect(cfg.get_path("paths.metadata_db"))
 
-    def reporter():
-        while True:
-            s = yield
-            console.print(
-                f"  {s['files']:,} papers · {s['contexts']:,} contexts · {s['skipped']} skipped"
-            )
-
-    p = reporter()
-    next(p)
+    p = reporter(lambda s: (
+        f"  {s['files']:,} papers · {s['contexts']:,} contexts · {s['skipped']} skipped"))
     try:
         stats = P.build(conn, cfg.get_path("paths.raw_cache"), limit=limit, progress=p)
         total = conn.execute("SELECT COUNT(*) FROM citation_contexts").fetchone()[0]
@@ -84,17 +78,12 @@ def explore(
                        df_ceiling_frac=float(lex.get("df_ceiling_frac", 0.005)),
                        cross_encoder=ce)
 
-    def reporter():
-        while True:
-            s = yield
-            mark = "miss" if s["source_rank"] is None else f"#{s['source_rank']}"
-            console.print(
-                f"  [{s['cycles']:>4}] {s['style']:16} src {mark:5} "
-                f"+{s['positives']}/-{s['negatives']}  {s['last_q'][:58]}"
-            )
+    def line(s):
+        mark = "miss" if s["source_rank"] is None else f"#{s['source_rank']}"
+        return (f"  [{s['cycles']:>4}] {s['style']:16} src {mark:5} "
+                f"+{s['positives']}/-{s['negatives']}  {s['last_q'][:58]}")
 
-    p = reporter()
-    next(p)
+    p = reporter(line)
     topic_list = [t.strip() for t in (topics or "").split(";") if t.strip()]
     if topic_list:
         console.print(f"focusing on {len(topic_list)} topics: " + ", ".join(topic_list))
@@ -189,36 +178,35 @@ def finetune_pairs(
     console.print(f"\n[bold]training[/bold] on {len(train):,} triples "
                   f"({len(val):,} held back for early stopping)")
 
-    def reporter():
-        seen_epoch = 0
-        while True:
-            st = yield
-            if st.get("early_stop"):
-                console.print(
-                    f"  [yellow]early stop[/yellow] at step {st['step']}/{st['steps']} — "
+    seen_epoch = 0
+
+    def line(st):
+        nonlocal seen_epoch
+        if st.get("early_stop"):
+            return (f"  [yellow]early stop[/yellow] at step {st['step']}/{st['steps']} — "
                     f"epoch {st.get('epoch','?')}/{st.get('epochs','?')}, "
                     f"step {st.get('epoch_step','?')}/{st.get('steps_per_epoch','?')} "
                     f"within it = [bold]{st.get('epoch_frac', 0):.2f} epochs[/bold] · "
                     f"best val {st['best_val']:.4f}")
-                continue
-            # A line whenever the epoch rolls over, so the trace shows where the
-            # boundaries are without reading step arithmetic.
-            ep = st.get("epoch")
-            if ep and ep != seen_epoch:
-                seen_epoch = ep
-                console.print(f"  [dim]--- epoch {ep}/{st.get('epochs')} "
-                              f"({st.get('steps_per_epoch')} steps) ---[/dim]")
-            v = st.get("val_loss")
-            frac = st.get("epoch_frac")
-            if frac is None and st.get("steps_per_epoch"):
-                frac = st["step"] / st["steps_per_epoch"]
-            console.print(f"  step {st['step']:>4}/{st['steps']}"
-                          + (f"  ep {frac:5.2f}" if frac is not None else "")
-                          + f"  loss {st['loss']:7.4f}  lr {st['lr']:.2e}"
-                          + (f"  val {v:7.4f}" if v is not None else "")
-                          + f"  {st['elapsed']/60:.0f}m")
+        # A banner whenever the epoch rolls over, so the trace shows where the boundaries
+        # are without reading step arithmetic. Printed here rather than returned, because
+        # it precedes the step line rather than replacing it.
+        ep = st.get("epoch")
+        if ep and ep != seen_epoch:
+            seen_epoch = ep
+            console.print(f"  [dim]--- epoch {ep}/{st.get('epochs')} "
+                          f"({st.get('steps_per_epoch')} steps) ---[/dim]")
+        v = st.get("val_loss")
+        frac = st.get("epoch_frac")
+        if frac is None and st.get("steps_per_epoch"):
+            frac = st["step"] / st["steps_per_epoch"]
+        return (f"  step {st['step']:>4}/{st['steps']}"
+                + (f"  ep {frac:5.2f}" if frac is not None else "")
+                + f"  loss {st['loss']:7.4f}  lr {st['lr']:.2e}"
+                + (f"  val {v:7.4f}" if v is not None else "")
+                + f"  {st['elapsed']/60:.0f}m")
 
-    pr = reporter(); next(pr)
+    pr = reporter(line)
     model = KF.train_on_mnrl(list(train), model_name, device, rec,
                              progress=pr, val_triples=val)
     console.print(f"[green]trained[/green] {getattr(model, 'steps_trained', 0)} steps"
@@ -303,18 +291,15 @@ def lr_sweep(
             "measuring noise. Raise --max-per-query or lower --batch-size."
         )
 
-    def reporter():
-        while True:
-            s = yield
-            if s.get("early_stop"):
-                console.print(f"      [yellow]early stop[/yellow] step {s['step']}  "
-                              f"best val {s['best_val']:.4f}")
-                continue
-            v = s.get("val_loss")
-            console.print(f"      step {s['step']:>4}/{s['steps']}  loss {s['loss']:8.4f}  "
-                          f"lr {s['lr']:.2e}" + (f"  val {v:7.4f}" if v is not None else ""))
+    def line(s):
+        if s.get("early_stop"):
+            return (f"      [yellow]early stop[/yellow] step {s['step']}  "
+                    f"best val {s['best_val']:.4f}")
+        v = s.get("val_loss")
+        return (f"      step {s['step']:>4}/{s['steps']}  loss {s['loss']:8.4f}  "
+                f"lr {s['lr']:.2e}" + (f"  val {v:7.4f}" if v is not None else ""))
 
-    p = reporter(); next(p)
+    p = reporter(line)
     rows = []
     for lr in grid:
         console.print(f"\n[bold]muon lr {lr:.1e}[/bold]")
@@ -371,17 +356,14 @@ def fit_check(
                      if rec.patience else "no early stopping"))
     model_name = cfg.get_in("embedding.model")
 
-    def reporter():
-        while True:
-            s = yield
-            if s.get("early_stop"):
-                console.print(f"    [yellow]early stop[/yellow] at step {s['step']}  "
-                              f"best val loss {s['best_val']:.4f}")
-                continue
-            v = s.get("val_loss")
-            console.print(f"    step {s['step']:>4}/{s['steps']}  loss {s['loss']:8.4f}  "
-                          f"lr {s['lr']:.2e}"
-                          + (f"  val {v:7.4f}" if v is not None else ""))
+    def line(s):
+        if s.get("early_stop"):
+            return (f"    [yellow]early stop[/yellow] at step {s['step']}  "
+                    f"best val loss {s['best_val']:.4f}")
+        v = s.get("val_loss")
+        return (f"    step {s['step']:>4}/{s['steps']}  loss {s['loss']:8.4f}  "
+                f"lr {s['lr']:.2e}"
+                + (f"  val {v:7.4f}" if v is not None else ""))
 
     if mode == "overfit":
         sub = triples[:n]
@@ -395,7 +377,7 @@ def fit_check(
         del base
         ldev.empty_cache(device)
 
-        p = reporter(); next(p)
+        p = reporter(line)
         model = KF.train_on(list(sub), model_name, device,
                             KF.replace(rec, patience=0), progress=p)
         after = KF.evaluate(model, sub, device)
@@ -436,7 +418,7 @@ def fit_check(
         if inner_val:
             console.print(f"    inner split: {len(inner_train):,} train · "
                           f"{len(inner_val):,} early-stop val (by query)")
-        p = reporter(); next(p)
+        p = reporter(line)
         model = KF.train_on(list(inner_train), model_name, device, rec, progress=p,
                             val_triples=inner_val)
         after = KF.evaluate(model, val, device)
@@ -500,16 +482,9 @@ def finetune(
                        chunks_per_paper=chunks_per_paper, max_edges=max_edges,
                        compile_mode=None if no_compile else "default")
 
-    def reporter():
-        while True:
-            s = yield
-            console.print(
-                f"  step {s['step']:>5}/{s['steps']}  loss {s['loss']:.4f}  "
-                f"lr {s['lr']:.2e}  {s['elapsed']/60:.1f} min"
-            )
-
-    p = reporter()
-    next(p)
+    p = reporter(lambda s: (
+        f"  step {s['step']:>5}/{s['steps']}  loss {s['loss']:.4f}  "
+        f"lr {s['lr']:.2e}  {s['elapsed']/60:.1f} min"))
     model, stats = T.train(conn, tc, progress=p)
     console.print(
         f"[green]trained[/green] {stats['steps']} steps on {stats['bags']:,} bags "

@@ -13,6 +13,7 @@ from rich.table import Table
 from lara import config as config_mod
 from lara import device as ldev
 from lara.cli._base import app, console
+from lara.cli._progress import reporter
 
 
 @app.command()
@@ -222,18 +223,16 @@ def embed(
             model, devices, chunk_size=int(ecfg.get("slice_size", 8192)) // len(devices)
         )
 
-    def reporter():
-        total = 0
-        while True:
-            n, rate, start_row = yield
-            total += n
-            console.print(
-                f"  +{n:>5} chunks  {rate:6.0f}/s  rows {start_row:,}–{start_row + n:,}  "
-                f"({total:,}/{pending:,})"
-            )
+    done = 0
 
-    progress = reporter()
-    next(progress)
+    def line(rec):
+        nonlocal done
+        n, rate, start_row = rec
+        done += n
+        return (f"  +{n:>5} chunks  {rate:6.0f}/s  rows {start_row:,}–{start_row + n:,}  "
+                f"({done:,}/{pending:,})")
+
+    progress = reporter(line)
 
     try:
         stats = emb.run(
@@ -273,16 +272,9 @@ def citations(
     have = conn.execute("SELECT COUNT(*) FROM citations").fetchone()[0]
     console.print(f"[bold]{todo:,}[/bold] papers pending · {have:,} edges already")
 
-    def reporter():
-        while True:
-            s = yield
-            console.print(
-                f"  batch {s.batches:>5}  papers {s.papers:,}  +{s.edges:,} edges  "
-                f"missing {s.missing:,}  retries {s.retries}  errors {s.errors}"
-            )
-
-    p = reporter()
-    next(p)
+    p = reporter(lambda s: (
+        f"  batch {s.batches:>5}  papers {s.papers:,}  +{s.edges:,} edges  "
+        f"missing {s.missing:,}  retries {s.retries}  errors {s.errors}"))
     try:
         stats = cit.run(conn, cfg, limit=limit, progress=p)
         console.print(
@@ -329,15 +321,15 @@ def embed_papers(
     if len(devices) > 1:
         encoder = emb.MultiGPUEncoder(model, devices, chunk_size=2048)
 
-    def reporter():
-        total = 0
-        while True:
-            n, rate, start_row = yield
-            total += n
-            console.print(f"  +{n:>5} papers  {rate:6.0f}/s  ({total:,}/{pending:,})")
+    done = 0
 
-    progress = reporter()
-    next(progress)
+    def line(rec):
+        nonlocal done
+        n, rate, _start_row = rec
+        done += n
+        return f"  +{n:>5} papers  {rate:6.0f}/s  ({done:,}/{pending:,})"
+
+    progress = reporter(line)
     try:
         stats = emb.run_papers(
             conn, store, encoder, batch_size=int(ecfg["batch_size"]),
