@@ -206,5 +206,12 @@ lara config set retrieval.hierarchy.tag_with_model false   # cheaper, no tagging
   tagging call would hide almost all of it — not yet implemented.
 - **A highlighted passage is already a confirmed chunk.** Tier 1 could be skipped entirely
   when the user has selected text — also not yet implemented.
-- **`walk()` is standalone.** It is not yet wired into `/api/ask`; that endpoint still uses
-  the flat agent loop.
+- **Wired into `/api/ask`, but only when no scope is pinned.** The walk runs when a paper
+  is open *and* the scope dropdown is left on `corpus`. Selecting "this paper" or "citation
+  neighbourhood" is an instruction, not a hint, so those bypass the walk entirely and
+  retrieve at exactly the scope named. With no paper open there is no tier 1, and the flat
+  corpus search runs as before.
+- **Decomposition and the walk do not compose.** A compound question asked with a paper
+  open takes the hierarchical path, not the split-and-merge path. Both exist to fix a
+  first-retrieval problem and running them together would search parts of a question at
+  tiers chosen for the whole of it.

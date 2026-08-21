@@ -1686,6 +1686,51 @@ async def ask(req: AskRequest) -> StreamingResponse:
                     yield step("rewrite", rw["query"], original=req.query, why=rw["why"])
 
             hits = req.hits
+
+            # Hierarchical scope: with a paper open and no scope pinned, start inside that
+            # paper and widen only if the model says the answer is not there. The dropdown
+            # still wins when the reader sets it — "this paper" and "citation
+            # neighbourhood" are instructions, not hints, and overriding them would make
+            # the control a lie.
+            hcfg = s.cfg.get_in("retrieval.hierarchy") or {}
+            use_walk = (hits is None and req.paper and req.scope == "corpus"
+                        and hcfg.get("enabled", True))
+            if use_walk:
+                from lara.serve import hierarchy as HR
+
+                q: asyncio.Queue = asyncio.Queue()
+                result: dict = {}
+
+                async def _walk() -> None:
+                    try:
+                        result["r"] = await HR.walk(
+                            s, s.cfg, search_query["q"], req.paper,
+                            selection=req.selection, final_k=breadth.k,
+                            model=req.model, stream_answer=stream_answer,
+                            on_step=lambda tier, note: q.put_nowait((tier, note)),
+                        )
+                    finally:
+                        q.put_nowait(None)
+
+                task = asyncio.create_task(_walk())
+                while True:
+                    item = await q.get()
+                    if item is None:
+                        break
+                    yield step("scope", f"{item[0]}: {item[1]}")
+                await task
+                walked = result.get("r")
+                if walked is not None and walked.hits:
+                    hits = walked.hits
+                    path = walked.path or "corpus"
+                    kept = sum(len(d.kept) for d in walked.decisions if d.kind == "tag")
+                    yield step("scope", f"searched {path} · {kept} passage(s) confirmed "
+                                        f"in the paper", path=path)
+                else:
+                    # The paper had nothing embedded, or the walk failed. Fall through to
+                    # the flat search rather than answering from nothing.
+                    use_walk = False
+
             if hits is None:
                 # A compound question embeds to a single vector sitting BETWEEN its parts,
                 # retrieving well for none of them. Splitting first and searching each
