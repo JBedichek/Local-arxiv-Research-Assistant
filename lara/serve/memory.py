@@ -54,41 +54,52 @@ def _path(root: Path) -> Path:
     return Path(root) / LIBRARY_NAME
 
 
-def load(root: Path) -> dict:
-    """Read the library, tolerating absence and corruption.
+def _read(path: Path, empty) -> dict:
+    """Read one of this module's JSON files, tolerating absence and corruption.
 
     A missing file is the normal first-run state. A corrupt one is renamed aside rather
     than deleted — it is the reader's data, and a truncated file is often still readable
-    by hand — and an empty library is returned so the UI comes up instead of failing.
+    by hand — and the empty shape is returned so the UI comes up instead of failing.
+
+    Missing top-level keys are filled from that same shape, so a file written by an older
+    version does not need a migration to be readable.
     """
-    p = _path(root)
-    if not p.exists():
-        return _empty()
+    if not path.exists():
+        return empty()
     try:
-        data = json.loads(p.read_text())
+        data = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError):
         try:
-            p.rename(p.with_suffix(f".corrupt-{int(time.time())}.json"))
+            path.rename(path.with_suffix(f".corrupt-{int(time.time())}.json"))
         except OSError:
             pass
-        return _empty()
+        return empty()
     if not isinstance(data, dict):
-        return _empty()
-    data.setdefault("version", 1)
-    data.setdefault("folders", [])
-    data.setdefault("entries", [])
+        return empty()
+    for k, v in empty().items():
+        data.setdefault(k, v)
     return data
 
 
-def save(root: Path, data: dict) -> None:
-    p = _path(root)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
+def _write(path: Path, data: dict) -> None:
+    """Write atomically: fsync then rename, so a crash mid-write cannot truncate the file
+    the reader's whole library lives in."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
     with open(tmp, "w") as fh:
         json.dump(data, fh, indent=1, ensure_ascii=False)
         fh.flush()
         os.fsync(fh.fileno())
-    os.replace(tmp, p)
+    os.replace(tmp, path)
+
+
+def load(root: Path) -> dict:
+    """The reading library: folders and entries."""
+    return _read(_path(root), _empty)
+
+
+def save(root: Path, data: dict) -> None:
+    _write(_path(root), data)
 
 
 def _folder_exists(data: dict, folder_id: str | None) -> bool:
@@ -333,6 +344,10 @@ def _taste_path(root: Path) -> Path:
     return Path(root) / TASTE_NAME
 
 
+def _empty_taste() -> dict:
+    return {"version": 1, "marks": []}
+
+
 def load_taste(root: Path) -> dict:
     """Marks the reader made on passages they found interesting.
 
@@ -341,32 +356,11 @@ def load_taste(root: Path) -> dict:
     when a passage is marked, and the two would otherwise contend on the same lock and the
     same serialisation for no reason.
     """
-    p = _taste_path(root)
-    if not p.exists():
-        return {"version": 1, "marks": []}
-    try:
-        data = json.loads(p.read_text())
-    except (json.JSONDecodeError, OSError):
-        try:
-            p.rename(p.with_suffix(f".corrupt-{int(time.time())}.json"))
-        except OSError:
-            pass
-        return {"version": 1, "marks": []}
-    if not isinstance(data, dict):
-        return {"version": 1, "marks": []}
-    data.setdefault("marks", [])
-    return data
+    return _read(_taste_path(root), _empty_taste)
 
 
 def save_taste(root: Path, data: dict) -> None:
-    p = _taste_path(root)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_suffix(".tmp")
-    with open(tmp, "w") as fh:
-        json.dump(data, fh, indent=1, ensure_ascii=False)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, p)
+    _write(_taste_path(root), data)
 
 
 def record_taste(root: Path, *, chunk_id: int, vector_row: int, arxiv_id: str = "",
@@ -448,3 +442,27 @@ def clear_thread_summary(root: Path, tid: str) -> bool:
             return False
         save(root, data)
         return True
+
+
+# ── the library graph's cache ─────────────────────────────────────────────────────
+#
+# lara.serve.library_graph owns what a graph IS; this owns where it is kept. It used to
+# reach in here for _LOCK and call load() twice per cache check — once for the graph and
+# once more inside the fingerprint — which is three reads of the whole library to answer
+# "is the cached one still good".
+
+
+def graph_cache(root: Path) -> tuple[list[str], dict | None]:
+    """The question ids a cached graph is keyed on, and the cache entry, from one read."""
+    data = _read(_path(root), _empty)
+    ids = sorted(e.get("id", "") for e in data.get("entries", [])
+                 if e.get("kind") == "question")
+    return ids, data.get("library_graph")
+
+
+def store_graph(root: Path, fingerprint: str, graph: dict) -> None:
+    """Replace the cached graph, under the same lock every other writer takes."""
+    with _LOCK:
+        data = _read(_path(root), _empty)
+        data["library_graph"] = {"fingerprint": fingerprint, "graph": graph}
+        _write(_path(root), data)

@@ -259,15 +259,14 @@ async def build(cfg, root, model, stream_answer) -> dict:
 # ── cache ─────────────────────────────────────────────────────────────────────────
 
 
-def _fingerprint(root) -> str:
-    """Changes exactly when the library does, so a stale graph is never served."""
-    from lara.serve import memory as MEM
+def _fingerprint(ids: list[str]) -> str:
+    """Changes exactly when the library does, so a stale graph is never served.
 
+    Takes the ids rather than fetching them, which makes it pure — and means the caller
+    reads the library once instead of once here and once again around the call.
+    """
     import hashlib
 
-    data = MEM.load(root)
-    ids = sorted(e.get("id", "") for e in data.get("entries", [])
-                 if e.get("kind") == "question")
     # hashlib, not hash(): PYTHONHASHSEED is randomised per process, so a built-in hash
     # would produce a different fingerprint in every worker and after every restart —
     # a cache that can never hit, silently rebuilding the whole graph on each request.
@@ -278,16 +277,14 @@ def _fingerprint(root) -> str:
 def cached(root) -> dict | None:
     from lara.serve import memory as MEM
 
-    g = MEM.load(root).get("library_graph")
-    if g and g.get("fingerprint") == _fingerprint(root):
-        return g.get("graph")
+    ids, entry = MEM.graph_cache(root)
+    if entry and entry.get("fingerprint") == _fingerprint(ids):
+        return entry.get("graph")
     return None
 
 
 def store(root, graph: dict) -> None:
     from lara.serve import memory as MEM
 
-    with MEM._LOCK:
-        data = MEM.load(root)
-        data["library_graph"] = {"fingerprint": _fingerprint(root), "graph": graph}
-        MEM.save(root, data)
+    ids, _ = MEM.graph_cache(root)
+    MEM.store_graph(root, _fingerprint(ids), graph)

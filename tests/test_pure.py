@@ -733,3 +733,69 @@ def test_every_config_key_is_read_by_something():
         + "\nEither wire it up, delete it, or add it to _INTENTIONALLY_UNREAD with a "
           "comment in config.yaml saying it is not implemented."
     )
+
+
+# ── the library's JSON store ──────────────────────────────────────────────────────
+#
+# load/save and load_taste/save_taste were the same forty lines twice. The corruption
+# path is the part worth pinning: it is reached only when a file is already damaged, so
+# it is exactly the code least likely to have been run.
+
+import lara.serve.memory as _MEM
+
+
+def test_missing_file_is_the_normal_first_run_state(tmp_path):
+    assert _MEM.load(tmp_path) == {"version": 1, "folders": [], "entries": []}
+    assert _MEM.load_taste(tmp_path) == {"version": 1, "marks": []}
+
+
+def test_round_trip(tmp_path):
+    _MEM.save(tmp_path, {"version": 1, "folders": [{"id": "f"}], "entries": []})
+    assert _MEM.load(tmp_path)["folders"] == [{"id": "f"}]
+
+
+def test_a_corrupt_file_is_renamed_aside_not_deleted(tmp_path):
+    p = tmp_path / _MEM.LIBRARY_NAME
+    p.write_text('{"entries": [truncated')
+    assert _MEM.load(tmp_path) == {"version": 1, "folders": [], "entries": []}
+    assert not p.exists()
+    # the reader's data survives under a new name — a truncated library is often still
+    # readable by hand, and deleting it would be the worst possible response to a crash
+    aside = list(tmp_path.glob("*.corrupt-*.json"))
+    assert len(aside) == 1 and aside[0].read_text() == '{"entries": [truncated'
+
+
+def test_a_file_that_is_not_an_object_is_treated_as_corrupt(tmp_path):
+    (tmp_path / _MEM.TASTE_NAME).write_text("[1, 2, 3]")
+    assert _MEM.load_taste(tmp_path) == {"version": 1, "marks": []}
+
+
+def test_missing_top_level_keys_are_filled_in(tmp_path):
+    # A file written by an older version stays readable without a migration.
+    (tmp_path / _MEM.LIBRARY_NAME).write_text('{"entries": [{"id": "e"}]}')
+    data = _MEM.load(tmp_path)
+    assert data["entries"] == [{"id": "e"}] and data["folders"] == [] and data["version"] == 1
+
+
+def test_writing_leaves_no_temp_file_behind(tmp_path):
+    _MEM.save_taste(tmp_path, {"version": 1, "marks": [{"id": "m"}]})
+    assert [p.name for p in tmp_path.iterdir()] == [_MEM.TASTE_NAME]
+
+
+def test_graph_cache_reads_ids_and_entry_together(tmp_path):
+    _MEM.save(tmp_path, {"version": 1, "folders": [], "entries": [
+        {"id": "q2", "kind": "question"}, {"id": "v1", "kind": "visit"},
+        {"id": "q1", "kind": "question"}]})
+    ids, entry = _MEM.graph_cache(tmp_path)
+    assert ids == ["q1", "q2"] and entry is None      # visits do not key the graph
+    _MEM.store_graph(tmp_path, "fp-1", {"nodes": []})
+    ids, entry = _MEM.graph_cache(tmp_path)
+    assert entry == {"fingerprint": "fp-1", "graph": {"nodes": []}}
+    assert _MEM.load(tmp_path)["entries"], "storing the graph must not drop the library"
+
+
+def test_fingerprint_is_stable_and_order_independent():
+    from lara.serve.library_graph import _fingerprint
+    assert _fingerprint(["a", "b"]) == _fingerprint(["a", "b"])
+    assert _fingerprint(["a", "b"]) != _fingerprint(["a", "c"])
+    assert _fingerprint([]).startswith("0:")
