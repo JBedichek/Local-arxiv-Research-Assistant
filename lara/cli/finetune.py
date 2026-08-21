@@ -5,7 +5,6 @@ from __future__ import annotations
 import typer
 
 from lara import config as config_mod
-from lara import device as ldev
 from lara.cli._base import app, console
 from lara.cli._progress import reporter
 
@@ -50,6 +49,7 @@ def explore(
     """
     import asyncio
 
+    from lara import device as ldev
     from lara.finetune import explore as EX
     from lara.finetune import judgements as J
     from lara.index import embed as emb
@@ -142,6 +142,7 @@ def finetune_pairs(
     """
     from pathlib import Path as _P
 
+    from lara import device as ldev
     from lara.finetune import evaluate as EV
     from lara.finetune import kfold as KF
     from lara.index.embed import load_model
@@ -336,6 +337,7 @@ def fit_check(
     accuracy toward 1.0. Failing that, the recipe is broken and more data cannot help.
     `kfold` splits by query to measure whether it generalises within-distribution.
     """
+    from lara import device as ldev
     from lara.finetune import kfold as KF
     from lara.store import db
 
@@ -453,6 +455,7 @@ def finetune(
     """Fine-tune the embedder on citation contexts with Muon. Evaluates before and after."""
     from pathlib import Path as _P
 
+    from lara import device as ldev
     from lara.finetune import evaluate as EV
     from lara.finetune import train as T
     from lara.index.embed import load_model

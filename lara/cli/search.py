@@ -6,7 +6,6 @@ import typer
 from rich.table import Table
 
 from lara import config as config_mod
-from lara import device as ldev
 from lara.cli._base import app, console
 
 
@@ -21,6 +20,7 @@ def search(
     device: str = typer.Option(None, help="Override device; default auto-detects"),
 ) -> None:
     """Retrieve chunks for a query and show anchored citations with timings."""
+    from lara import device as ldev
     from lara.index import embed as emb
     from lara.index import retrieve as R
     from lara.index.vectors import VectorStore
@@ -89,6 +89,7 @@ def bench_index(
 
     import numpy as np
 
+    from lara import device as ldev
     from lara.index import backends as BK
     from lara.index.vectors import VectorStore
 

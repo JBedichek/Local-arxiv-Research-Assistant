@@ -11,7 +11,6 @@ import typer
 from rich.table import Table
 
 from lara import config as config_mod
-from lara import device as ldev
 from lara.cli._base import app, console
 from lara.cli._progress import reporter
 
@@ -186,6 +185,7 @@ def embed(
     fts: bool = typer.Option(True, help="Rebuild the BM25 index afterwards"),
 ) -> None:
     """Embed pending chunks into the tier-1/tier-2 vector files. Resumable."""
+    from lara import device as ldev
     from lara.index import embed as emb
     from lara.index.vectors import VectorStore
     from lara.store import db
@@ -291,6 +291,7 @@ def embed_papers(
     device: str = typer.Option(None, help="Override device, e.g. cuda:2"),
 ) -> None:
     """Embed title+abstract for every in-scope paper (powers semantic paper search)."""
+    from lara import device as ldev
     from lara.index import embed as emb
     from lara.index.vectors import VectorStore
     from lara.store import db
