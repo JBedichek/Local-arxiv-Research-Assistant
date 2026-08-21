@@ -22,14 +22,13 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
-from lara.serve.generate import SYSTEM, stream_answer
+from lara.serve.generate import stream_answer
 
 # ── the speed <-> accuracy spectrum ────────────────────────────────────────────────
 #

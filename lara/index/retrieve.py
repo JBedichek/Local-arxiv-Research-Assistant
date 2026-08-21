@@ -431,8 +431,6 @@ def assert_reranker_works(ce, name: str, margin: float = 0.05) -> None:
 
     A behavioural probe is the only reliable check, so it runs at load time.
     """
-    import numpy as np
-
     scores = np.asarray(
         ce.predict(
             [(_PROBE_QUERY, _PROBE_RELEVANT), (_PROBE_QUERY, _PROBE_IRRELEVANT)],

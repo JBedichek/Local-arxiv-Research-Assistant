@@ -281,8 +281,6 @@ def heatmap(req: HeatmapRequest) -> JSONResponse:
     Scored at full 768-d precision from the mmap rather than the 256-d tier-1 vectors: a
     single paper is a few hundred rows, so exactness is free here.
     """
-    import numpy as np
-
     from lara.index.embed import embed_queries
 
     s = require_state()

@@ -249,8 +249,6 @@ async def generate_questions(cfg, conn, n: int = 200, model: str | None = None,
     model equally and distinguishing none of them. Forbidding quotation and asking for
     paraphrase is what keeps the task discriminative.
     """
-    import numpy as np
-
     from lara.serve.generate import stream_answer
 
     rng = np.random.default_rng(seed)

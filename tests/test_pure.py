@@ -296,9 +296,25 @@ def test_empty_string_means_auto():
 # cosine). Four hand-written copies is how that recurs.
 
 def test_all_modules_agree_on_the_query_prefix():
-    from lara.finetune import kfold, train
+    from lara.finetune import kfold
     from lara.index.embed import QUERY_PROMPT
-    assert kfold.QUERY_PREFIX == train.QUERY_PREFIX == QUERY_PROMPT
+    assert kfold.QUERY_PREFIX == QUERY_PROMPT
+
+
+def test_the_citation_context_trainer_prefixes_nothing():
+    """`lara finetune` encodes chunk text raw, and that is on purpose.
+
+    It trains on citation contexts -- a src chunk against a dst chunk -- which is a
+    symmetric similarity task with no query side, so EmbeddingGemma's asymmetric
+    query/document prompts have nothing to attach to. It briefly carried unused
+    QUERY_PREFIX and DOC_PREFIX constants that made it look as though it did prefix;
+    this pins the fact that it does not, so the next reader does not re-add them.
+    """
+    import inspect
+
+    from lara.finetune import train
+    src = inspect.getsource(train)
+    assert "QUERY_PREFIX" not in src and "DOC_PREFIX" not in src
 
 
 def test_untitled_doc_prefix_matches_document_text():

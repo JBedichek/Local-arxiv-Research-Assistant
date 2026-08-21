@@ -212,8 +212,6 @@ async def count_tokens(base_url: str, model: str, texts: list[str]) -> list[int]
     Returns None rather than guessing — a context viewer that silently shows estimates as
     facts is worse than one that admits it does not know.
     """
-    import httpx
-
     root = base_url.rstrip("/")
     root = root[:-3] if root.endswith("/v1") else root
     out: list[int] = []
@@ -234,8 +232,6 @@ async def count_tokens(base_url: str, model: str, texts: list[str]) -> list[int]
 
 async def context_limit(base_url: str, model: str) -> int | None:
     """The model's real context window, as the server reports it."""
-    import httpx
-
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
             r = await client.get(f"{base_url.rstrip('/')}/models")
@@ -373,10 +369,7 @@ async def stream_answer(
 
                 backend = GEN.resolve_backend(cfg, DV.detect().accelerator,
                                               cfg.get_path("huggingface.home"))
-                configured = GEN.model_for(backend, {
-                    **((cfg.get_in("serving.generator") or {})),
-                    "vllm": cfg.get_in("serving.vllm") or {},
-                })
+                configured = GEN.model_for(backend, GEN.generator_cfg(cfg))
             except Exception:
                 backend, configured = "the generation backend", None
             hint = ("run `lara setup` to choose one, then restart `lara serve`"

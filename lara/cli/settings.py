@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import typer
 
 from lara import config as config_mod
@@ -56,7 +58,7 @@ def _unset_in(tree: dict, dotted: str) -> bool:
     return True
 
 
-def _write_local(path, tree) -> "Path | None":
+def _write_local(path, tree) -> Path | None:
     """Write config.local.yaml, backing up first.
 
     yaml.safe_dump cannot preserve comments, so any explanation in the file is lost on
@@ -65,7 +67,6 @@ def _write_local(path, tree) -> "Path | None":
     """
     import shutil
     import time
-    from pathlib import Path
 
     import yaml as _yaml
 

@@ -352,6 +352,20 @@ def model_for(backend: str, cfg: dict) -> str | None:
     return (cfg.get(backend) or {}).get("model")
 
 
+def generator_cfg(cfg) -> dict:
+    """`serving.generator` with `serving.vllm` folded in under its own key.
+
+    vLLM's settings live beside `generator` in config.yaml rather than under it, for the
+    good reason that `lara serve-llm` manages a vLLM process whether or not it is the
+    configured generator. Every caller that wants "the generator settings" therefore has
+    to graft the two together, and four of them were doing it inline -- so reading only
+    `serving.generator` reported "no default model" on every Mac, where the model lives
+    under the mlx or llamacpp key instead.
+    """
+    serving = cfg.get_in("serving") or {}
+    return {**(serving.get("generator") or {}), "vllm": serving.get("vllm") or {}}
+
+
 # ── the process ───────────────────────────────────────────────────────────────────
 
 
@@ -471,7 +485,7 @@ def from_config(cfg, accelerator: str, model_override: str | None = None,
     serving = cfg.get_in("serving") or {}
     gen = serving.get("generator") or {}
     backend = choose(accelerator, backend_override or gen.get("backend"))
-    merged = {**gen, "vllm": serving.get("vllm") or {}}
+    merged = generator_cfg(cfg)
     model = model_override or model_for(backend.name, merged)
     base_url = (serving.get("vllm") or {}).get("base_url", "http://127.0.0.1:8000/v1")
     if backend.name != "external" and not model:

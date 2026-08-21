@@ -185,8 +185,7 @@ def models() -> JSONResponse:
         "backend": backend,
         # Per backend: the three formats are not interchangeable, so each keeps its own
         # model setting. Reading only the vLLM one reported "no default" on every Mac.
-        "configured_default": GEN.model_for(
-            backend, {**(serving.get("generator") or {}), "vllm": serving.get("vllm") or {}}),
+        "configured_default": GEN.model_for(backend, GEN.generator_cfg(s.cfg)),
         # Everything a backend could serve, including ones whose backend is not
         # installed: those carry `needs_install` and a hint naming what to do. Omitting
         # them is what made a freshly downloaded model vanish with no explanation.

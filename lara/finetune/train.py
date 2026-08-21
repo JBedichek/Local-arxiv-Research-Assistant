@@ -29,7 +29,6 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -64,12 +63,6 @@ class TrainConfig:
     held_out_frac: float = 0.2
     grad_clip: float = 1.0
     stats: dict = field(default_factory=dict)
-
-
-# Imported/derived rather than retyped — see lara.index.embed.
-from lara.index.embed import QUERY_PROMPT as QUERY_PREFIX  # noqa: E402
-
-DOC_PREFIX = "title: {title} | text: "  # format string; doc_prefix_for() fills it
 
 
 def mil_nce(src: torch.Tensor, dst: torch.Tensor, temperature: float,
@@ -168,15 +161,9 @@ def encode_batch(model, texts: list[str], device: str) -> torch.Tensor:
 
 
 def train(conn: sqlite3.Connection, cfg: TrainConfig, progress=None):
-    try:
-        from muon import SingleDeviceMuonWithAuxAdam
-    except ImportError as exc:      # noqa: F401 - re-raised with instructions
-        raise ImportError(
-            "the Muon optimiser is not installed. It is not on PyPI under that name -- "
-            "`pip install muon` fetches an unrelated omics package that will import but "
-            "not provide SingleDeviceMuonWithAuxAdam. Install from source:\n"
-            "    pip install git+https://github.com/KellerJordan/Muon"
-        ) from exc
+    from lara.finetune.optim import load_muon
+
+    SingleDeviceMuonWithAuxAdam = load_muon()
     from sentence_transformers import SentenceTransformer
 
     from lara.finetune import evaluate as EV
