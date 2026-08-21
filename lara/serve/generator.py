@@ -38,6 +38,7 @@ import signal
 import subprocess
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -140,7 +141,15 @@ class LlamaCppBackend(Backend):
             "-ngl", str(c.get("n_gpu_layers", 999)),
             "--parallel", str(c.get("parallel", 2)),
         ]
-        if c.get("flash_attn", True):
+        # `-fa` became a valued option: older builds took it as a bare boolean, current
+        # ones require on|off|auto. Emitting the bare form against a current build makes
+        # it swallow the NEXT argument as its value -- the observed failure was
+        # `error: unknown value for --flash-attn: '--cache-reuse'`, which names neither
+        # the real problem nor the flag that caused it.
+        want_fa = c.get("flash_attn", True)
+        if _flash_attn_takes_value():
+            cmd += ["-fa", "on" if want_fa else "off"]
+        elif want_fa:
             cmd.append("-fa")
         # Prefix reuse is what keeps follow-up questions about the same paper fast, which
         # is the whole reason the prompt is laid out stable-prefix-first.
@@ -205,6 +214,29 @@ BACKENDS: dict[str, Backend] = {
 
 def installed() -> list[Backend]:
     return [b for b in BACKENDS.values() if b.name != "external" and b.available()]
+
+
+@lru_cache(maxsize=1)
+def _flash_attn_takes_value() -> bool:
+    """Whether this llama-server wants ``-fa on`` rather than a bare ``-fa``.
+
+    Read from ``--help`` rather than from a version number: the binary can come from
+    Homebrew, a manual build or a container, and its own help text is the only account
+    of its flags that is guaranteed to match the binary being launched. Defaults to the
+    current syntax if help cannot be read at all.
+    """
+    exe = shutil.which("llama-server")
+    if not exe:
+        return True
+    try:
+        out = subprocess.run([exe, "--help"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    text = (out.stdout or "") + (out.stderr or "")
+    for line in text.splitlines():
+        if "--flash-attn" in line:
+            return "on|off|auto" in line.replace(" ", "")
+    return True
 
 
 def choose(accelerator: str, requested: str | None = None) -> Backend:
