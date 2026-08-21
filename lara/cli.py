@@ -520,6 +520,9 @@ def finetune_pairs(
     n_eval: int = typer.Option(800, help="Queries per independent eval task"),
     device: str = typer.Option(None),
     force: bool = typer.Option(False, "--force", help="Save even if the guard rejects it"),
+    contextual: bool = typer.Option(
+        True, help="Render training documents as the corpus is embedded "
+                   "(title > section | text). --no-contextual is the ablation."),
 ) -> None:
     """Train once on ALL judgement pairs, then judge it on the independent eval.
 
@@ -545,7 +548,7 @@ def finetune_pairs(
     conn = db.connect(cfg.get_path("paths.metadata_db"))
     model_name = cfg.get_in("embedding.model")
 
-    triples = KF.make_triples(conn, max_per_query=max_per_query, contextual=True)
+    triples = KF.make_triples(conn, max_per_query=max_per_query, contextual=contextual)
     n_q = len({t.query_hash for t in triples})
     if len(triples) < batch_size * 4:
         console.print(f"[red]only {len(triples):,} triples[/red] — run `lara explore` first")
@@ -555,7 +558,8 @@ def finetune_pairs(
                     patience=patience, eval_every=eval_every,
                     compile_mode=None if compile_mode.lower() == "none" else compile_mode)
     console.print(f"[bold]{len(triples):,}[/bold] triples from {n_q:,} queries · "
-                  f"MultipleNegativesRanking · batch {batch_size} · seq {max_seq_length}")
+                  f"MultipleNegativesRanking · batch {batch_size} · seq {max_seq_length} · "
+                  f"docs {'contextual' if contextual else 'bare (ablation)'}")
 
     console.print("\n[bold]baseline[/bold] on the independent eval")
     base = load_model(model_name, device=device, max_seq_length=max_seq_length)

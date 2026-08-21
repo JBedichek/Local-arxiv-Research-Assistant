@@ -47,7 +47,16 @@ def _held_out_srcs(conn: sqlite3.Connection, frac: float, seed: int) -> set[str]
 
 
 def build_citation_task(conn: sqlite3.Connection, n: int = 800, pool_size: int = 2000,
-                        frac_heldout: float = 0.2, seed: int = 0) -> Task:
+                        frac_heldout: float = 0.2, seed: int = 0,
+                        contextual: bool = True) -> Task:
+    """Rank the cited paper against a pool of other papers.
+
+    ``contextual`` renders documents the way the corpus actually holds them —
+    ``title: {title} | text: {abstract}`` for a paper, matching
+    ``lara.cli.embed_papers`` — rather than as bare ``title\nabstract``. The eval used
+    bare text for both, which measured the encoder in a format no part of the system
+    deploys. Deltas were still internally valid; absolute numbers described nothing.
+    """
     held = _held_out_srcs(conn, frac_heldout, seed)
     if not held:
         return Task("citation", [], [], [])
@@ -60,11 +69,18 @@ def build_citation_task(conn: sqlite3.Connection, n: int = 800, pool_size: int =
             ORDER BY c.id LIMIT ?""",
         [*held, n],
     ).fetchall()
+    from lara.index.embed import document_text
+
+    def render(title, abstract):
+        # Paper-level: no section, exactly as embed_papers does it.
+        return (document_text(title, None, abstract) if contextual
+                else f"{title}\n{abstract}")
+
     queries = [r["context"] for r in rows]
-    positives = [f"{r['title']}\n{r['abstract']}" for r in rows]
+    positives = [render(r["title"], r["abstract"]) for r in rows]
 
     pool = [
-        f"{r['title']}\n{r['abstract']}"
+        render(r["title"], r["abstract"])
         for r in conn.execute(
             "SELECT title, abstract FROM papers WHERE in_scope=1 AND abstract IS NOT NULL "
             "AND length(abstract) > 200 ORDER BY arxiv_id LIMIT ?", (pool_size,)
@@ -74,21 +90,44 @@ def build_citation_task(conn: sqlite3.Connection, n: int = 800, pool_size: int =
 
 
 def build_paraphrase_task(conn: sqlite3.Connection, n: int = 800,
-                          pool_size: int = 2000, seed: int = 0) -> Task:
+                          pool_size: int = 2000, seed: int = 0,
+                          contextual: bool = True) -> Task:
+    """Rank a paper's own body chunk against chunks from other papers.
+
+    ``contextual`` renders chunks as ``title: {paper} > {section} | text: {chunk}``, which
+    is what `lara.index.embed.document_text` writes into all 29.5 M corpus vectors. Bare
+    chunk text — the old behaviour — measures a format nothing deploys.
+    """
+    from lara.index.embed import document_text
+
+    def render(title, section, text):
+        return document_text(title, section, text) if contextual else text
+
     rows = conn.execute(
-        """SELECT p.abstract, c.text
-           FROM papers p JOIN chunks c ON c.arxiv_id = p.arxiv_id
+        """SELECT p.abstract, p.title, c.text, s.title AS section
+           FROM papers p
+           JOIN chunks c ON c.arxiv_id = p.arxiv_id
+           LEFT JOIN sections s ON s.arxiv_id = c.arxiv_id
+                               AND s.version  = c.version
+                               AND s.anchor   = c.section_anchor
            WHERE p.fulltext_status='ok' AND c.kind='body' AND length(c.text) > 400
              AND p.abstract IS NOT NULL AND length(p.abstract) > 200
            GROUP BY p.arxiv_id ORDER BY p.arxiv_id LIMIT ?""",
         (n,),
     ).fetchall()
     queries = [r["abstract"] for r in rows]
-    positives = [r["text"] for r in rows]
+    positives = [render(r["title"], r["section"], r["text"]) for r in rows]
     pool = [
-        r[0] for r in conn.execute(
-            "SELECT text FROM chunks WHERE kind='body' AND length(text) > 400 "
-            "ORDER BY chunk_id DESC LIMIT ?", (pool_size,)
+        render(r["title"], r["section"], r["text"])
+        for r in conn.execute(
+            """SELECT c.text, p.title, s.title AS section
+               FROM chunks c
+               LEFT JOIN papers p ON p.arxiv_id = c.arxiv_id
+               LEFT JOIN sections s ON s.arxiv_id = c.arxiv_id
+                                   AND s.version  = c.version
+                                   AND s.anchor   = c.section_anchor
+               WHERE c.kind='body' AND length(c.text) > 400
+               ORDER BY c.chunk_id DESC LIMIT ?""", (pool_size,)
         )
     ]
     return Task("paraphrase", queries, positives, pool)
@@ -146,11 +185,18 @@ def collapse_stats(model, conn: sqlite3.Connection, n: int = 300) -> dict[str, f
 
 
 def run(model, conn: sqlite3.Connection, n: int = 800, pool_size: int = 2000,
-        seed: int = 0) -> dict[str, dict[str, float]]:
+        seed: int = 0, contextual: bool = True) -> dict[str, dict[str, float]]:
+    """``contextual=True`` scores the encoder in the format the corpus is embedded in.
+
+    False reproduces the old bare-text behaviour, for comparing against numbers recorded
+    before this was fixed.
+    """
     return {
         "collapse": collapse_stats(model, conn),
-        "citation": score_task(model, build_citation_task(conn, n, pool_size, seed=seed)),
-        "paraphrase": score_task(model, build_paraphrase_task(conn, n, pool_size, seed=seed)),
+        "citation": score_task(model, build_citation_task(
+            conn, n, pool_size, seed=seed, contextual=contextual)),
+        "paraphrase": score_task(model, build_paraphrase_task(
+            conn, n, pool_size, seed=seed, contextual=contextual)),
     }
 
 
