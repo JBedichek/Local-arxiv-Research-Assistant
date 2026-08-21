@@ -559,12 +559,12 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #deep {
   position: fixed; inset: 0; z-index: 40;
   display: flex; flex-direction: column;
-  background: var(--bg); color: var(--fg);
+  background: var(--bg); color: var(--text);
 }
 #deep-bar {
   display: flex; align-items: center; gap: .6rem;
-  padding: .5rem .8rem; border-bottom: 1px solid var(--rule);
-  background: var(--bg-raised, var(--bg)); flex: 0 0 auto; flex-wrap: wrap;
+  padding: .5rem .8rem; border-bottom: 1px solid var(--line);
+  background: var(--panel-2); flex: 0 0 auto; flex-wrap: wrap;
 }
 #deep-bar h2 { font-size: 1rem; margin: 0; white-space: nowrap; }
 #deep-form { display: flex; gap: .4rem; flex: 1 1 26rem; min-width: 16rem; }
@@ -572,30 +572,30 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #deep-body { flex: 1 1 auto; display: flex; min-height: 0; }
 #deep-left  { flex: 1 1 55%; overflow: auto; padding: .7rem 1rem; min-width: 0; }
 #deep-right { flex: 1 1 45%; overflow: auto; padding: .7rem 1.1rem; min-width: 0;
-              border-left: 1px solid var(--rule); }
+              border-left: 1px solid var(--line); }
 #deep-left h3 { margin: 0 0 .5rem; font-size: .85rem; text-transform: uppercase;
                 letter-spacing: .06em; opacity: .75; }
 #deep-left h3 small { text-transform: none; letter-spacing: 0; opacity: .8; }
 
 /* One round = one collapsible group. Open while it is the newest, collapsed after,
    so a long run stays readable without hiding what is happening now. */
-.deep-round { border: 1px solid var(--rule); border-radius: 6px; margin-bottom: .55rem; }
+.deep-round { border: 1px solid var(--line); border-radius: 6px; margin-bottom: .55rem; }
 .deep-round > summary {
   cursor: pointer; padding: .45rem .6rem; font-size: .88rem;
   display: flex; gap: .5rem; align-items: baseline; flex-wrap: wrap;
 }
-.deep-round > summary::-webkit-details-marker { color: var(--muted); }
+.deep-round > summary::-webkit-details-marker { color: var(--dim); }
 .deep-round .rq { opacity: .72; font-style: italic; }
 .deep-round .tag {
   font-size: .72rem; padding: .05rem .4rem; border-radius: 999px;
-  border: 1px solid var(--rule); opacity: .85; white-space: nowrap;
+  border: 1px solid var(--line); opacity: .85; white-space: nowrap;
 }
 .deep-round .tag.cit { border-color: var(--accent, #6a9); }
 .deep-claims { padding: .1rem .6rem .55rem; display: flex; flex-direction: column; gap: .3rem; }
 
 /* Each confirmed chunk: the model's own name for it, then the compressed claim, then
    whatever it measured. The name is what makes a 60-claim run scannable. */
-.deep-claim { border-left: 2px solid var(--rule); padding: .18rem 0 .18rem .55rem; }
+.deep-claim { border-left: 2px solid var(--line); padding: .18rem 0 .18rem .55rem; }
 .deep-claim a.cname { font-weight: 600; text-decoration: none; }
 .deep-claim a.cname:hover { text-decoration: underline; }
 .deep-claim .cpaper { opacity: .6; font-size: .78rem; margin-left: .35rem; }
@@ -610,7 +610,7 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 .deep-gap { font-size: .82rem; padding: .3rem .6rem .5rem; opacity: .85; }
 .deep-gap b { font-weight: 600; }
 
-#deep-answers > details { border-bottom: 1px solid var(--rule); padding-bottom: .6rem;
+#deep-answers > details { border-bottom: 1px solid var(--line); padding-bottom: .6rem;
                           margin-bottom: .8rem; }
 #deep-answers > details > summary {
   cursor: pointer; font-size: .85rem; text-transform: uppercase;
@@ -626,7 +626,7 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 }
 #deep-tldr { font-size: 1.02em; }
 @media (max-width: 900px) { #deep-body { flex-direction: column; }
-                            #deep-right { border-left: 0; border-top: 1px solid var(--rule); } }
+                            #deep-right { border-left: 0; border-top: 1px solid var(--line); } }
 
 /* ── Inline maths ────────────────────────────────────────────────────────────
    Rendered from the LaTeX stored in each chunk's alttext (66% of the corpus has
@@ -669,7 +669,7 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 .ctable { width: 100%; border-collapse: collapse; }
 .ctable td { padding: .12rem .3rem; }
 .ctable td.num { text-align: right; font-variant-numeric: tabular-nums; }
-.ctable tr.ctot td { border-top: 1px solid var(--rule); opacity: .75; }
+.ctable tr.ctot td { border-top: 1px solid var(--line); opacity: .75; }
 .cdot { display: inline-block; width: .55em; height: .55em; border-radius: 2px;
         margin-right: .4em; vertical-align: baseline; }
 .ctx-note { opacity: .7; margin: .4rem 0 0; }
