@@ -18,10 +18,14 @@ backend can be dropped in later without anything upstream noticing.
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 import time
 import urllib.parse
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 import httpx
 from lxml import html as LH
@@ -54,6 +58,18 @@ BACKOFF_MAX_SEC = 480.0
 #: the confusion SearchStats.errors exists to prevent.
 BLOCK_MARKERS = ("anomaly", "unusual traffic", "captcha")
 
+#: Where answered queries are kept. Caching matters more here than it usually does: the
+#: engine throttles by address, so every query avoided is throttle budget preserved, and a
+#: corpus recipe re-runs its queries on every rebuild. With a cache, rebuilding a corpus
+#: from its recipe costs no searches at all.
+CACHE_DIR = Path(os.environ.get("LARA_SEARCH_CACHE",
+                                Path.home() / ".cache" / "lara" / "search"))
+
+#: Search results for textbooks and manuals do not turn over quickly, and a month-old
+#: answer to "free calculus textbook pdf" is the same answer. Long by the standards of a
+#: news crawler, correct for this.
+CACHE_TTL_SEC = 30 * 24 * 3600
+
 #: Hosts that are the search engine talking about itself, never a result worth fetching.
 SELF_DOMAINS = ("duckduckgo.com", "duck.com")
 
@@ -63,6 +79,41 @@ _backoff = 0.0
 
 class Blocked(Exception):
     """The search engine is refusing this address for now."""
+
+
+def _cache_path(query: str, k: int) -> Path:
+    key = hashlib.sha256(f"{query}\x00{k}".encode()).hexdigest()[:24]
+    return CACHE_DIR / f"{key}.json"
+
+
+def _cache_read(query: str, k: int, *, allow_stale: bool = False
+                ) -> tuple[list["Result"], bool] | None:
+    """Cached results and whether they were stale, or None if nothing is stored."""
+    path = _cache_path(query, k)
+    try:
+        blob = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    age = time.time() - blob.get("stored", 0)
+    stale = age > CACHE_TTL_SEC
+    if stale and not allow_stale:
+        return None
+    return [Result(**r) for r in blob.get("results", [])], stale
+
+
+def _cache_write(query: str, k: int, results: list["Result"]) -> None:
+    # An empty result set is not cached: it is far more often a block or a transient
+    # failure than a genuine absence, and caching it would make one bad minute look like a
+    # permanent fact about the query.
+    if not results:
+        return
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _cache_path(query, k).write_text(json.dumps(
+            {"query": query, "k": k, "stored": time.time(),
+             "results": [asdict(r) for r in results]}))
+    except OSError:
+        pass
 
 
 def _looks_blocked(status: int, body: str) -> bool:
@@ -91,6 +142,8 @@ class SearchStats:
     queries: int = 0
     results: int = 0
     blocked: int = 0
+    cached: int = 0          # served from cache, no request made
+    stale: int = 0           # served from an expired cache because we were blocked
     errors: list[str] = field(default_factory=list)
 
     @property
@@ -108,7 +161,7 @@ def _unwrap(href: str) -> str:
 
 
 def search(query: str, k: int = 10, *, timeout: float = 25.0,
-           stats: SearchStats | None = None) -> list[Result]:
+           stats: SearchStats | None = None, use_cache: bool = True) -> list[Result]:
     """Top-k results for one query. Never raises: a failed search returns nothing.
 
     A corpus build issues many queries and one of them timing out should cost that query's
@@ -117,6 +170,13 @@ def search(query: str, k: int = 10, *, timeout: float = 25.0,
     identical from an empty list and mean completely different things to a user.
     """
     global _last_query, _backoff
+    if use_cache:
+        hit = _cache_read(query, k)
+        if hit is not None:
+            if stats is not None:
+                stats.cached += 1
+            return hit[0]
+
     wait = max(MIN_INTERVAL_SEC - (time.monotonic() - _last_query), _backoff)
     if wait > 0:
         time.sleep(wait)
@@ -141,6 +201,15 @@ def search(query: str, k: int = 10, *, timeout: float = 25.0,
         if stats is not None:
             stats.blocked += 1
             stats.errors.append(f"{query}: blocked ({exc}); waiting {_backoff:.0f}s")
+        # Blocked is exactly when a stale answer earns its keep. Month-old results for
+        # "free calculus textbook" are worth incomparably more than nothing, and the
+        # alternative is a build that stops because a rate limiter is unhappy.
+        if use_cache:
+            hit = _cache_read(query, k, allow_stale=True)
+            if hit is not None:
+                if stats is not None:
+                    stats.stale += 1
+                return hit[0]
         return []
     except Exception as exc:                       # noqa: BLE001 - reported, not raised
         if stats is not None:
@@ -171,6 +240,8 @@ def search(query: str, k: int = 10, *, timeout: float = 25.0,
 
     if stats is not None:
         stats.results += len(out)
+    if use_cache:
+        _cache_write(query, k, out)
     return out
 
 
