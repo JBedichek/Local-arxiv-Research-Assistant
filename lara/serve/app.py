@@ -764,7 +764,12 @@ def model_resolve(req: ResolveRequest) -> JSONResponse:
         "repo": r.repo, "exists": r.exists, "gated": r.gated, "error": r.error,
         "params": r.params, "arch": r.arch, "quantization": r.quantization,
         "size_gb": r.size_gb, "n_safetensors": r.n_safetensors, "n_gguf": r.n_gguf,
-        "pipeline": r.pipeline, "variants": r.variants, "pick": r.pick,
+        # The quantisation is treated as a property of the repo, not something to choose:
+        # the server picks the 4-bit build and reports only that. `pick_files` still has
+        # to travel, because the repo physically contains every other quantisation and
+        # downloading without naming files fetches all of them.
+        "pipeline": r.pipeline, "pick": r.pick,
+        "pick_files": next((v["files"] for v in r.variants if v["quant"] == r.pick), None),
         "already_cached": _dl(s).cache_dir(r.repo).exists() if r.repo else False,
     }
     if r.exists and r.size_gb:

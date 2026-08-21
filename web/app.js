@@ -1874,20 +1874,8 @@ queueMicrotask(() => boot().catch((e) => {
 
 let dlResolved = null;
 let dlPoll = null;
-/* Which GGUF quantisation is selected. Null for safetensors repos, which have one. */
-let dlQuant = null;
-/* /api/device, cached so the fit line can be recomputed when the selection changes. */
+/* /api/device, cached so the dialog can report what fits without refetching. */
 let dlDevice = null;
-
-/* The selected variant, and the size/files that go with it. */
-function dlVariant(r) {
-  if (!r || !r.variants || !r.variants.length) return null;
-  return r.variants.find((v) => v.quant === dlQuant) || null;
-}
-function dlSize(r) {
-  const v = dlVariant(r);
-  return v ? v.size_gb : (r ? r.size_gb : 0);
-}
 
 /* Where to actually find each format. A model name alone is not enough: "Qwen3-8B" names
  * three different sets of files depending on who converted it, and only one of them will
@@ -1977,22 +1965,12 @@ function renderResolved(r) {
   if (r.arch) html += row("architecture", escapeHtml(r.arch));
   if (r.quantization) html += row("quantization", escapeHtml(r.quantization));
 
-  /* A GGUF repo ships one file per quantisation — 25 of them, 133 GB, for an 8B model —
-   * so "download size" means nothing until one is chosen, and fetching the repo means
-   * fetching every alternative. Default to the 4-bit build the server picked; only the
-   * selected files are ever downloaded. */
-  if (r.variants && r.variants.length) {
-    const opts = r.variants.map((v) => {
-      const sel = v.quant === dlQuant ? " selected" : "";
-      const shards = v.files.length > 1 ? ` · ${v.files.length} parts` : "";
-      return `<option value="${escapeHtml(v.quant)}"${sel}>${escapeHtml(v.quant)}`
-           + ` — ${v.size_gb.toFixed(1)} GB${shards}</option>`;
-    }).join("");
-    html += `<div class="row"><span class="k">quantisation</span><span class="v">`
-          + `<select id="dl-quant">${opts}</select></span></div>`;
-  }
+  /* The quantisation is a property of the repo, not a choice: the server picks the
+   * 4-bit build and this reports it. The repo still physically contains every other
+   * quantisation, which is why the download names its files rather than the repo. */
+  if (r.pick) html += row("quantisation", escapeHtml(r.pick));
 
-  const size = dlSize(r);
+  const size = r.size_gb;
   html += row("download size",
     size ? `~${size.toFixed(1)} GB` : (r.n_gguf ? "pick a quantisation above" : "unknown"));
 
@@ -2020,14 +1998,6 @@ function renderResolved(r) {
           + `<span class="v warn">${escapeHtml(r.warning)}</span></div>`;
   }
   $("#dl-info").innerHTML = html;
-
-  const qsel = $("#dl-quant");
-  if (qsel) {
-    qsel.addEventListener("change", (e) => {
-      dlQuant = e.target.value;
-      renderResolved(dlResolved);   // size and fit both follow the selection
-    });
-  }
   // Offered even when it does not fit: the estimate is conservative and the machine is
   // the user's to judge.
   $("#dl-start").hidden = !!r.already_cached;
@@ -2045,7 +2015,6 @@ $("#dl-form").addEventListener("submit", async (ev) => {
       body: JSON.stringify({ query: q }),
     });
     dlResolved = r;
-    dlQuant = r.pick || (r.variants && r.variants.length ? r.variants[0].quant : null);
     if (!r.exists || r.error) {
       $("#dl-info").innerHTML = `<span class="bad">${escapeHtml(r.error || "not found")}</span>`;
       return;
@@ -2061,15 +2030,15 @@ $("#dl-start").addEventListener("click", async () => {
   $("#dl-start").hidden = true;
   $("#dl-progress").hidden = false;
   try {
-    const variant = dlVariant(dlResolved);
     await api("/api/model/download", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         repo: dlResolved.repo,
-        size_gb: dlSize(dlResolved),
-        // Only this quantisation's files. Omitted for safetensors repos, where the
-        // whole snapshot is the model.
-        files: variant ? variant.files : null,
+        size_gb: dlResolved.size_gb,
+        // Only the picked quantisation's files. Null for safetensors repos, where the
+        // whole snapshot is the model. Without this a GGUF repo fetches every
+        // quantisation it ships.
+        files: dlResolved.pick_files || null,
       }),
     });
   } catch (err) {
