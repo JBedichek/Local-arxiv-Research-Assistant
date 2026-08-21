@@ -78,6 +78,31 @@ def generator_params_at_4bit(headroom_gb: float) -> float:
     return max(0.0, headroom_gb / KV_OVERHEAD) * 1e9 / (GENERATOR_QUANT_BITS / 8)
 
 
+#: KV cache is 2 (K and V) x layers x kv_heads x head_dim x dtype_bytes *per token*, and
+#: at a long context it outweighs the weights it serves: an 8B at 32 k tokens in fp16
+#: needs 4.8 GB of cache against 4.7 GB of Q4_K_M weights. Nothing in the wizard used to
+#: mention it, so `ctx_size: 32768` sat in the config quietly doubling the generator.
+#:
+#: This figure is for an 8B-class GQA model -- 36 layers, 8 KV heads, 128 head dim, which
+#: is Qwen3-8B's shape. Architecture is not derivable from a parameter count, so treat it
+#: as sizing guidance rather than a measurement; llama.cpp prints the exact number at load.
+KV_BYTES_PER_TOKEN_FP16 = 2 * 36 * 8 * 128 * 2
+
+#: Context lengths worth offering. 32 k is llama.cpp's default here and is why the cache
+#: was so large; 8 k comfortably holds a question plus the excerpts a RAG answer cites.
+CONTEXT_CHOICES = (4096, 8192, 16384, 32768, 65536)
+
+
+def kv_cache_gb(ctx_tokens: int, quantised: bool = False) -> float:
+    """KV cache for one generator at this context length.
+
+    ``-c`` is the *total* context shared across slots in llama.cpp, so ``--parallel`` does
+    not multiply this. ``quantised`` is q8_0 for both K and V, which halves it.
+    """
+    per_token = KV_BYTES_PER_TOKEN_FP16 / (2 if quantised else 1)
+    return per_token * ctx_tokens / 1e9
+
+
 def format_params(n: float) -> str:
     """Parameter count as people name models: 0.6B, 8B, 70B."""
     b = n / 1e9
@@ -487,7 +512,8 @@ def overrides_for(plan: Plan, *, model: str | None = None,
                   disk_root: str | None = None,
                   devices: list[int] | str | None = None,
                   topics: list[str] | None = None,
-                  backend: str = "vllm") -> dict:
+                  backend: str = "vllm",
+                  ctx_size: int | None = None) -> dict:
     """Build the override dict the wizard writes. Only non-default keys are included."""
     index: dict = {"backend": plan.option.backend, "precision": plan.option.precision}
     if plan.option.faiss_kind:
@@ -542,6 +568,10 @@ def overrides_for(plan: Plan, *, model: str | None = None,
             # Matches the schema generator.model_for reads: serving.generator.<name>.model,
             # a sibling of `backend` rather than of `generator`.
             generator[backend] = {"model": model}
+            # The KV cache is sized from this, and at 32k it outweighs the weights. It is
+            # a per-backend setting, so it rides along with the model it applies to.
+            if ctx_size and backend in ("llamacpp", "ollama"):
+                generator[backend]["ctx_size"] = int(ctx_size)
     if vllm:
         serving["vllm"] = vllm
     if generator:

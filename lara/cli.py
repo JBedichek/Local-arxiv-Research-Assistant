@@ -1362,12 +1362,63 @@ def setup(
                 if m and m.runtime_quant_options():
                     quant = m.runtime_quant_options()[0]
 
+    # ── 5b. context length ─────────────────────────────────────────────────────
+    # The KV cache is per-token and at 32k outweighs the weights it serves, so this is
+    # the largest generator-side memory decision and nothing used to surface it.
+    ctx_size = int(cfg.get_in("serving.generator.llamacpp.ctx_size", 32768) or 32768)
+    kv_quant = bool(cfg.get_in("serving.generator.llamacpp.cache_type_k"))
+    if model and gen_backend in ("llamacpp", "ollama"):
+        model_gb = next((m.size_gb for m in (cached if not base_url else [])
+                         if model in (m.repo, m.spec)), 0.0)
+        spare = SU.generator_headroom_gb(device.budget_gb, plan.overhead_gb
+                                         + plan.planned_index_gb)
+
+        def ctx_table(cursor: int | None) -> Table:
+            t = Table(show_header=True, header_style="bold")
+            for c, j in (("", "left"), ("context", "right"), ("KV cache", "right"),
+                         ("+ weights", "right"), ("verdict", "left")):
+                t.add_column(c, justify=j, overflow="fold")
+            for i, n in enumerate(SU.CONTEXT_CHOICES):
+                kv = SU.kv_cache_gb(n, kv_quant)
+                total = kv + model_gb
+                on = cursor is not None and i == cursor
+                fits = total <= spare
+                t.add_row("❯" if on else ("→" if n == ctx_size else ""),
+                          f"[bold cyan]{n:,}[/bold cyan]" if on else f"{n:,}",
+                          f"{kv:.2f} GB", f"{total:.2f} GB",
+                          "[green]fits[/green]" if fits
+                          else f"[red]needs {total - spare:.1f} GB more[/red]")
+            return t
+
+        console.print("\n[bold]5b. Context length[/bold]")
+        console.print(f"  [dim]How much text the generator can hold at once — the question, "
+                      f"the excerpts it cites, and the answer. Its KV cache costs "
+                      f"{SU.KV_BYTES_PER_TOKEN_FP16 / 1024:.0f} KB per token"
+                      f"{' (halved by q8_0)' if kv_quant else ''}, so this is usually the "
+                      f"largest generator-side memory decision.\n"
+                      f"  Estimated for an 8B-class model; llama.cpp prints the exact "
+                      f"figure when it loads. {spare:.1f} GB is free after retrieval.[/dim]")
+        start = (list(SU.CONTEXT_CHOICES).index(ctx_size)
+                 if ctx_size in SU.CONTEXT_CHOICES else 1)
+        if non_interactive or show:
+            console.print(ctx_table(None))
+        elif prompt_mod.interactive():
+            picked = prompt_mod.select(len(SU.CONTEXT_CHOICES), ctx_table,
+                                       console=console, initial=start)
+            if picked is not None:
+                ctx_size = SU.CONTEXT_CHOICES[picked]
+            console.print(f"  context: [bold]{ctx_size:,}[/bold]")
+        else:
+            console.print(ctx_table(None))
+            raw = typer.prompt("  context length", default=str(ctx_size))
+            ctx_size = int(raw) if raw.strip().isdigit() else ctx_size
+
     # ── 6. write ───────────────────────────────────────────────────────────────
     overrides = SU.overrides_for(
         plan, model=model, quantization=quant, base_url=base_url,
         disk_root=str(cfg.get_path("disk.root")),
         devices=[int(g) for g in range(len(device.gpus))] if device.gpus else "auto",
-        topics=topics, backend=gen_backend,
+        topics=topics, backend=gen_backend, ctx_size=ctx_size,
     )
     # Pin the filesystem the corpus actually lives on. Detectable, and the check that
     # catches a symlink quietly redirecting 30 GB onto the wrong disk.
