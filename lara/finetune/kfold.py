@@ -783,14 +783,14 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
                     since_best += 1
 
             if progress is not None and step % 5 == 0:
-                progress.send({"step": step, "steps": steps, "loss": float(loss.detach()),
+                progress.send({"step": step, "steps": steps, "loss": total,
                                "lr": opt.param_groups[0]["lr"], "val_loss": vl,
                                "best_val": best_loss if best_state is not None else None,
                                "elapsed": time.time() - started})
             if val_triples and since_best >= rec.patience:
                 if progress is not None:
                     progress.send({"step": step, "steps": steps, "early_stop": True,
-                                   "loss": float(loss.detach()), "best_val": best_loss,
+                                   "loss": total, "best_val": best_loss,
                                    "lr": opt.param_groups[0]["lr"],
                                    "elapsed": time.time() - started})
                 stopped = True
