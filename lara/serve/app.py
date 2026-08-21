@@ -1449,6 +1449,82 @@ class SynthRequest(BaseModel):
     model: str | None = None
 
 
+@app.get("/api/library/graph")
+async def library_graph(refresh: bool = False, model: str | None = None) -> JSONResponse:
+    """The library as a directed graph of conversations.
+
+    Cached against a fingerprint of the question entries, so it is rebuilt when the
+    library changes and not on every render — it costs two model calls over the whole
+    library.
+    """
+    from lara.serve import library_graph as LG
+    from lara.serve.generate import stream_answer
+
+    s = _state()
+    root = _memory_root()
+    if not refresh:
+        hit = LG.cached(root)
+        if hit is not None:
+            return JSONResponse({**hit, "cached": True})
+
+    graph = await LG.build(s.cfg, root, model, stream_answer)
+    if graph.get("nodes"):
+        LG.store(root, graph)
+    return JSONResponse({**graph, "cached": False})
+
+
+class CompressRequest(BaseModel):
+    paper: str | None = None
+    model: str | None = None
+    keep: int = 2
+
+
+@app.post("/api/thread/compress")
+async def thread_compress(req: CompressRequest) -> JSONResponse:
+    """Summarise a thread's older turns so the conversation can keep going.
+
+    The most recent turns stay verbatim — they are what follow-ups point at, so
+    compressing them would break the reference resolution this exists to protect.
+    """
+    from lara.serve import thread as TH
+    from lara.serve.generate import stream_answer
+
+    s = _state()
+    out = await TH.compress(s.cfg, _memory_root(), req.paper, req.model, stream_answer,
+                            keep=max(0, int(req.keep)))
+    return JSONResponse(out)
+
+
+@app.post("/api/thread/uncompress")
+def thread_uncompress(req: CompressRequest) -> JSONResponse:
+    """Drop a thread's summary and send the full history again."""
+    from lara.serve import memory as MEM
+    from lara.serve import thread as TH
+
+    ok = MEM.clear_thread_summary(_memory_root(), TH.thread_id(req.paper))
+    return JSONResponse({"ok": ok})
+
+
+@app.get("/api/thread/state")
+def thread_state(paper: str | None = None) -> JSONResponse:
+    """What the model will be sent for this thread, and what has been compressed away."""
+    from lara.serve import memory as MEM
+    from lara.serve import thread as TH
+
+    root = _memory_root()
+    tid = TH.thread_id(paper)
+    summary = MEM.get_thread_summary(root, tid)
+    live = TH.turns_for(root, paper)
+    return JSONResponse({
+        "thread": tid,
+        "summary": summary,
+        "compressed_turns": len(MEM.get_thread_summary_covered(root, tid)),
+        "live_turns": len(live),
+        "total_turns": len(TH.turns_for(root, paper, limit=999, include_compressed=True)),
+        "history_chars": len(TH.history_block(live, summary=summary)),
+    })
+
+
 @app.post("/api/synthesize")
 async def synthesize(req: SynthRequest) -> StreamingResponse:
     """Deep automated research, streamed as it happens.
@@ -1547,7 +1623,9 @@ async def ask(req: AskRequest) -> StreamingResponse:
 
     # The thread is keyed by paper, so opening another one starts a fresh conversation.
     turns = TH.turns_for(_memory_root(), req.paper)
-    history = TH.history_block(turns)
+    from lara.serve import memory as _MEM
+    thread_summary = _MEM.get_thread_summary(_memory_root(), TH.thread_id(req.paper))
+    history = TH.history_block(turns, summary=thread_summary)
     # Passages the last answers cited are strong candidates for a follow-up, and cost
     # nothing to reuse: they were already retrieved and reranked.
     seed_ids = TH.prior_chunk_ids(turns)

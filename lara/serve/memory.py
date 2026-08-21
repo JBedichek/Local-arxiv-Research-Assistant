@@ -411,3 +411,40 @@ def delete_taste(root: Path, mark_id: str) -> bool:
             return False
         save_taste(root, data)
         return True
+
+
+# ── thread summaries ──────────────────────────────────────────────────────────────
+#
+# A compressed conversation. Kept beside the entries rather than replacing them: the
+# reader's library should still show every question they asked, even once the model has
+# stopped being sent them verbatim.
+
+def get_thread_summary(root: Path, tid: str) -> str:
+    return (load(root).get("thread_summaries", {}).get(tid) or {}).get("summary", "")
+
+
+def get_thread_summary_covered(root: Path, tid: str) -> list[str]:
+    """Entry ids already folded into the summary, so they are not sent twice."""
+    return (load(root).get("thread_summaries", {}).get(tid) or {}).get("covered", [])
+
+
+def set_thread_summary(root: Path, tid: str, summary: str, covered: list[str]) -> dict:
+    with _LOCK:
+        data = load(root)
+        store = data.setdefault("thread_summaries", {})
+        prev = store.get(tid) or {}
+        # Compression is cumulative: a second pass folds the first summary's coverage in
+        # rather than orphaning it, or those turns would silently return to the prompt.
+        merged = list(dict.fromkeys([*prev.get("covered", []), *covered]))
+        store[tid] = {"summary": summary, "covered": merged, "updated_utc": _now()}
+        save(root, data)
+        return store[tid]
+
+
+def clear_thread_summary(root: Path, tid: str) -> bool:
+    with _LOCK:
+        data = load(root)
+        if (data.get("thread_summaries") or {}).pop(tid, None) is None:
+            return False
+        save(root, data)
+        return True

@@ -176,8 +176,11 @@
 <main>
   <section id="library-pane">
     <h2>Library
+      <button type="button" id="lib-view" title="Switch between the graph and the list">graph</button>
+      <button type="button" id="lib-rebuild" title="Re-read the library and rebuild the graph" hidden>↻</button>
       <button type="button" id="lib-newfolder" title="New folder">+ folder</button>
     </h2>
+    <div id="lib-graph" hidden></div>
     <div id="lib-tree"><p class="lib-empty">Papers you open and questions you ask show up here.</p></div>
   </section>
 

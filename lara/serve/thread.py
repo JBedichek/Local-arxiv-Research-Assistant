@@ -42,11 +42,19 @@ def thread_id(arxiv_id: str | None) -> str:
     return arxiv_id or CORPUS_THREAD
 
 
-def turns_for(root, arxiv_id: str | None, limit: int = DEFAULT_TURNS) -> list[dict]:
-    """The most recent question/answer pairs in this thread, oldest first."""
+def turns_for(root, arxiv_id: str | None, limit: int = DEFAULT_TURNS,
+              include_compressed: bool = False) -> list[dict]:
+    """The most recent question/answer pairs in this thread, oldest first.
+
+    Turns already folded into a stored summary are skipped unless asked for: they are
+    represented by the summary now, and sending both would cost the tokens compression
+    was invoked to reclaim.
+    """
     from lara.serve import memory as MEM
 
     want = thread_id(arxiv_id)
+    covered = set() if include_compressed else set(
+        MEM.get_thread_summary_covered(root, want))
     try:
         data = MEM.load(root)
     except Exception:
@@ -54,7 +62,7 @@ def turns_for(root, arxiv_id: str | None, limit: int = DEFAULT_TURNS) -> list[di
     turns = [
         e for e in data.get("entries", [])
         if e.get("kind") == "question" and thread_id(e.get("arxiv_id")) == want
-        and (e.get("question") or "").strip()
+        and (e.get("question") or "").strip() and e.get("id") not in covered
     ]
     turns.sort(key=lambda e: e.get("created_utc") or "")
     return turns[-limit:]
@@ -157,16 +165,25 @@ async def rewrite(cfg, question: str, turns: list[dict], model, stream_answer) -
 # ── prompt ────────────────────────────────────────────────────────────────────────
 
 
-def history_block(turns: list[dict], max_answer: int = MAX_ANSWER_CHARS) -> str:
+def history_block(turns: list[dict], max_answer: int = MAX_ANSWER_CHARS,
+                  summary: str = "") -> str:
     """The conversation as the answering model sees it.
 
     Answers are truncated because their job here is to establish what was discussed, not
     to be re-read in full: an untruncated thread would crowd out the excerpts that carry
     the evidence for the current question.
     """
-    if not turns:
+    if not turns and not summary:
         return ""
-    lines = ["Earlier in this conversation:"]
+    lines = []
+    if summary:
+        # The compressed turns are presented as established context rather than as
+        # transcript, because that is what they now are: the exchanges themselves are
+        # gone and only these notes can resolve a reference back to them.
+        lines.append("Summary of earlier turns in this conversation:\n" + summary.strip())
+    if turns:
+        lines.append("\nMost recent exchanges:" if summary
+                     else "Earlier in this conversation:")
     for t in turns:
         q = (t.get("question") or "").strip()
         a = (t.get("answer") or "").strip()
@@ -198,3 +215,86 @@ def prior_chunk_ids(turns: list[dict], cap: int = 8) -> list[int]:
         if len(out) >= cap:
             break
     return out[:cap]
+
+
+# ── compression ───────────────────────────────────────────────────────────────────
+
+#: Turns kept verbatim after compressing. References almost always point at the most
+#: recent exchange, so summarising it away is what would actually break follow-ups.
+KEEP_VERBATIM = 2
+
+COMPRESS_SYSTEM = """You are compressing a conversation so it can keep going.
+
+The summary REPLACES the exchanges it covers. Nothing else from them survives — so
+anything the reader might refer back to has to be in it, stated plainly enough that a
+pronoun can be resolved against it.
+
+What your summary causes:
+- It is prepended to future prompts in place of the full exchanges, and is what the model
+  will use to work out what "it", "that" or "the second one" refers to.
+- Anything you leave out is gone. If a method, dataset, number or comparison was discussed
+  and you omit it, a later question about it will be answered as though it were never
+  mentioned.
+- Anything you add that was not discussed will be treated as established fact.
+
+Write compact notes, not prose. Prioritise, in order:
+1. Named entities — methods, papers, datasets, metrics, authors.
+2. Conclusions actually reached, with their numbers and conditions.
+3. What the reader seemed to be pursuing, so a vague follow-up still has a subject.
+4. Anything explicitly ruled out or found unsupported.
+
+Do not restate the questions verbatim. Do not add caveats about being a summary.
+Aim for under 200 words."""
+
+
+async def compress(cfg, root, arxiv_id, model, stream_answer,
+                   keep: int = KEEP_VERBATIM) -> dict:
+    """Summarise a thread's older turns so the conversation can continue cheaply.
+
+    The most recent turns are left verbatim: they are what follow-ups point at, and
+    compressing them is what would break reference resolution — the opposite of the point.
+    """
+    from lara.serve import memory as MEM
+
+    turns = turns_for(root, arxiv_id, limit=200)
+    if len(turns) <= keep:
+        return {"ok": False, "reason": f"only {len(turns)} turns; nothing to compress"}
+
+    older, recent = turns[:-keep], turns[-keep:]
+    prior = MEM.get_thread_summary(root, thread_id(arxiv_id))
+    convo = "\n\n".join(
+        f"Q: {t.get('question','').strip()}\nA: {(t.get('answer') or '').strip()[:1500]}"
+        for t in older)
+    prompt = ((f"Existing summary of even earlier turns:\n{prior}\n\n" if prior else "")
+              + f"Exchanges to compress:\n{convo}\n\nWrite the compact notes.")
+
+    buf = ""
+    try:
+        async for tok in stream_answer(cfg, prompt, [], system=COMPRESS_SYSTEM, model=model,
+                                       temperature=0.1, max_tokens=500, raw_user=True):
+            buf += tok
+    except Exception:
+        buf = ""
+    summary = (buf or "").strip()
+    if len(summary) < 40:
+        return {"ok": False, "reason": "the model returned no usable summary"}
+
+    # Compare like with like. `turns` here is the WHOLE thread, but only the last
+    # DEFAULT_TURNS were ever being sent, so measuring against all of them would report a
+    # saving that never existed. The honest before is what the model actually saw.
+    before = len(history_block(turns[-DEFAULT_TURNS:]))
+    MEM.set_thread_summary(root, thread_id(arxiv_id), summary,
+                           covered=[t["id"] for t in older])
+    after = len(history_block(recent, summary=summary))
+    return {
+        "ok": True, "summary": summary,
+        "compressed_turns": len(older), "kept_verbatim": len(recent),
+        "chars_before": before, "chars_after": after,
+        # What compression actually buys is COVERAGE: every turn is represented, instead
+        # of a sliding window of the most recent DEFAULT_TURNS. On a short thread that
+        # costs more characters than it saves, and saying so is better than implying a
+        # win that is not there.
+        "turns_before": min(len(turns), DEFAULT_TURNS),
+        "turns_after": len(turns),
+        "saves_chars": after < before,
+    }

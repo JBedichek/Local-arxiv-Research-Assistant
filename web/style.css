@@ -676,3 +676,32 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 .perf { margin-top: .35rem; font-size: .78rem; opacity: .72;
         font-variant-numeric: tabular-nums; }
 .perf b { font-weight: 600; opacity: .95; }
+
+/* ── Library graph ───────────────────────────────────────────────────────────
+   Laid out like a git log: rows in time order, edges as curves in a left gutter.
+   A force-directed layout wants width a sidebar does not have. */
+#lib-graph { padding: .2rem .4rem .6rem; }
+.lgwrap { position: relative; display: flex; align-items: flex-start; }
+.lgsvg { flex: 0 0 auto; }
+.lgrows { flex: 1 1 auto; min-width: 0; padding-top: var(--pad); }
+.lgnode { height: var(--row); box-sizing: border-box; padding: .2rem .35rem;
+          border-radius: 5px; cursor: pointer; overflow: hidden; }
+.lgnode:hover { background: rgba(127,127,127,.12); }
+.lgtop { display: flex; gap: .35rem; align-items: baseline; }
+.lglabel { font-size: .84rem; font-weight: 600; white-space: nowrap;
+           overflow: hidden; text-overflow: ellipsis; }
+.lgn { margin-left: auto; font-size: .7rem; opacity: .55; }
+.lgmeta { display: flex; gap: .3rem; align-items: center; font-size: .68rem;
+          opacity: .6; margin-top: .1rem; }
+.ltag { padding: 0 .3rem; border-radius: 3px; background: rgba(127,127,127,.16); }
+.lglegend { display: flex; flex-wrap: wrap; gap: .5rem; font-size: .68rem;
+            opacity: .75; padding: .5rem .2rem 0; }
+.lglegend i { display: inline-block; width: .6em; height: .6em; border-radius: 2px;
+              margin-right: .25em; }
+.lgfoot { font-size: .68rem; opacity: .55; padding: .3rem .2rem 0; margin: 0; }
+#lib-view, #lib-rebuild { font-size: .7rem; }
+
+.ctx-compress { margin-top: .5rem; font-size: .78rem; }
+.ctx-summary { margin-top: .4rem; font-size: .78rem; }
+.ctx-summary > summary { cursor: pointer; opacity: .75; }
+.ctx-summary > div { padding: .3rem 0 0; opacity: .9; white-space: pre-wrap; }
