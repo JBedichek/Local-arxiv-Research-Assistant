@@ -523,6 +523,10 @@ def finetune_pairs(
     contextual: bool = typer.Option(
         True, help="Render training documents as the corpus is embedded "
                    "(title > section | text). --no-contextual is the ablation."),
+    sam_rho: float = typer.Option(
+        0.0, help="Sharpness-Aware Minimisation radius; 0 off. Doubles step cost."),
+    ema_decay: float = typer.Option(
+        0.0, help="EMA of weights, e.g. 0.999; 0 off. Nearly free."),
 ) -> None:
     """Train once on ALL judgement pairs, then judge it on the independent eval.
 
@@ -556,10 +560,13 @@ def finetune_pairs(
     rec = KF.Recipe(lr_muon=lr_muon, lr_adam=lr_muon / 5, batch_size=batch_size,
                     micro_batch=micro_batch, epochs=epochs, max_seq_length=max_seq_length,
                     patience=patience, eval_every=eval_every,
+                    sam_rho=sam_rho, ema_decay=ema_decay,
                     compile_mode=None if compile_mode.lower() == "none" else compile_mode)
     console.print(f"[bold]{len(triples):,}[/bold] triples from {n_q:,} queries · "
                   f"MultipleNegativesRanking · batch {batch_size} · seq {max_seq_length} · "
-                  f"docs {'contextual' if contextual else 'bare (ablation)'}")
+                  f"docs {'contextual' if contextual else 'bare (ablation)'}"
+                  + (f" · SAM rho={sam_rho}" if sam_rho else "")
+                  + (f" · EMA {ema_decay}" if ema_decay else ""))
 
     console.print("\n[bold]baseline[/bold] on the independent eval")
     base = load_model(model_name, device=device, max_seq_length=max_seq_length)
@@ -1637,7 +1644,8 @@ _CHOICES: dict[str, tuple[str, ...]] = {
     "index.backend": ("auto", "torch", "faiss"),
     "index.precision": ("fp16", "int8"),
     "index.faiss.kind": ("flat", "sq8", "hnsw"),
-    "serving.generator.backend": ("auto", "vllm", "llamacpp", "mlx", "external"),
+    "serving.generator.backend": ("auto", "vllm", "llamacpp", "mlx", "ollama",
+                                 "external"),
     "serving.auth.mode": ("auto", "always", "off"),
     "embedding.compile": ("default", "reduce-overhead", "max-autotune", "null"),
 }
@@ -2288,7 +2296,7 @@ def serve(
 def serve_llm(
     config: str = typer.Option(None, help="Path to config.yaml"),
     model: str = typer.Option(None, help="Override the model"),
-    backend: str = typer.Option(None, help="vllm | llamacpp | mlx | external"),
+    backend: str = typer.Option(None, help="vllm | llamacpp | mlx | ollama | external"),
     show: bool = typer.Option(False, "--show", help="Print the command instead of running"),
 ) -> None:
     """Start the generation server on its own.

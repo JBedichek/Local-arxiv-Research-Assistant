@@ -262,6 +262,7 @@ class Retriever:
         rows: np.ndarray | None = None,
         selection: str | None = None,
         final_k: int | None = None,
+        feedback: "list[np.ndarray] | None" = None,
     ) -> RetrievalResult:
         """Run the full pipeline.
 
@@ -269,6 +270,17 @@ class Retriever:
         to the embedded query so retrieval is anchored on what the user is looking at, but
         kept out of the BM25 term list, where a long passage's common words would swamp
         the question's distinctive ones.
+
+        ``feedback`` holds extra full-precision query vectors — in practice the chunks a
+        model confirmed were relevant in a narrower tier. Each runs its **own** dense
+        search and joins the reciprocal rank fusion as a separate list, rather than being
+        averaged into one vector. Averaging normalised embeddings from different subtopics
+        lands the centroid in a region close to neither, which is the classic failure of
+        centroid query expansion; fusing ranked lists cannot land nowhere.
+
+        They widen *recall* only. Tier-2 rescoring and the cross-encoder still score
+        against the question alone, so feedback can surface a passage but never decide the
+        final order — which is what keeps query drift out of the answer.
         """
         t: dict[str, float] = {}
         clock = time.perf_counter
@@ -289,6 +301,15 @@ class Retriever:
                 return RetrievalResult([], t, 0)
         dense_rows, _ = self.dense.search(q_trunc, k=self.tier2_candidates, rows=rows)
         dense_ids = self.chunk_ids_for_rows(dense_rows)
+        ranked_lists: dict[str, list[int]] = {"dense": dense_ids}
+        for i, vec in enumerate(feedback or []):
+            v = np.asarray(vec, dtype=np.float32)[: self.dim_trunc]
+            n = float(np.linalg.norm(v))
+            if not np.isfinite(n) or n < 1e-12:
+                continue
+            fb_rows, _ = self.dense.search((v / n).astype(np.float32),
+                                           k=self.tier2_candidates, rows=rows)
+            ranked_lists[f"feedback{i}"] = self.chunk_ids_for_rows(fb_rows)
         t["dense"] = (clock() - t0) * 1000
 
         t0 = clock()
@@ -304,7 +325,7 @@ class Retriever:
 
         t0 = clock()
         fused_ids, parts = S.reciprocal_rank_fusion(
-            {"dense": dense_ids, "bm25": lexical_ids}, k=self.rrf_k
+            {**ranked_lists, "bm25": lexical_ids}, k=self.rrf_k
         )
         t["fuse"] = (clock() - t0) * 1000
         if not fused_ids:

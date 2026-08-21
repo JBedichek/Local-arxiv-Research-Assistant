@@ -12,6 +12,8 @@ backend      platform            model format                    why you would p
 ``llamacpp`` anywhere, Metal     GGUF                            most mature; runs anywhere
 ``mlx``      Apple Silicon only  MLX (``mlx-community/*``)       unified memory, often
                                                                  faster than llama.cpp
+``ollama``   anywhere, Metal     Ollama tags (``qwen3:8b``)      easiest; usually already
+                                                                 installed on a Mac
 ``external`` anything            whatever it already serves      you started it yourself
 ===========  ==================  ==============================  ===========================
 
@@ -191,6 +193,43 @@ class MlxBackend(Backend):
         return cmd + [str(a) for a in (c.get("extra_args") or [])]
 
 
+class OllamaBackend(Backend):
+    """Ollama — llama.cpp underneath, with model management on top.
+
+    Two things make it behave unlike the others. The server is **not** told which model to
+    load: ``ollama serve`` starts a daemon and models are loaded on demand by whatever name
+    a request asks for, so ``model`` here is a tag like ``qwen3:8b`` that must already have
+    been pulled. And the port comes from ``OLLAMA_HOST`` rather than a flag, because
+    ``serve`` takes no address argument.
+
+    On macOS the desktop app usually has a daemon running already, in which case the probe
+    adopts it and nothing is launched.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "ollama", "Ollama", "Ollama tags (e.g. qwen3:8b)", ("mps", "cpu", "cuda"),
+            "https://ollama.com/download  (or `brew install ollama`)",
+            "Easiest to run and usually already installed on a Mac. llama.cpp underneath, "
+            "so expect llama.cpp's speed with less to configure. Pull models with "
+            "`ollama pull <tag>`; lara cannot pull them for you.",
+        )
+
+    def available(self) -> bool:
+        return shutil.which("ollama") is not None
+
+    def command(self, model: str, port: int, cfg: dict) -> list[str]:
+        # No model argument: the daemon serves whatever has been pulled, chosen per request.
+        return ["ollama", "serve"]
+
+    def env(self, cfg: dict) -> dict:
+        env = dict(os.environ)
+        c = cfg.get("ollama") or {}
+        host = c.get("host", "127.0.0.1")
+        env["OLLAMA_HOST"] = f"{host}:{c.get('port', 11434)}"
+        return env
+
+
 class ExternalBackend(Backend):
     def __init__(self) -> None:
         super().__init__(
@@ -208,7 +247,8 @@ class ExternalBackend(Backend):
 
 
 BACKENDS: dict[str, Backend] = {
-    b.name: b for b in (VllmBackend(), LlamaCppBackend(), MlxBackend(), ExternalBackend())
+    b.name: b for b in (VllmBackend(), LlamaCppBackend(), MlxBackend(),
+                        OllamaBackend(), ExternalBackend())
 }
 
 
@@ -251,11 +291,14 @@ def choose(accelerator: str, requested: str | None = None) -> Backend:
         return BACKENDS.get(requested, BACKENDS["external"])
 
     if accelerator == "mps":
-        order = ("mlx", "llamacpp")
+        # MLX first: it targets Apple Silicon directly and is usually the fastest here.
+        # Ollama before llama.cpp because on a Mac it is far more often already installed,
+        # and it is llama.cpp underneath anyway.
+        order = ("mlx", "ollama", "llamacpp")
     elif accelerator in ("cuda", "rocm"):
-        order = ("vllm", "llamacpp")
+        order = ("vllm", "llamacpp", "ollama")
     else:
-        order = ("llamacpp",)
+        order = ("llamacpp", "ollama")
 
     for name in order:
         if BACKENDS[name].available():

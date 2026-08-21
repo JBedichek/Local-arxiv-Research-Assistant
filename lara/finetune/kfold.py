@@ -258,6 +258,22 @@ class Recipe:
     # InfoNCE scale for MultipleNegativesRankingLoss. 0.05 == logits x20, matching
     # `embedding.temperature` used for the citation objective in train.py.
     temperature: float = 0.05
+    # Sharpness-Aware Minimisation. 0 disables it. SAM takes the gradient at the worst
+    # point in an epsilon-ball around the current weights rather than at the weights
+    # themselves, which biases training toward flat minima and is worth most exactly where
+    # we are: 20 k examples from 788 queries against a 300 M encoder, early-stopping at
+    # step ~95 of 148 because validation turns over. Overfitting is the observed failure,
+    # and flat minima are the thing that addresses it.
+    #
+    # It costs a second full gradient per step, and each of ours is already a two-pass
+    # GradCache cycle, so a SAM step is four forwards rather than two. 0.05 is the value
+    # the paper uses for fine-tuning; ASAM's adaptive radius is the obvious next knob if
+    # this helps.
+    sam_rho: float = 0.0
+    # Exponential moving average of the weights, evaluated instead of the raw ones. Nearly
+    # free — one extra copy of the parameters and a lerp per step — and it captures much of
+    # what averaging-based regularisation offers without a second gradient.
+    ema_decay: float = 0.0
     compile_mode: str | None = None   # off by default: folds are short, compile is not free
     seed: int = 0
 
@@ -665,6 +681,8 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
     base = [g["lr"] for g in opt.param_groups]
     micro = rec.micro_batch or rec.batch_size
     step, started = 0, time.time()
+    ema = ({k: v.detach().clone().float() for k, v in model.state_dict().items()
+            if v.dtype.is_floating_point} if rec.ema_decay else None)
     best_loss, best_state, since_best, stopped = float("inf"), None, 0, False
     val_triples = val_triples or []
 
@@ -686,40 +704,74 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
                 g["lr"] = b * scale
 
             chunks = length_sorted_chunks(part, micro)
-            feats = []
-            cached = {"q": [], "p": [], "n": []}
-            # Pass 1: embeddings only, no graph retained.
-            with torch.no_grad():
-                for sub_part in chunks:
-                    qs, ps, ns = texts(sub_part)
-                    f = [{k: v.to(device) for k, v in model.tokenize(x).items()}
-                         for x in (qs, ps, ns)]
-                    feats.append(f)
+
+            def gradcache_backward(chunks=chunks):
+                """One exact full-batch gradient, accumulated into .grad. Returns the loss.
+
+                Factored out because SAM needs two of them per step: one to find the
+                worst point in the neighbourhood, one to take the gradient there.
+                """
+                feats, cached = [], {"q": [], "p": [], "n": []}
+                with torch.no_grad():
+                    for sub_part in chunks:
+                        qs, ps, ns_ = texts(sub_part)
+                        f = [{k: v.to(device) for k, v in model.tokenize(x).items()}
+                             for x in (qs, ps, ns_)]
+                        feats.append(f)
+                        with dev.autocast(device):
+                            for key, ff in zip(("q", "p", "n"), f):
+                                cached[key].append(_encode_ids(model, ff).float())
+                leaves = {k: torch.cat(v).detach().requires_grad_(True)
+                          for k, v in cached.items()}
+                lo = mnrl(leaves["q"], leaves["p"], leaves["n"], rec.temperature)
+                lo.backward()
+                gr = {k: leaves[k].grad for k in ("q", "p", "n")}
+                off_ = 0
+                for sub_part, f in zip(chunks, feats):
+                    n_i = len(sub_part)
                     with dev.autocast(device):
-                        for key, ff in zip(("q", "p", "n"), f):
-                            cached[key].append(_encode_ids(model, ff).float())
+                        outs = [_encode_ids(model, ff) for ff in f]
+                    torch.autograd.backward(
+                        outs,
+                        grad_tensors=[gr[k][off_:off_ + n_i].to(outs[0].dtype)
+                                      for k in ("q", "p", "n")],
+                    )
+                    off_ += n_i
+                return float(lo.detach())
 
-            # The real full-batch loss, differentiated only w.r.t. the cached embeddings.
-            leaves = {k: torch.cat(v).detach().requires_grad_(True) for k, v in cached.items()}
-            loss = mnrl(leaves["q"], leaves["p"], leaves["n"], rec.temperature)
-            loss.backward()
-            grads = {k: leaves[k].grad for k in ("q", "p", "n")}
-
-            # Pass 2: re-encode with graph, seeded by the cached gradients.
             opt.zero_grad(set_to_none=True)
-            off = 0
-            for sub_part, f in zip(chunks, feats):
-                n_i = len(sub_part)
-                with dev.autocast(device):
-                    outs = [_encode_ids(model, ff) for ff in f]
-                torch.autograd.backward(
-                    outs,
-                    grad_tensors=[grads[k][off:off + n_i].to(outs[0].dtype)
-                                  for k in ("q", "p", "n")],
-                )
-                off += n_i
+            total = gradcache_backward()
+
+            if rec.sam_rho:
+                # Ascent step: move to the worst point in the rho-ball, take the gradient
+                # THERE, and apply that. The perturbation is scaled by the global gradient
+                # norm so rho is a radius in parameter space rather than per-tensor.
+                params = [q for q in model.parameters() if q.grad is not None]
+                gnorm = torch.norm(torch.stack([q.grad.norm() for q in params]))
+                if float(gnorm) > 0:
+                    scale = rec.sam_rho / (gnorm + 1e-12)
+                    # Keep the originals rather than subtracting the perturbation back
+                    # off: add_ then sub_ is not exact in float32, and the ~1e-8 residue
+                    # per step is a drift nothing would ever attribute to SAM. A second
+                    # copy of the parameters is ~1.2 GB against 98 GB of card.
+                    orig = [q.detach().clone() for q in params]
+                    with torch.no_grad():
+                        for q in params:
+                            q.add_(q.grad.detach() * scale)
+                    opt.zero_grad(set_to_none=True)
+                    total = gradcache_backward()
+                    with torch.no_grad():          # restore exactly before stepping
+                        for q, o in zip(params, orig):
+                            q.copy_(o)
+                    del orig
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), rec.grad_clip)
             opt.step()
+            if ema is not None:
+                with torch.no_grad():
+                    for k, v in model.state_dict().items():
+                        if v.dtype.is_floating_point:
+                            ema[k].mul_(rec.ema_decay).add_(v, alpha=1 - rec.ema_decay)
             step += 1
 
             vl = None
@@ -746,6 +798,12 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
 
     if best_state is not None:
         model.load_state_dict({k: v.to(device) for k, v in best_state.items()})
+    elif ema is not None:
+        # Only when early stopping never picked a checkpoint: the averaged weights are a
+        # regulariser, and silently overwriting a checkpoint that was chosen on validation
+        # would replace a measured decision with an unmeasured one.
+        model.load_state_dict({**model.state_dict(),
+                               **{k: v.to(device) for k, v in ema.items()}})
     model.eval()
     model.stopped_early = stopped
     model.best_val_loss = best_loss if best_state is not None else None

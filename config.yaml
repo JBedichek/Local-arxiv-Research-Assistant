@@ -121,6 +121,25 @@ embedding:
   query_prefix: "task: search result | query: "
   doc_prefix: "title: {title} > {section} | text: "
 
+retrieval:
+  # Hierarchical scope: answer from the open paper before searching 29.5M chunks.
+  # A reader asking "why does this need a warmup?" almost always means *this paper*.
+  #
+  #   paper -> neighbourhood (what it cites / what cites it) -> corpus
+  #
+  # Between tiers the model marks which passages actually helped, and those become extra
+  # query vectors for the wider search — fused by reciprocal rank fusion, never averaged.
+  # Feedback widens recall only; the question alone still decides the final order.
+  hierarchy:
+    enabled: true
+    paper_frac: 0.2          # of the paper's chunks to consider...
+    paper_min_k: 5           # ...clamped, since papers run from 15 to 300+ chunks
+    paper_max_k: 30
+    tag_with_model: true     # false = keep the reranker's top 3, no LLM call
+    max_feedback_vectors: 4  # each is another dense search and another list in the fusion
+    allow_neighbourhood: true
+    allow_corpus: true
+
 index:
   # Tier-1 search backend. `lara bench-index` measures these on your machine and
   # `lara setup` writes the answer into config.local.yaml.
@@ -266,6 +285,13 @@ serving:
       extra_args: []
     mlx:
       model: null               # e.g. "mlx-community/Qwen3-8B-4bit"
+      extra_args: []
+    ollama:
+      # A tag you have already pulled (`ollama pull qwen3:8b`). Ollama loads models on
+      # demand, so the daemon is not told which one — this is just the name requests use.
+      model: null               # e.g. "qwen3:8b"
+      host: 127.0.0.1
+      port: 11434               # ollama serve takes no port flag; set via OLLAMA_HOST
       extra_args: []
   vllm:
     # D4: GGUF ignored, vLLM only. Q4: rare switching — one model resident at a time.
