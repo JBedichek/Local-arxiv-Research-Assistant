@@ -230,7 +230,7 @@ def get_paper(arxiv_id: str) -> JSONResponse:
 
     version = row["fulltext_version"] or row["latest_version"] or 1
     path = s.raw_html_path(arxiv_id)
-    body = papers_mod.render(str(path), arxiv_id) if path else ""
+    body = papers_mod.render(str(path), arxiv_id, version) if path else ""
 
     try:
         from lara.serve import memory as MEM

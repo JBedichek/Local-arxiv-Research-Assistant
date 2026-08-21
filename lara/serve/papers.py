@@ -36,26 +36,55 @@ STRIP = " | ".join([
 _dctx = zstd.ZstdDecompressor()
 
 
-def _absolutize(root, arxiv_id: str) -> None:
-    """Point relative assets at arXiv so figures still render."""
-    base = f"https://arxiv.org/html/{arxiv_id}/"
+def _resolve(url: str, origin: str, doc_base: str, html_root: str, arxiv_id: str) -> str:
+    """Turn one relative reference into an absolute one.
+
+    Three shapes appear in arXiv's HTML and the old single-prefix rule got two of them
+    wrong, which is why no figure ever loaded:
+
+    ``2504.11884v1/Fig1.png``  already carries the paper id, because the page is served
+                               without a trailing slash and its own relative refs resolve
+                               against ``/html/``. Prefixing the id again produced
+                               ``/html/2504.11884/2504.11884v1/Fig1.png`` -> 404.
+    ``/static/base/...svg``    root-relative, and belongs to the origin, not to this
+                               paper. Concatenating gave ``/html/2504.11884//static/...``.
+    ``x1.png``                 genuinely relative to the document directory.
+    """
+    if url.startswith("/"):
+        return origin + url
+    # An id-qualified path is relative to /html/, not to this paper's directory.
+    if re.match(rf"^{re.escape(arxiv_id)}(v\d+)?/", url):
+        return html_root + url
+    return doc_base + url.lstrip("./")
+
+
+def _absolutize(root, arxiv_id: str, version: int = 1, source: str = "arxiv_html") -> None:
+    """Point relative assets at their origin so figures still render."""
+    origin = ("https://ar5iv.labs.arxiv.org" if source == "ar5iv"
+              else "https://arxiv.org")
+    html_root = f"{origin}/html/"
+    # ar5iv serves one document per id with no version segment; arXiv's own HTML is
+    # versioned, and an unversioned path only works because it redirects.
+    doc_base = (f"{html_root}{arxiv_id}/" if source == "ar5iv"
+                else f"{html_root}{arxiv_id}v{version}/")
+
     for el in root.xpath("//img[@src] | //source[@src]"):
         src = el.get("src") or ""
         if src and not src.startswith(("http://", "https://", "data:")):
-            el.set("src", base + src.lstrip("./"))
+            el.set("src", _resolve(src, origin, doc_base, html_root, arxiv_id))
         el.set("loading", "lazy")
     for el in root.xpath("//a[@href]"):
         href = el.get("href") or ""
         if href.startswith("#"):
             continue
         if href and not href.startswith(("http://", "https://", "mailto:")):
-            el.set("href", base + href.lstrip("./"))
+            el.set("href", _resolve(href, origin, doc_base, html_root, arxiv_id))
         el.set("target", "_blank")
         el.set("rel", "noopener")
 
 
 @functools.lru_cache(maxsize=32)
-def render(path_str: str, arxiv_id: str) -> str:
+def render(path_str: str, arxiv_id: str, version: int = 1) -> str:
     """Decompress, sanitise and return the paper body. Cached — re-opens are free."""
     raw = _dctx.decompress(Path(path_str).read_bytes())
     root = LH.fromstring(raw)
@@ -64,7 +93,10 @@ def render(path_str: str, arxiv_id: str) -> str:
         parent = el.getparent()
         if parent is not None:
             parent.remove(el)
-    _absolutize(root, arxiv_id)
+    # The cache filename carries which source produced this copy, and the two serve
+    # their assets from different origins.
+    source = "ar5iv" if ".ar5iv." in Path(path_str).name else "arxiv_html"
+    _absolutize(root, arxiv_id, version, source)
 
     body = root.xpath("//article") or root.xpath("//body") or [root]
     out = LH.tostring(body[0], encoding="unicode")
