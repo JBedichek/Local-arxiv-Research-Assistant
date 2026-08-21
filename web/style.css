@@ -627,3 +627,20 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #deep-tldr { font-size: 1.02em; }
 @media (max-width: 900px) { #deep-body { flex-direction: column; }
                             #deep-right { border-left: 0; border-top: 1px solid var(--rule); } }
+
+/* ── Inline maths ────────────────────────────────────────────────────────────
+   Rendered from the LaTeX stored in each chunk's alttext (66% of the corpus has
+   some). Deliberately restrained: this is notation inside running prose, so it
+   should sit on the text baseline rather than announce itself. */
+.math, .math-display { font-family: "STIX Two Math", "Cambria Math", Georgia, serif; }
+.math-display { display: block; text-align: center; margin: .7em 0; font-size: 1.05em; }
+.math sub, .math sup, .math-display sub, .math-display sup { font-size: .72em; line-height: 0; }
+.math .mup, .math-display .mup { font-family: inherit; font-style: normal; }
+.mbb { font-weight: 600; }
+/* A stacked fraction, kept to one line-height so it never disturbs the leading. */
+.mfrac { display: inline-flex; flex-direction: column; vertical-align: -0.45em;
+         text-align: center; font-size: .88em; line-height: 1.05; margin: 0 .12em; }
+.mfrac .mnum { border-bottom: 1px solid currentColor; padding: 0 .22em; }
+.mfrac .mden { padding: 0 .22em; }
+/* The radical glyph supplies the hook; the overline supplies the vinculum. */
+.msqrt { border-top: 1px solid currentColor; padding: 0 .12em 0 .06em; margin-left: -.06em; }
