@@ -62,6 +62,28 @@ import torch
 from lara import device as dev
 
 
+#: Ceiling on the transient a single dequantisation block materialises. int8 rows become
+#: float32 inside the search -- 4 bytes per dimension per row -- so a block of N rows costs
+#: N * dim * 4 bytes *on top of* everything already resident.
+#:
+#: This is a correctness limit on Metal, not a tuning knob. Under memory pressure MPS does
+#: not raise: it returns wrong answers. Measured on an M-series Mac, a 2.5 GB block (2.47 M
+#: rows at dim 256, which the old fixed 4 M-row default produced) yielded a normalised
+#: tensor reporting 1,082,002,458 non-zero elements out of 128,000,000 -- an impossible
+#: count -- scores that were uniformly 0.0, and at larger sizes NaN. topk over that returns
+#: uninitialised indices, which surfaced as `IndexError: index 4431045198971321921 is out
+#: of bounds` from row-id translation, three frames from the cause and looking nothing like
+#: an allocation failure. The same code is correct in a fresh process; it is the pressure
+#: from the resident embedder, reranker and hot cache that tips it over.
+SEARCH_BLOCK_BYTES = {"mps": 256_000_000, "cuda": 1_000_000_000, "cpu": 512_000_000}
+
+
+def default_search_block(device: str, dim: int) -> int:
+    """Rows per dequantisation block, sized so the transient stays within budget."""
+    budget = SEARCH_BLOCK_BYTES.get(str(device).split(":", 1)[0], 256_000_000)
+    return max(65_536, budget // max(1, dim * 4))
+
+
 def _normalise(block: np.ndarray) -> np.ndarray:
     """int8 rows -> unit-norm float32. The stored bytes are a quantisation of unit
     vectors, so renormalising after the cast restores a true cosine."""
@@ -263,7 +285,7 @@ class TorchBackend(_Resident):
 
     def __init__(self, int8_matrix: np.ndarray, device: str | None = None,
                  *, precision: str = "fp16", row_ids: np.ndarray | None = None,
-                 block: int = 1_000_000, search_block: int = 4_000_000) -> None:
+                 block: int = 1_000_000, search_block: int | None = None) -> None:
         if precision not in ("fp16", "int8"):
             raise ValueError(f"precision must be fp16 or int8, got {precision!r}")
         self.device = dev.resolve(device)
@@ -276,9 +298,9 @@ class TorchBackend(_Resident):
                 "topic scope (`lara corpus scope`) instead.",
                 RuntimeWarning, stacklevel=2)
         self.precision = precision
-        self.search_block = search_block
         self.row_ids, n = _prepare_rows(int8_matrix, row_ids)
         dim = int(int8_matrix.shape[1])
+        self.search_block = search_block or default_search_block(self.device, dim)
         self.n, self.dim = n, dim
 
         dtype = torch.float16 if precision == "fp16" else torch.int8
@@ -322,6 +344,19 @@ class TorchBackend(_Resident):
             blk = torch.nn.functional.normalize(raw.float(), dim=1)
             out[0, s:e] = (q.float() @ blk.T)[0]
             del blk
+        # Cheap next to the matmul, and the difference between a diagnosis and a puzzle.
+        # Corrupt scores do not raise on their own: topk consumes them and hands back
+        # uninitialised indices, which fail much later in row-id translation with a
+        # nonsense subscript. Unit vectors cannot produce a uniformly zero score vector,
+        # so both checks below indicate the computation did not really happen.
+        if not torch.isfinite(out).all() or float(out.abs().max()) == 0.0:
+            raise RuntimeError(
+                f"dense search produced degenerate scores on {self.device} "
+                f"({self.n:,} rows, block {self.search_block:,}). On Metal this means "
+                f"the device ran out of room and returned wrong answers rather than "
+                f"raising: lower index.search_block, scope the corpus smaller, or "
+                f"disable the cross-encoder to free memory."
+            )
         return out
 
     def search(self, query: np.ndarray, k: int = 200, rows: np.ndarray | None = None):
