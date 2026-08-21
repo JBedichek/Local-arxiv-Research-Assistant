@@ -235,7 +235,7 @@ def reload_index() -> JSONResponse:
     before = s.retriever.dense.n
     papers_before = s.paper_index.n if s.paper_index is not None else 0
     # Rebuild through the same factory the retriever was constructed with. Calling
-    # DenseIndex directly dropped the D22 keep-set, the configured precision and the
+    # the index class directly dropped the D22 keep-set, the configured precision and the
     # backend choice, so one reload silently made the WHOLE corpus resident — on exactly
     # the machines that were scoped because they cannot hold it.
     icfg = s.cfg.get_in("index") or {}

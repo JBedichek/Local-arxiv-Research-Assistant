@@ -128,7 +128,7 @@ def memory_breakdown() -> JSONResponse:
         out["tier2_source"] = "fp16 mmap" if getattr(r, "fp16", None) is not None else "int8 mmap"
         out["cross_encoder_loaded"] = getattr(r, "cross_encoder", None) is not None
     if getattr(s, "paper_index", None) is not None:
-        out["paper_index_gb"] = round(s.paper_index.vram_bytes() / 1e9, 2)
+        out["paper_index_gb"] = round(s.paper_index.memory_bytes() / 1e9, 2)
 
     # The planner reserves this, but nothing in the serving path allocates it.
     out["hot_tier_configured_gb"] = round(

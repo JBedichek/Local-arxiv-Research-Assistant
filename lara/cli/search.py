@@ -55,7 +55,7 @@ def search(
         lexical=bool(icfg["lexical"]["enabled"]) and not no_bm25,
         cross_encoder=ce,
     )
-    console.print(f"index VRAM: {retr.dense.vram_bytes()/1e9:.2f} GB\n")
+    console.print(f"index memory: {retr.dense.memory_bytes()/1e9:.2f} GB\n")
 
     result = retr.retrieve(query, papers=[paper] if paper else None)
     for i, hit in enumerate(result.hits, 1):

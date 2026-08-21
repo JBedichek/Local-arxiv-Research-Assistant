@@ -29,11 +29,6 @@ import re
 import sqlite3
 from dataclasses import dataclass, field
 
-import numpy as np
-import torch
-
-from lara import device as dev
-
 
 def fragment_for(arxiv_id: str, version: int, anchor_start: str, char_start: int,
                  anchor_end: str, char_end: int) -> str:
@@ -113,127 +108,6 @@ def reciprocal_rank_fusion(
     for cid in order:
         parts[cid]["rrf"] = fused[cid]
     return order, parts
-
-
-class DenseIndex:
-    """Exact search as a GPU matmul. No ANN structure, no build step.
-
-    ``row_ids`` makes the index **partially resident** (PLAN.md D22): only those global
-    vector rows are loaded, and the class translates between its own dense local indices
-    and the global row numbers every caller speaks. Without it the index covers the whole
-    corpus and local index == global row, which is the original behaviour.
-
-    Residency is what lets a large corpus run on a small machine — the rest of the corpus
-    stays reachable through BM25 over FTS5 and the tier-2 fp16 mmap, both of which are
-    complete regardless of what is resident here.
-    """
-
-    def __init__(self, int8_matrix: np.ndarray, device: str | None = None,
-                 block: int = 1_000_000, row_ids: np.ndarray | None = None) -> None:
-        self.device = dev.resolve(device)
-        device = self.device
-        if row_ids is not None:
-            # Sorted is a precondition, not a nicety: the global -> local translation is a
-            # binary search, and an unsorted array would silently return wrong rows.
-            row_ids = np.ascontiguousarray(row_ids, dtype=np.int64)
-            if row_ids.size and not np.all(np.diff(row_ids) > 0):
-                row_ids = np.unique(row_ids)
-            int8_matrix = int8_matrix[row_ids]
-        self.row_ids = row_ids
-        n, dim = int8_matrix.shape
-        # Built block-wise straight into the destination tensor. Converting the whole
-        # matrix at once needs a full float32 copy — 11.4 GB at 11M vectors — which the
-        # caching allocator then holds, so cuda:0 reported 24.7 GB for 6.5 GB of resident
-        # data. Blocks keep the transient at ~1 GB regardless of corpus size.
-        self.matrix = torch.empty((n, dim), dtype=torch.float16, device=device)
-        for start in range(0, n, block):
-            stop = min(start + block, n)
-            part = torch.from_numpy(int8_matrix[start:stop]).to(device).float()
-            # int8 rows are quantized from unit vectors; renormalize after the cast so the
-            # inner product is a true cosine.
-            self.matrix[start:stop] = torch.nn.functional.normalize(part, dim=1).half()
-            del part
-        dev.empty_cache(device)
-        self.n, self.dim = self.matrix.shape
-
-    def vram_bytes(self) -> int:
-        return self.matrix.element_size() * self.matrix.nelement()
-
-    @property
-    def resident(self) -> bool:
-        return self.row_ids is not None
-
-    def to_local(self, rows: np.ndarray) -> np.ndarray:
-        """Global vector rows -> local matrix indices, dropping any not resident.
-
-        Callers hand us global rows from SQLite (scoping to a paper, a citation
-        neighbourhood, tier 0). Under residency some of those rows are not loaded, and
-        they have to be dropped rather than silently indexing the wrong vector.
-        """
-        rows = np.ascontiguousarray(rows, dtype=np.int64)
-        if self.row_ids is None:
-            return rows
-        if rows.size == 0 or self.row_ids.size == 0:
-            return np.empty(0, dtype=np.int64)
-        pos = np.searchsorted(self.row_ids, rows)
-        pos_clipped = np.minimum(pos, self.row_ids.size - 1)
-        return pos[self.row_ids[pos_clipped] == rows]
-
-    def to_global(self, local: np.ndarray) -> np.ndarray:
-        """Local matrix indices -> global vector rows."""
-        return local if self.row_ids is None else self.row_ids[local]
-
-    def search(
-        self, query: np.ndarray, k: int = 200, rows: np.ndarray | None = None
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Top-k by inner product. ``rows`` restricts the search (tier 0, graph scoping).
-
-        Returns **global** vector rows in both cases, so residency is invisible to callers.
-        """
-        q = torch.from_numpy(np.ascontiguousarray(query, dtype=np.float16)).to(self.device)
-        if q.ndim == 1:
-            q = q.unsqueeze(0)
-        if rows is None:
-            scores = q @ self.matrix.T
-            top = torch.topk(scores, min(k, self.n), dim=1)
-            return (self.to_global(top.indices[0].cpu().numpy()),
-                    top.values[0].float().cpu().numpy())
-
-        local = self.to_local(rows)
-        if local.size == 0:
-            return np.empty(0, dtype=np.int64), np.empty(0, dtype=np.float32)
-        subset = torch.from_numpy(local).to(self.device)
-        scores = q @ self.matrix[subset].T
-        top = torch.topk(scores, min(k, subset.numel()), dim=1)
-        picked = subset[top.indices[0]].cpu().numpy()
-        return self.to_global(picked), top.values[0].float().cpu().numpy()
-
-    def paper_scores(
-        self, query: np.ndarray, rows_by_paper: dict[str, np.ndarray], top_n: int = 3
-    ) -> dict[str, float]:
-        """Heatmap scoring (R9): mean of each paper's top-N chunk similarities.
-
-        Not the mean over all chunks — that dilutes, so a 100-chunk paper with one
-        perfect chunk scores low, answering "is this paper *about* the query" when
-        exploration needs "does it *answer* the query". Not the plain max either, which
-        lets a single spurious chunk light up a node. Top-3 mean keeps max's semantics
-        with resistance to one outlier.
-        """
-        q = torch.from_numpy(np.ascontiguousarray(query, dtype=np.float16)).to(self.device)
-        if q.ndim == 2:
-            q = q[0]
-        out: dict[str, float] = {}
-        for paper, rows in rows_by_paper.items():
-            if rows.size == 0:
-                continue
-            local = self.to_local(rows)
-            if local.size == 0:
-                continue          # paper is not resident; heatmap falls back to tier 2
-            subset = torch.from_numpy(local).to(self.device)
-            scores = self.matrix[subset] @ q
-            n = min(top_n, scores.numel())
-            out[paper] = float(torch.topk(scores, n).values.mean())
-        return out
 
 
 def bm25_search(

@@ -328,10 +328,6 @@ class TorchBackend(_Resident):
     def memory_bytes(self) -> int:
         return self.matrix.element_size() * self.matrix.nelement()
 
-    # Kept for callers that predate the rename.
-    def vram_bytes(self) -> int:
-        return self.memory_bytes()
-
     def describe(self) -> str:
         return f"torch {self.precision} on {self.device} ({self.n:,} vectors)"
 

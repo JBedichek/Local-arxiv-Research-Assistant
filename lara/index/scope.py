@@ -208,7 +208,7 @@ def expand_by_citations(conn: sqlite3.Connection, kept: set[str],
 def resident_rows(conn: sqlite3.Connection, kept: set[str]) -> np.ndarray:
     """Vector rows for every embedded chunk of the kept papers, sorted ascending.
 
-    Sorted because :class:`~lara.index.search.DenseIndex` binary-searches this array to
+    Sorted because :class:`~lara.index.backends._Resident` binary-searches this array to
     translate global rows to local indices.
     """
     if not kept:

@@ -68,12 +68,16 @@ class AppState:
             self._load_paper_index()
 
     def _load_paper_index(self) -> None:
-        from lara.index import search as S
-
         try:
             if self.paper_store.rows() == 0:
                 return
-            self.paper_index = S.DenseIndex(self.paper_store.load_int8(), device=self.device)
+            # The same backend the chunk index uses. This was its own near-identical copy
+            # of TorchBackend for a while, which meant every fix TorchBackend received --
+            # degenerate-score detection, shrink-and-retry on OOM, gathering resident rows
+            # per block instead of fancy-indexing the whole memmap at once -- stopped at
+            # the chunk index and never reached paper search.
+            self.paper_index = BK.TorchBackend(self.paper_store.load_int8(),
+                                               device=self.device)
             self.paper_row_to_id = {
                 r["vector_row"]: r["arxiv_id"]
                 for r in self.conn().execute("SELECT arxiv_id, vector_row FROM paper_vectors")
