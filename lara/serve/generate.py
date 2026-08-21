@@ -241,6 +241,28 @@ async def stream_answer(
                         sent = len(acc)
                         yield out
         except httpx.ConnectError as exc:
+            # Naming vLLM here was wrong on every machine that does not run vLLM, which
+            # is every Mac. Report the backend that would actually serve, and the reason
+            # nothing is listening — which is usually that no model is configured for it,
+            # not that the user forgot to launch something.
+            try:
+                from lara.serve import devices as DV
+                from lara.serve import generator as GEN
+
+                backend = GEN.resolve_backend(cfg, DV.detect().accelerator,
+                                              cfg.get_path("huggingface.home"))
+                configured = GEN.model_for(backend, {
+                    **((cfg.get_in("serving.generator") or {})),
+                    "vllm": cfg.get_in("serving.vllm") or {},
+                })
+            except Exception:
+                backend, configured = "the generation backend", None
+            hint = ("run `lara setup` to choose one, then restart `lara serve`"
+                    if not configured else
+                    f"`lara serve` should have started it for {configured}; "
+                    f"check its log, or run `lara serve-llm`")
             raise RuntimeError(
-                f"no vLLM server at {base_url} — start one with `lara serve-llm`"
+                f"nothing is answering at {base_url}. Backend is {backend} and "
+                f"{'no model is configured for it' if not configured else 'it is not running'}"
+                f" — {hint}."
             ) from exc

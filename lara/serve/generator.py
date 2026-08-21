@@ -399,12 +399,17 @@ class GeneratorProcess:
         self.stop()
 
 
-def from_config(cfg, accelerator: str, model_override: str | None = None
-                ) -> GeneratorProcess | None:
-    """Build a supervisor from the ``serving`` config, or None if nothing is configured."""
+def from_config(cfg, accelerator: str, model_override: str | None = None,
+                backend_override: str | None = None) -> GeneratorProcess | None:
+    """Build a supervisor from the ``serving`` config, or None if nothing is configured.
+
+    ``backend_override`` travels with ``model_override``: the two are a pair, because a
+    model only means anything to the runtime whose format it is. Overriding the model
+    alone would hand a GGUF spec to MLX.
+    """
     serving = cfg.get_in("serving") or {}
     gen = serving.get("generator") or {}
-    backend = choose(accelerator, gen.get("backend"))
+    backend = choose(accelerator, backend_override or gen.get("backend"))
     merged = {**gen, "vllm": serving.get("vllm") or {}}
     model = model_override or model_for(backend.name, merged)
     base_url = (serving.get("vllm") or {}).get("base_url", "http://127.0.0.1:8000/v1")

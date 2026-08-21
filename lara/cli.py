@@ -1897,10 +1897,27 @@ def serve(
         from lara.serve import devices as DV
         from lara.serve import generator as GEN
 
-        gen = GEN.from_config(cfg, DV.detect().accelerator)
+        accel = DV.detect().accelerator
+        gen = GEN.from_config(cfg, accel)
         if gen is None:
-            console.print("[yellow]no generator configured[/yellow] — retrieval will work, "
-                          "answers will not. Run `lara setup` to pick one.")
+            # Nothing configured, but a usable model may well be sitting in the cache --
+            # it is on a fresh install that downloaded one from the reader. Adopting it
+            # beats printing "run lara setup" at someone who just downloaded a model and
+            # reasonably expects to be able to ask a question.
+            backend = GEN.resolve_backend(cfg, accel, cfg.get_path("huggingface.home"))
+            found = models_mod.servable(cfg.get_path("huggingface.home"), backend=backend)
+            fitting = [m for m in found if DV.fits(m.size_gb, DV.detect())["fits"]]
+            pick = (fitting or found or [None])[-1]
+            if pick is not None:
+                gen = GEN.from_config(cfg, accel, model_override=pick.spec,
+                                      backend_override=backend)
+                console.print(f"[yellow]no generator configured[/yellow] — using cached "
+                              f"[bold]{pick.spec}[/bold] ({pick.size_gb:.1f} GB) on "
+                              f"{backend} for this run. `lara setup` makes it permanent.")
+        if gen is None:
+            console.print("[yellow]no generator configured[/yellow] and none cached — "
+                          "retrieval will work, answers will not. Download one from the "
+                          "reader, or run `lara setup`.")
         else:
             gen.start()
             if gen.adopted:
