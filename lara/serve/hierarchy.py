@@ -33,8 +33,6 @@ positives and zero negatives).
 
 from __future__ import annotations
 
-import json
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -42,9 +40,6 @@ from typing import Any
 import numpy as np
 
 TIERS = ("paper", "neighbourhood", "corpus")
-
-_JSON = re.compile(r"\{.*\}", re.S)
-
 
 # ── prompts ───────────────────────────────────────────────────────────────────────
 #
@@ -180,28 +175,18 @@ async def tag(cfg, question: str, hits: list[dict], model: str | None,
 
     prompt = (f"Question: {question}\n\nExcerpts from the open paper:\n"
               f"{_excerpts(hits)}\n\nReply with the JSON object only.")
-    buf = ""
-    try:
-        async for tok in stream_answer(cfg, prompt, [], system=TAG_SYSTEM, model=model,
-                                       temperature=0.0, max_tokens=200, raw_user=True):
-            buf += tok
-    except Exception:
-        buf = ""
+    from lara.serve.generate import complete_json
 
-    m = _JSON.search(buf or "")
-    if not m:
+    d = await complete_json(cfg, prompt, system=TAG_SYSTEM, model=model, max_tokens=200)
+    if d is None:
         # No verdict is not the same as "keep nothing": silently dropping every passage
         # would turn a model hiccup into an empty answer. Fall back to the reranker's own
         # top pick, which is the signal we would have used without a model at all.
         top = [1] if hits else []
         return _decision_from(hits, top, "no verdict parsed; kept the top-ranked excerpt",
                               via="fallback")
-    try:
-        keep = json.loads(m.group(0)).get("keep") or []
-        why = str(json.loads(m.group(0)).get("why") or "")[:200]
-    except json.JSONDecodeError:
-        return _decision_from(hits, [1] if hits else [], "unparseable verdict",
-                              via="fallback")
+    keep = d.get("keep") or []
+    why = str(d.get("why") or "")[:200]
     idx = [int(i) for i in keep if isinstance(i, (int, float, str)) and str(i).isdigit()]
     return _decision_from(hits, idx, why)
 
@@ -233,24 +218,14 @@ async def escalate(cfg, question: str, tier: str, hits: list[dict], coverage: st
                f"Retrieved {len(hits)} excerpt(s):\n{_excerpts(hits[:6])}\n\n"
                f"Scopes available now: {', '.join(('stop',) + allow)}\n"
                "Reply with the JSON object only.")
-    buf = ""
-    try:
-        async for tok in stream_answer(cfg, summary, [], system=ESCALATE_SYSTEM,
-                                       model=model, temperature=0.0, max_tokens=120,
-                                       raw_user=True):
-            buf += tok
-    except Exception:
-        buf = ""
+    from lara.serve.generate import complete_json
 
-    m = _JSON.search(buf or "")
+    d = await complete_json(cfg, summary, system=ESCALATE_SYSTEM, model=model,
+                            max_tokens=120)
     choice, why, via = None, "", "model"
-    if m:
-        try:
-            d = json.loads(m.group(0))
-            choice = str(d.get("scope") or "").strip().lower()
-            why = str(d.get("why") or "")[:200]
-        except json.JSONDecodeError:
-            choice = None
+    if d is not None:
+        choice = str(d.get("scope") or "").strip().lower()
+        why = str(d.get("why") or "")[:200]
     if choice not in {"stop", *allow}:
         # Widen by one step rather than stopping. A parse failure should not silently
         # convert "I could not decide" into "the paper was enough".

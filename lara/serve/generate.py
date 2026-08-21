@@ -21,6 +21,7 @@ the cached prefix, so after the first request they cost nothing.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import AsyncIterator
 
 import httpx
@@ -154,6 +155,53 @@ def build_prompt(
         ("excerpts", excerpts), ("question", tail),
     ]
     return prefix, tail, parts
+
+
+_JSON_OBJECT = re.compile(r"\{.*\}", re.S)
+_JSON_ARRAY = re.compile(r"\[.*\]", re.S)
+
+
+async def complete(cfg, prompt: str, *, system: str, model: str | None = None,
+                   temperature: float = 0.0, max_tokens: int = 400) -> str:
+    """One non-streamed controller turn, accumulated to a string.
+
+    The twelve lines this replaces were written out at nine call sites, and had already
+    drifted: three of them did not wrap the stream at all, so a generator error failed
+    those turns while degrading silently everywhere else — for no stated reason. Failure
+    is a value here, not an exception, because every caller already has a considered
+    fallback and none of them wants a controller hiccup to fail a user's question.
+    """
+    buf = ""
+    try:
+        async for tok in stream_answer(cfg, prompt, [], system=system, model=model,
+                                       temperature=temperature, max_tokens=max_tokens,
+                                       raw_user=True):
+            buf += tok
+    except Exception:
+        return ""
+    return buf
+
+
+async def complete_json(cfg, prompt: str, *, system: str, shape: str = "object",
+                        model: str | None = None, temperature: float = 0.0,
+                        max_tokens: int = 400, default=None):
+    """A controller turn parsed as JSON, or ``default`` if it cannot be.
+
+    Only the transport and the extraction are shared. Schema validation and what to do
+    when the verdict is unusable stay at the call site, because that is where the real
+    variation lives and it is deliberate: one caller keeps the reranker's top pick, another
+    widens a tier rather than stopping, a third treats the same failure as "answer now".
+    Collapsing those into one policy would be the opposite of a simplification.
+    """
+    raw = await complete(cfg, prompt, system=system, model=model,
+                         temperature=temperature, max_tokens=max_tokens)
+    m = (_JSON_ARRAY if shape == "array" else _JSON_OBJECT).search(raw or "")
+    if not m:
+        return default
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return default
 
 
 async def count_tokens(base_url: str, model: str, texts: list[str]) -> list[int] | None:

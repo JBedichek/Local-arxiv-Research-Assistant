@@ -306,3 +306,73 @@ def test_untitled_doc_prefix_matches_document_text():
 def test_document_text_omits_a_section_already_in_the_title():
     from lara.index.embed import document_text
     assert document_text("Attention", "attention", "x") == "title: Attention | text: x"
+
+
+# ── the shared JSON verdict transport ─────────────────────────────────────────────
+# Nine call sites used to spell this out, and three of them lacked the try/except the
+# other six had. Driven with an injected stream rather than a live model: deterministic,
+# and it covers failure shapes a real generator only produces occasionally.
+#
+# Run through asyncio.run rather than pytest-asyncio, so the suite needs no plugin — a
+# test suite with an install step is a test suite that stops being run.
+
+import asyncio
+
+import lara.serve.generate as GEN
+
+
+def _fake_stream(text=None, exc=None):
+    async def gen(cfg, prompt, hits, **kw):
+        if exc is not None:
+            raise exc
+        for piece in (text or ""):
+            yield piece
+    return gen
+
+
+def _json(monkeypatch, *, text=None, exc=None, **kw):
+    monkeypatch.setattr(GEN, "stream_answer", _fake_stream(text, exc))
+    return asyncio.run(GEN.complete_json(None, "p", system="s", **kw))
+
+
+def test_complete_json_parses_a_bare_object(monkeypatch):
+    assert _json(monkeypatch, text='{"ok": true}') == {"ok": True}
+
+
+def test_complete_json_finds_an_object_inside_prose(monkeypatch):
+    # Models narrate. Extraction has to survive a preamble and a trailing sentence.
+    assert _json(monkeypatch, text='Sure! {"ok": 1} Hope that helps.') == {"ok": 1}
+
+
+def test_complete_json_survives_code_fences(monkeypatch):
+    assert _json(monkeypatch, text='```json\n{"a": [1, 2]}\n```') == {"a": [1, 2]}
+
+
+def test_complete_json_array_shape(monkeypatch):
+    out = _json(monkeypatch, text='[{"n": 1}, {"n": 2}]', shape="array")
+    assert [r["n"] for r in out] == [1, 2]
+
+
+def test_object_shape_does_not_match_a_bare_array(monkeypatch):
+    # The shapes are distinct on purpose: extract() wants a list, and a shared regex would
+    # let it silently accept the braces inside an object instead.
+    assert _json(monkeypatch, text="[1, 2, 3]", default="fell back") == "fell back"
+
+
+def test_malformed_json_returns_the_default(monkeypatch):
+    assert _json(monkeypatch, text='{"a": ', default={"d": 1}) == {"d": 1}
+
+
+def test_no_json_at_all_returns_the_default(monkeypatch):
+    assert _json(monkeypatch, text="I cannot help with that.", default=[]) == []
+
+
+def test_a_generator_error_returns_the_default_rather_than_raising(monkeypatch):
+    # The behaviour agent.py did NOT have: its three sites propagated, so a generator
+    # hiccup failed the controller turn while degrading silently everywhere else.
+    assert _json(monkeypatch, exc=RuntimeError("vLLM down"), default="safe") == "safe"
+
+
+def test_complete_returns_empty_string_on_error(monkeypatch):
+    monkeypatch.setattr(GEN, "stream_answer", _fake_stream(exc=OSError("connrefused")))
+    assert asyncio.run(GEN.complete(None, "p", system="s")) == ""

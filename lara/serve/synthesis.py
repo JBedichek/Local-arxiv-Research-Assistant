@@ -30,18 +30,12 @@ when consecutive rounds stop finding anything new regardless of what the model w
 
 from __future__ import annotations
 
-import json
-import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
 import numpy as np
-
-_JSON_ARRAY = re.compile(r"\[.*\]", re.S)
-_JSON_OBJ = re.compile(r"\{.*\}", re.S)
-
 
 # ── prompts ───────────────────────────────────────────────────────────────────────
 
@@ -297,22 +291,13 @@ async def extract(cfg, question: str, hits: list[dict], model, stream_answer,
         return [], []
     prompt = (f"Research question: {question}\n\nExcerpts:\n{_numbered(hits)}\n\n"
               "Reply with the JSON array only.")
-    buf = ""
-    try:
-        async for tok in stream_answer(cfg, prompt, [], system=EXTRACT_SYSTEM, model=model,
-                                       temperature=0.0, max_tokens=1400, raw_user=True):
-            buf += tok
-    except Exception:
-        buf = ""
+    from lara.serve.generate import complete_json
 
-    m = _JSON_ARRAY.search(buf or "")
-    if not m:
-        # No verdict is not evidence of irrelevance. Dropping the batch would silently
-        # lose a round's work, so nothing is recorded as rejected either.
-        return [], []
-    try:
-        rows = json.loads(m.group(0))
-    except json.JSONDecodeError:
+    # No verdict is not evidence of irrelevance. Dropping the batch would silently lose a
+    # round's work, so on failure nothing is recorded as rejected either.
+    rows = await complete_json(cfg, prompt, system=EXTRACT_SYSTEM, shape="array",
+                               model=model, max_tokens=1400, default=None)
+    if rows is None:
         return [], []
 
     claims: list[Claim] = []
@@ -355,19 +340,11 @@ async def should_continue(cfg, question: str, rnd: Round, run: Run, model,
               f"Total so far: {len(run.claims)} claims from {len(run.papers)} papers, "
               f"{len(run.rounds)} rounds.\n\nEvidence gathered:\n{table}\n\n"
               "Reply with the JSON object only.")
-    buf = ""
-    try:
-        async for tok in stream_answer(cfg, prompt, [], system=CONTINUE_SYSTEM, model=model,
-                                       temperature=0.0, max_tokens=200, raw_user=True):
-            buf += tok
-    except Exception:
-        buf = ""
-    m = _JSON_OBJ.search(buf or "")
-    if not m:
-        return {"decision": "stop", "gap": "", "next_query": "", "via": "fallback"}
-    try:
-        d = json.loads(m.group(0))
-    except json.JSONDecodeError:
+    from lara.serve.generate import complete_json
+
+    d = await complete_json(cfg, prompt, system=CONTINUE_SYSTEM, model=model,
+                            max_tokens=200)
+    if d is None:
         return {"decision": "stop", "gap": "", "next_query": "", "via": "fallback"}
     return {"decision": "continue" if d.get("decision") == "continue" else "stop",
             "gap": str(d.get("gap") or "")[:300],

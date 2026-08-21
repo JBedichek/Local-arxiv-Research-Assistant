@@ -144,13 +144,12 @@ async def decide(cfg, question: str, hits: list[dict], breadth: Breadth,
         f"{'Context expansion is not available; do not choose it.' if not breadth.expand_context else ''}\n"
         "Reply with the JSON object only."
     )
-    buf = ""
-    async for tok in stream_answer(
-        cfg, prompt, [], system=DECIDE_SYSTEM, model=model,
-        temperature=0.0, max_tokens=400, raw_user=True,
-    ):
-        buf += tok
-    return parse_decision(buf)
+    from lara.serve.generate import complete
+
+    # parse_decision does its own tolerant extraction (it accepts prose and fences around
+    # the object), so this takes the raw text rather than complete_json.
+    return parse_decision(await complete(cfg, prompt, system=DECIDE_SYSTEM, model=model,
+                                         max_tokens=400))
 
 
 # ── context expansion ──────────────────────────────────────────────────────────────
@@ -276,18 +275,10 @@ async def assess(cfg, question: str, hits: list[dict], model: str | None) -> dic
         f"Question: {question}\n\nExcerpts:\n{format_excerpts(hits)}\n\n"
         "Reply with the JSON object only."
     )
-    buf = ""
-    async for tok in stream_answer(
-        cfg, prompt, [], system=ASSESS_SYSTEM, model=model,
-        temperature=0.0, max_tokens=250, raw_user=True,
-    ):
-        buf += tok
-    m = _JSON.search(buf or "")
-    if not m:
-        return {"coverage": prior or "full", "missing": "", "conflict": "", "via": "default"}
-    try:
-        d = json.loads(m.group(0))
-    except json.JSONDecodeError:
+    from lara.serve.generate import complete_json
+
+    d = await complete_json(cfg, prompt, system=ASSESS_SYSTEM, model=model, max_tokens=250)
+    if d is None:
         return {"coverage": prior or "full", "missing": "", "conflict": "", "via": "default"}
     cov = d.get("coverage")
     if cov not in {"full", "partial", "none"}:
@@ -396,19 +387,12 @@ async def decompose(cfg, question: str, model: str | None,
     if not looks_compound(question):
         return {"kind": "atomic", "parts": [], "reason": "no compound markers", "via": "heuristic"}
 
-    buf = ""
-    async for tok in stream_answer(
+    from lara.serve.generate import complete_json
+
+    d = await complete_json(
         cfg, f"Question: {question}\n\nReply with the JSON object only.",
-        [], system=DECOMPOSE_SYSTEM, model=model,
-        temperature=0.0, max_tokens=300, raw_user=True,
-    ):
-        buf += tok
-    m = _JSON.search(buf or "")
-    if not m:
-        return {"kind": "atomic", "parts": [], "reason": "unparseable", "via": "default"}
-    try:
-        d = json.loads(m.group(0))
-    except json.JSONDecodeError:
+        system=DECOMPOSE_SYSTEM, model=model, max_tokens=300)
+    if d is None:
         return {"kind": "atomic", "parts": [], "reason": "unparseable", "via": "default"}
 
     kind = d.get("kind") if d.get("kind") in {"atomic", "parallel", "sequential"} else "atomic"

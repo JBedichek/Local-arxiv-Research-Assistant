@@ -27,12 +27,8 @@ the answer only changes when a new question is asked.
 
 from __future__ import annotations
 
-import json
-import re
 import time
 from dataclasses import asdict, dataclass, field
-
-_JSON_ARRAY = re.compile(r"\[.*\]", re.S)
 
 #: Relationship kinds the model may use. A closed set keeps the legend readable and stops
 #: the graph acquiring fifty synonyms for "related to".
@@ -147,22 +143,11 @@ def _describe(t: dict, limit: int = 900) -> str:
 
 async def _label(cfg, ts: list[dict], model, stream_answer) -> dict[int, dict]:
     listing = "\n\n".join(f"[{i}] {_describe(t)}" for i, t in enumerate(ts, 1))
-    buf = ""
-    try:
-        async for tok in stream_answer(cfg, f"Conversations:\n{listing}\n\nReply with the "
-                                            "JSON array only.", [], system=LABEL_SYSTEM,
-                                       model=model, temperature=0.0, max_tokens=1600,
-                                       raw_user=True):
-            buf += tok
-    except Exception:
-        buf = ""
-    m = _JSON_ARRAY.search(buf or "")
-    if not m:
-        return {}
-    try:
-        rows = json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return {}
+    from lara.serve.generate import complete_json
+
+    rows = await complete_json(
+        cfg, f"Conversations:\n{listing}\n\nReply with the JSON array only.",
+        system=LABEL_SYSTEM, shape="array", model=model, max_tokens=1600, default=[])
     out: dict[int, dict] = {}
     for r in rows if isinstance(rows, list) else []:
         try:
@@ -184,22 +169,11 @@ async def _edges(cfg, nodes: list[Node], model, stream_answer) -> list[Edge]:
     listing = "\n".join(
         f"[{i}] {n.first_utc[:10]} · {n.label} — {n.summary}"
         for i, n in enumerate(nodes, 1))
-    buf = ""
-    try:
-        async for tok in stream_answer(cfg, f"Conversations, oldest first:\n{listing}\n\n"
-                                            "Reply with the JSON array only.", [],
-                                       system=EDGE_SYSTEM, model=model, temperature=0.0,
-                                       max_tokens=1200, raw_user=True):
-            buf += tok
-    except Exception:
-        buf = ""
-    m = _JSON_ARRAY.search(buf or "")
-    if not m:
-        return []
-    try:
-        rows = json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return []
+    from lara.serve.generate import complete_json
+
+    rows = await complete_json(
+        cfg, f"Conversations, oldest first:\n{listing}\n\nReply with the JSON array only.",
+        system=EDGE_SYSTEM, shape="array", model=model, max_tokens=1200, default=[])
 
     seen: set[tuple[str, str]] = set()
     edges: list[Edge] = []

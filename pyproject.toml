@@ -94,7 +94,9 @@ serve = ["vllm>=0.10; sys_platform == 'linux'"]   # legacy alias for `vllm`
 #     pip install git+https://github.com/KellerJordan/Muon
 # Everything except `lara finetune` works without it.
 finetune = []
-dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.7", "mypy>=1.13"]
+# No pytest-asyncio: the few coroutine tests drive asyncio.run directly, so the suite
+# runs with plain pytest and nothing else.
+dev = ["pytest>=8.3", "ruff>=0.7", "mypy>=1.13"]
 
 [project.scripts]
 lara = "lara.cli:app"
