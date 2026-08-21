@@ -210,11 +210,11 @@ class Plan:
         return generator_params_at_4bit(self.generator_headroom_gb)
 
 
-#: The retriever's row map: one int->int entry per vector row in the WHOLE corpus,
-#: measured at ~23 bytes per entry on CPython 3.12. Worth naming because it does not
-#: shrink when the corpus is scoped -- keeping 10% leaves it untouched -- so a plan that
-#: ignores it understates a small machine by two thirds of a gigabyte.
-ROW_MAP_BYTES_PER_ROW = 23
+#: The retriever's row map: vector_row -> chunk_id for the WHOLE corpus, as an int32
+#: lookup table, so 4 bytes per row. Still worth counting because it does not shrink when
+#: the corpus is scoped -- keeping 10% leaves it untouched -- but it is no longer material:
+#: as a dict it measured ~23 bytes per entry and 0.67 GB, against 0.12 GB now.
+ROW_MAP_BYTES_PER_ROW = 4
 
 
 def overhead_gb(hot_tier_bytes: int = 0, cross_encoder: bool = True,

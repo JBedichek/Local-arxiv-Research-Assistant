@@ -100,13 +100,58 @@ class Retriever:
         """The connection belonging to the calling thread."""
         return self._conn_factory()
 
-    def _load_row_map(self) -> dict[int, int]:
-        return {
-            r["vector_row"]: r["chunk_id"]
-            for r in self.conn.execute(
-                "SELECT vector_row, chunk_id FROM chunks WHERE vector_row IS NOT NULL"
-            )
-        }
+    #: Marks a vector row with no chunk behind it. `vector_row` is *nearly* dense but not
+    #: quite — 28.7 M populated rows spread over a maximum of 29.55 M — so the gaps have
+    #: to be representable rather than assumed away.
+    NO_CHUNK = -1
+
+    def _load_row_map(self) -> np.ndarray:
+        """vector_row -> chunk_id, as a lookup table indexed by row.
+
+        This was a dict, which cost 0.67 GB for 28.7 M entries (~23 bytes each, measured)
+        and — being whole-corpus — did not shrink when the corpus was scoped, making it
+        the one resident cost the keep fraction could not touch. As an int32 array it is
+        ~118 MB, and the lookup becomes a vectorised gather rather than 200 dict probes
+        with a membership test each.
+
+        int32 rather than int64: both columns max out around 29.5 M, three orders of
+        magnitude inside the range, and int64 would double it for nothing.
+        """
+        top = self.conn.execute(
+            "SELECT MAX(vector_row) FROM chunks WHERE vector_row IS NOT NULL"
+        ).fetchone()[0]
+        if top is None:
+            return np.empty(0, dtype=np.int32)
+
+        table = np.full(int(top) + 1, self.NO_CHUNK, dtype=np.int32)
+        cur = self.conn.execute(
+            "SELECT vector_row, chunk_id FROM chunks WHERE vector_row IS NOT NULL"
+        )
+        # Streamed in batches rather than fetchall(): materialising 28.7 M row objects and
+        # two int64 columns alongside them peaked at 0.53 GB to build a 0.12 GB table,
+        # which defeats most of the point of building it.
+        while True:
+            batch = cur.fetchmany(1_000_000)
+            if not batch:
+                break
+            n = len(batch)
+            vr = np.fromiter((r[0] for r in batch), dtype=np.int64, count=n)
+            table[vr] = np.fromiter((r[1] for r in batch), dtype=np.int32, count=n)
+            del batch, vr
+        return table
+
+    def chunk_ids_for_rows(self, dense_rows: np.ndarray) -> list[int]:
+        """Chunk ids for vector rows, dropping rows the table does not cover.
+
+        Rows beyond the table are not an error: an embed run can append vectors after the
+        map was built, and `refresh_row_map` is what catches up.
+        """
+        r = np.asarray(dense_rows, dtype=np.int64)
+        if r.size == 0 or self._row_to_chunk.size == 0:
+            return []
+        r = r[(r >= 0) & (r < self._row_to_chunk.size)]
+        ids = self._row_to_chunk[r]
+        return ids[ids != self.NO_CHUNK].tolist()
 
     def rows_for_papers(self, papers: list[str]) -> np.ndarray:
         """Vector rows belonging to a set of papers — the tier-0 / scoped-search filter."""
@@ -243,9 +288,7 @@ class Retriever:
             if rows.size == 0:
                 return RetrievalResult([], t, 0)
         dense_rows, _ = self.dense.search(q_trunc, k=self.tier2_candidates, rows=rows)
-        dense_ids = [
-            self._row_to_chunk[int(r)] for r in dense_rows if int(r) in self._row_to_chunk
-        ]
+        dense_ids = self.chunk_ids_for_rows(dense_rows)
         t["dense"] = (clock() - t0) * 1000
 
         t0 = clock()

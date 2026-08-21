@@ -153,10 +153,13 @@ def memory_breakdown() -> JSONResponse:
             out["tier1_search_block"] = getattr(dense, "search_block", None)
         rowmap = getattr(r, "_row_to_chunk", None)
         if rowmap is not None:
-            # A dict of one int->int pair per vector row in the WHOLE corpus, so it does
-            # not shrink when the corpus is scoped. Measured at ~23 bytes per entry.
-            out["row_map_entries"] = len(rowmap)
-            out["row_map_gb"] = round(sys.getsizeof(rowmap) / 1e9, 2)
+            # Whole-corpus, so it does not shrink when the corpus is scoped: the one
+            # resident cost the keep fraction cannot move.
+            out["row_map_entries"] = int(getattr(rowmap, "size", len(rowmap)))
+            out["row_map_gb"] = round(
+                (rowmap.nbytes if hasattr(rowmap, "nbytes")
+                 else sys.getsizeof(rowmap)) / 1e9, 3)
+            out["row_map_dtype"] = str(getattr(rowmap, "dtype", "dict"))
         out["tier2_source"] = "fp16 mmap" if getattr(r, "fp16", None) is not None else "int8 mmap"
         out["cross_encoder_loaded"] = getattr(r, "cross_encoder", None) is not None
     if getattr(s, "paper_index", None) is not None:
