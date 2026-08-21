@@ -371,7 +371,7 @@ $("#ask-form").addEventListener("submit", async (ev) => {
       const frames = buf.split("\n\n");
       buf = frames.pop();
       for (const frame of frames) {
-        const ev = /event: (\w+)/.exec(frame);
+        const ev = /^event: (.+)$/m.exec(frame);
         const dm = /data: ([\s\S]*)$/.exec(frame);
         if (!ev || !dm) continue;
         if (ev[1] === "step") {

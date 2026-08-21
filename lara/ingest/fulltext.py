@@ -67,7 +67,13 @@ class FullTextFetcher:
         on_429_initial_sec: float = 60.0,
         backoff_multiplier: float = 2.0,
         backoff_max_sec: float = 3600.0,
+        chunking: dict | None = None,
     ) -> None:
+        # Chunking settings reach the parser from here or not at all. They were declared in
+        # config.yaml and read by nothing — parse_html's own defaults won every time — so
+        # editing `target_chars` and re-crawling 300k papers would have changed nothing.
+        self.chunking = {k: v for k, v in (chunking or {}).items()
+                         if k in ("target_chars", "overlap_frac", "never_cross_sections")}
         self.rate = rate_per_sec
         self._limiter = AsyncLimiter(max(rate_per_sec, 0.1), 1.0)
         self._sem = asyncio.Semaphore(max_concurrency)
@@ -158,7 +164,7 @@ class FullTextFetcher:
                 else:
                     # ar5iv serves a styled placeholder for papers it could not convert;
                     # a real paper always yields body blocks.
-                    parsed = parse_html(body)
+                    parsed = parse_html(body, **self.chunking)
                     if not parsed.chunks:
                         errors.append(f"{source}:empty")
                         continue

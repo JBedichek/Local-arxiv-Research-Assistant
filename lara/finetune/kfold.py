@@ -727,10 +727,13 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
     def snapshot():
         return {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
 
-    for _ in range(rec.epochs):
+    steps_per_epoch = max(1, len(epoch_batches))
+    for epoch_idx in range(rec.epochs):
         if stopped:
             break
+        epoch_step = 0
         for part in query_disjoint_batches(triples, rec.batch_size, rng):
+            epoch_step += 1
             scale = (step / warmup) if step < warmup else 0.5 * (
                 1 + math.cos(math.pi * min(1.0, (step - warmup) / max(1, steps - warmup))))
             for g, b in zip(opt.param_groups, base):
@@ -819,12 +822,21 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
                 progress.send({"step": step, "steps": steps, "loss": total,
                                "lr": opt.param_groups[0]["lr"], "val_loss": vl,
                                "best_val": best_loss if best_state is not None else None,
+                               "epoch": epoch_idx + 1, "epochs": rec.epochs,
+                               "epoch_step": epoch_step, "steps_per_epoch": steps_per_epoch,
                                "elapsed": time.time() - started})
             if val_triples and since_best >= rec.patience:
                 if progress is not None:
                     progress.send({"step": step, "steps": steps, "early_stop": True,
                                    "loss": total, "best_val": best_loss,
                                    "lr": opt.param_groups[0]["lr"],
+                                   "epoch": epoch_idx + 1, "epochs": rec.epochs,
+                                   "epoch_step": epoch_step,
+                                   "steps_per_epoch": steps_per_epoch,
+                                   # Fractional epochs, because "stopped at 2.43 epochs"
+                                   # answers whether the model had seen the data through
+                                   # more than once, and "stopped at step 90" does not.
+                                   "epoch_frac": step / steps_per_epoch,
                                    "elapsed": time.time() - started})
                 stopped = True
                 break

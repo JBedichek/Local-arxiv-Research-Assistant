@@ -192,8 +192,8 @@ def expand_chunks(conn, chunk_ids: list[int], before: int = 2, after: int = 1,
             seen.add(r["chunk_id"])
             out.append({
                 "chunk_id": r["chunk_id"], "arxiv_id": r["arxiv_id"], "version": r["version"],
-                "url": f"/p/{r['arxiv_id']}v{r['version']}#{r['anchor_start']}:"
-                       f"{r['char_start']}-{r['char_end']}",
+                "url": S.fragment_for(r["arxiv_id"], r["version"], r["anchor_start"],
+                                      r["char_start"], r["anchor_end"], r["char_end"]),
                 "anchor": r["anchor_start"], "char_start": r["char_start"],
                 "char_end": r["char_end"], "anchor_end": r["anchor_end"],
                 "section": r["section_title"] or r["section_anchor"], "kind": r["kind"],

@@ -184,6 +184,7 @@ def crawl(
         on_429_initial_sec=float(fcfg.get("backoff", {}).get("on_429_initial_sec", 60)),
         backoff_multiplier=float(fcfg.get("backoff", {}).get("multiplier", 2.0)),
         backoff_max_sec=float(fcfg.get("backoff", {}).get("max_sec", 3600)),
+        chunking=cfg.get_in("chunking") or {},
     )
 
     async def run() -> None:
@@ -583,15 +584,32 @@ def finetune_pairs(
                   f"({len(val):,} held back for early stopping)")
 
     def reporter():
+        seen_epoch = 0
         while True:
             st = yield
             if st.get("early_stop"):
-                console.print(f"  [yellow]early stop[/yellow] step {st['step']} "
-                              f"best val {st['best_val']:.4f}")
+                console.print(
+                    f"  [yellow]early stop[/yellow] at step {st['step']}/{st['steps']} — "
+                    f"epoch {st.get('epoch','?')}/{st.get('epochs','?')}, "
+                    f"step {st.get('epoch_step','?')}/{st.get('steps_per_epoch','?')} "
+                    f"within it = [bold]{st.get('epoch_frac', 0):.2f} epochs[/bold] · "
+                    f"best val {st['best_val']:.4f}")
                 continue
+            # A line whenever the epoch rolls over, so the trace shows where the
+            # boundaries are without reading step arithmetic.
+            ep = st.get("epoch")
+            if ep and ep != seen_epoch:
+                seen_epoch = ep
+                console.print(f"  [dim]--- epoch {ep}/{st.get('epochs')} "
+                              f"({st.get('steps_per_epoch')} steps) ---[/dim]")
             v = st.get("val_loss")
-            console.print(f"  step {st['step']:>4}/{st['steps']}  loss {st['loss']:7.4f}  "
-                          f"lr {st['lr']:.2e}" + (f"  val {v:7.4f}" if v is not None else "")
+            frac = st.get("epoch_frac")
+            if frac is None and st.get("steps_per_epoch"):
+                frac = st["step"] / st["steps_per_epoch"]
+            console.print(f"  step {st['step']:>4}/{st['steps']}"
+                          + (f"  ep {frac:5.2f}" if frac is not None else "")
+                          + f"  loss {st['loss']:7.4f}  lr {st['lr']:.2e}"
+                          + (f"  val {v:7.4f}" if v is not None else "")
                           + f"  {st['elapsed']/60:.0f}m")
 
     pr = reporter(); next(pr)

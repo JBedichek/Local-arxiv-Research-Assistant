@@ -354,14 +354,7 @@ def retrieve(req: RetrieveRequest) -> JSONResponse:
         "timings_ms": {k: round(v, 1) for k, v in result.timings_ms.items()},
         "candidates": result.n_candidates,
         "hits": [
-            {
-                "chunk_id": h.chunk_id, "arxiv_id": h.arxiv_id, "version": h.version,
-                "url": h.fragment(), "anchor": h.anchor_start,
-                "char_start": h.char_start, "char_end": h.char_end,
-                "anchor_end": h.anchor_end, "section": h.section_title or h.section_anchor,
-                "kind": h.kind, "score": round(h.score, 4),
-                "paper_title": h.paper_title, "text": h.text,
-            }
+            h.to_dict()
             for h in result.hits
         ],
     })
@@ -856,7 +849,7 @@ def device_info() -> JSONResponse:
         "unified_memory": d.unified_memory, "total_ram_gb": d.total_ram_gb,
         "usable_ram_gb": d.usable_ram_gb, "gpus": d.gpus,
         "total_vram_gb": d.total_vram_gb, "budget_gb": d.budget_gb,
-        # d.backend is the advisory description; effective_backend is what will really
+        # d.backend is the advisory description; resolve_backend is what will really
         # run, which differs on a Mac with mlx-lm installed and wants a different format.
         "backend": GEN.resolve_backend(cfg, d.accelerator, cfg.get_path("huggingface.home")),
         "backend_advisory": d.backend,
@@ -1659,14 +1652,7 @@ async def ask(req: AskRequest) -> StreamingResponse:
             query, papers=restrict, selection=req.selection, final_k=k,
             feedback=feedback,
         )
-        return [
-            {"chunk_id": h.chunk_id, "arxiv_id": h.arxiv_id, "version": h.version,
-             "url": h.fragment(), "anchor": h.anchor_start, "char_start": h.char_start,
-             "char_end": h.char_end, "anchor_end": h.anchor_end,
-             "section": h.section_title or h.section_anchor, "kind": h.kind,
-             "score": round(h.score, 4), "paper_title": h.paper_title, "text": h.text}
-            for h in result.hits
-        ]
+        return [h.to_dict() for h in result.hits]
 
     async def events():
         started = time.time()
@@ -1849,6 +1835,8 @@ async def ask(req: AskRequest) -> StreamingResponse:
                 custom_prompt = None
 
             answer = ""
+            prompt_parts: list = []
+            usage: dict = {}
             gen_started = time.time()
             first_token_at = None
             async for token in stream_answer(
@@ -1859,6 +1847,7 @@ async def ask(req: AskRequest) -> StreamingResponse:
                 s.cfg, req.query, hits, selection=req.selection, history=history,
                 model=req.model, temperature=req.temperature, max_tokens=req.max_tokens,
                 coverage=coverage, system=custom_prompt,
+                prompt_parts=prompt_parts, usage_out=usage,
             ):
                 if first_token_at is None:
                     first_token_at = time.time()
@@ -1873,8 +1862,7 @@ async def ask(req: AskRequest) -> StreamingResponse:
                 vcfg = s.cfg.get_in("serving.vllm") or {}
                 base_url = vcfg.get("base_url", "http://127.0.0.1:8000/v1")
                 model_name = req.model or vcfg.get("default_model") or ""
-                parts = list(getattr(GEN.build_prompt, "last_parts", []) or [])
-                usage = getattr(GEN.stream_answer, "last_usage", None) or {}
+                parts = list(prompt_parts)
 
                 counts = await GEN.count_tokens(base_url, model_name,
                                                 [t for _, t in parts]) if parts else None

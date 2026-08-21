@@ -345,20 +345,6 @@ def resolve_backend(cfg, accelerator: str, hf_home=None) -> str:
     return default
 
 
-def effective_backend(cfg, accelerator: str) -> str:
-    """The backend that will actually serve, as a canonical name.
-
-    ``devices.Device.backend`` is advisory prose written before anything is installed —
-    it says "llama.cpp" on any Mac. :func:`choose` is the real decision and takes
-    installation into account, so on a Mac with ``mlx-lm`` present the two disagree and
-    name different weight formats. Anything that has to match the runtime — which models
-    are listed as servable, which config key the chosen model is written under — has to
-    ask this, not the Device.
-    """
-    requested = ((cfg.get_in("serving.generator") or {}) or {}).get("backend")
-    return choose(accelerator, requested).name
-
-
 def model_for(backend: str, cfg: dict) -> str | None:
     """The model configured for one backend. Formats differ, so these cannot be shared."""
     if backend == "vllm":

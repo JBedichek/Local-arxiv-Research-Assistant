@@ -35,6 +35,21 @@ import torch
 from lara import device as dev
 
 
+def fragment_for(arxiv_id: str, version: int, anchor_start: str, char_start: int,
+                 anchor_end: str, char_end: int) -> str:
+    """Build a citation fragment from raw columns.
+
+    Free-standing because callers that never construct a Hit still have to produce the
+    identical string. Writing it out a second time is how 29.8% of the corpus — the chunks
+    whose text spans two anchors — ended up with `char_end` interpreted against the
+    *opening* anchor, pointing the reader's highlight at the wrong text.
+    """
+    base = f"/p/{arxiv_id}v{version}#{anchor_start}:{char_start}"
+    if anchor_end and anchor_end != anchor_start:
+        return f"{base}-{anchor_end}:{char_end}"
+    return f"{base}-{char_end}"
+
+
 @dataclass
 class Hit:
     chunk_id: int
@@ -55,10 +70,25 @@ class Hit:
 
     def fragment(self) -> str:
         """The citation URL the LLM emits and the reader resolves (PLAN.md §4)."""
-        base = f"/p/{self.arxiv_id}v{self.version}#{self.anchor_start}:{self.char_start}"
-        if self.anchor_end != self.anchor_start:
-            return f"{base}-{self.anchor_end}:{self.char_end}"
-        return f"{base}-{self.char_end}"
+        return fragment_for(self.arxiv_id, self.version, self.anchor_start,
+                            self.char_start, self.anchor_end, self.char_end)
+
+    def to_dict(self) -> dict:
+        """The wire shape every endpoint sends for a retrieved passage.
+
+        One definition, because the key names are load-bearing: ``section`` (not
+        ``section_title``) is what agent.format_excerpts and the answer prompt read, and a
+        near-miss silently drops the section from every excerpt rather than raising.
+        """
+        return {
+            "chunk_id": self.chunk_id, "arxiv_id": self.arxiv_id, "version": self.version,
+            "url": self.fragment(), "anchor": self.anchor_start,
+            "char_start": self.char_start, "char_end": self.char_end,
+            "anchor_end": self.anchor_end,
+            "section": self.section_title or self.section_anchor,
+            "kind": self.kind, "score": round(self.score, 4),
+            "paper_title": self.paper_title, "text": self.text,
+        }
 
 
 def reciprocal_rank_fusion(

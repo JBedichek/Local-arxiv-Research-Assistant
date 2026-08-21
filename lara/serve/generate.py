@@ -145,13 +145,15 @@ def build_prompt(
                  "explicitly if the excerpts answer some parts but not others:\n"
                  + "\n".join(f"  - {p}" for p in parts) + "\n")
     tail += f"\nQuestion: {query.strip()}\n\nAnswer:"
-    # The parts, in prompt order, so the viewer shows what was actually sent rather than a
-    # reconstruction that can drift from it.
-    build_prompt.last_parts = [
+    # Returned, not stashed on the function. Module-level mutable state made two
+    # concurrent /api/ask streams read each other's prompt breakdown — and every agent
+    # sub-call (decide, assess, rewrite, tag) goes through here too, so even one request
+    # overwrote its own parts several times before the viewer read them.
+    parts = [
         ("system", SYSTEM), ("few-shot", FEWSHOT), ("history", history),
         ("excerpts", excerpts), ("question", tail),
     ]
-    return prefix, tail
+    return prefix, tail, parts
 
 
 async def count_tokens(base_url: str, model: str, texts: list[str]) -> list[int] | None:
@@ -215,6 +217,8 @@ async def stream_answer(
     raw_user: bool = False,
     coverage: str = "full",
     history: str = "",
+    prompt_parts: list | None = None,
+    usage_out: dict | None = None,
 ) -> AsyncIterator[str]:
     """Stream a completion.
 
@@ -227,7 +231,9 @@ async def stream_answer(
     vcfg = cfg.get_in("serving.vllm")
     base_url = vcfg["base_url"].rstrip("/")
     model_name = model or vcfg.get("default_model")
-    prefix, tail = build_prompt(query, hits, selection, history)
+    prefix, tail, parts = build_prompt(query, hits, selection, history)
+    if prompt_parts is not None:
+        prompt_parts[:] = parts
 
     # Chat completions, not raw completions: the generator is instruction tuned, so its
     # chat template is what it was trained to answer in. Raw prompting works but produces
@@ -256,7 +262,6 @@ async def stream_answer(
         "stream_options": {"include_usage": True},
         "chat_template_kwargs": {"enable_thinking": False},
     }
-    stream_answer.last_usage = None
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0)) as client:
         try:
@@ -274,9 +279,10 @@ async def stream_answer(
                         chunk = json.loads(data)
                     except json.JSONDecodeError:
                         continue
-                    if chunk.get("usage"):
-                        # The final frame carries exact prompt and completion counts.
-                        stream_answer.last_usage = chunk["usage"]
+                    if chunk.get("usage") and usage_out is not None:
+                        # The final frame carries exact prompt and completion counts. Into
+                        # a dict the caller owns, so concurrent streams cannot collide.
+                        usage_out.update(chunk["usage"])
                     choice = (chunk.get("choices") or [{}])[0]
                     delta = choice.get("delta", {})
                     # Some builds stream reasoning in its own field; that is easy, we

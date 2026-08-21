@@ -161,16 +161,7 @@ def to_dict(h) -> dict:
     and a near-miss here would silently drop the section from every excerpt shown to the
     model rather than raising.
     """
-    if isinstance(h, dict):
-        return h
-    return {
-        "chunk_id": h.chunk_id, "arxiv_id": h.arxiv_id, "version": h.version,
-        "url": h.fragment(), "anchor": h.anchor_start,
-        "char_start": h.char_start, "char_end": h.char_end,
-        "anchor_end": h.anchor_end, "section": h.section_title or h.section_anchor,
-        "kind": h.kind, "score": round(h.score, 4),
-        "paper_title": h.paper_title, "text": h.text,
-    }
+    return h if isinstance(h, dict) else h.to_dict()
 
 
 def _excerpts(hits: list[dict]) -> str:

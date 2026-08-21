@@ -69,6 +69,19 @@ def document_text(title: str | None, section_title: str | None, text: str) -> st
     return f"title: {head} | text: {text}"
 
 
+#: The two document prefixes every trainer and evaluator needs, derived from the one
+#: function that defines the corpus format rather than retyped. Four hand-written copies
+#: had already drifted — kfold used "title: none", train used "title: {title}" — and
+#: judgements.py and kfold.py both record what a train/serve format mismatch cost when it
+#: last happened: 0.909 -> 0.741 cosine. Deriving them makes that drift impossible.
+DOC_PREFIX_UNTITLED = document_text(None, None, "")      # "title: none | text: "
+
+
+def doc_prefix_for(title: str | None) -> str:
+    """The document prefix for a paper-level document with this title."""
+    return document_text(title, None, "")
+
+
 def load_model(
     name: str,
     device: str | int | None = None,

@@ -66,8 +66,10 @@ class TrainConfig:
     stats: dict = field(default_factory=dict)
 
 
-DOC_PREFIX = "title: {title} | text: "
-QUERY_PREFIX = "task: search result | query: "
+# Imported/derived rather than retyped — see lara.index.embed.
+from lara.index.embed import QUERY_PROMPT as QUERY_PREFIX  # noqa: E402
+
+DOC_PREFIX = "title: {title} | text: "  # format string; doc_prefix_for() fills it
 
 
 def mil_nce(src: torch.Tensor, dst: torch.Tensor, temperature: float,
