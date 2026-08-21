@@ -307,6 +307,17 @@ class Recipe:
     # free — one extra copy of the parameters and a lerp per step — and it captures much of
     # what averaging-based regularisation offers without a second gradient.
     ema_decay: float = 0.0
+    #: Cap on triples used for the early-stopping signal.
+    #:
+    #: The inner split is a FRACTION of the training set, so it grew with every harvest —
+    #: 3,649 triples at 24 k, 24,116 at 161 k. At 161 k one validation encoded 71,424
+    #: sequences against 1,536 for a training step: 46.5x a step, every 10 steps, so 82 %
+    #: of all compute went to deciding when to stop rather than to training.
+    #:
+    #: Early stopping needs a stable, representative estimate, not an exhaustive one. A
+    #: fixed subsample gives the same decision at a small fraction of the cost, and the
+    #: subsample is deterministic so the loss stays comparable between evaluations.
+    val_max_triples: int = 2048
     compile_mode: str | None = None   # off by default: folds are short, compile is not free
     seed: int = 0
 
@@ -707,6 +718,27 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
         lr_muon, lr_adam, weight_decay = rec.lr_muon, rec.lr_adam, rec.weight_decay
     opt = SingleDeviceMuonWithAuxAdam(split_param_groups(model, _Cfg()))
 
+    # ── data-parallel, without the DDP wrapper ────────────────────────────────────
+    # Each rank keeps a FULL `batch_size` of its own, so per-query negatives stay at
+    # 2*batch_size-1 exactly as on one GPU; the effective batch is batch_size * world.
+    # Nothing about the objective changes, the gradient estimate just averages `world`
+    # independent problems.
+    #
+    # The DDP wrapper is deliberately not used. GradCache issues one manual
+    # `torch.autograd.backward` per micro-batch, and DDP's hooks would fire a gradient
+    # all-reduce on each of them — either syncing many times per step or needing no_sync
+    # bookkeeping around a loop that already has enough going on. All-reducing once, after
+    # the full-batch gradient exists, is the same arithmetic and far easier to verify:
+    # every rank ends with identical gradients, so every rank computes an identical Muon
+    # update and the replicas cannot drift.
+    ddp = torch.distributed.is_available() and torch.distributed.is_initialized()
+    world = torch.distributed.get_world_size() if ddp else 1
+    rank = torch.distributed.get_rank() if ddp else 0
+    if ddp:
+        # Disjoint shards, so an epoch covers the data once across all ranks rather than
+        # `world` times.
+        triples = triples[rank::world]
+
     rng = random.Random(rec.seed)
     epoch_batches = query_disjoint_batches(triples, rec.batch_size, rng)
     steps = max(1, len(epoch_batches) * rec.epochs)
@@ -801,6 +833,23 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
                             q.copy_(o)
                     del orig
 
+            if ddp:
+                # Average the gradients. One all-reduce over a flat buffer rather than one
+                # per tensor: a 300 M-parameter model has ~450 gradient tensors, and each
+                # separate NCCL call pays its own launch and synchronisation cost for a
+                # payload that is often a few kilobytes.
+                #
+                # Clipping happens AFTER the reduce so the norm is the global one and the
+                # clip threshold means the same thing at any world size.
+                grads = [prm.grad for prm in model.parameters() if prm.grad is not None]
+                if grads:
+                    flat = torch._utils._flatten_dense_tensors(grads)
+                    torch.distributed.all_reduce(
+                        flat, op=torch.distributed.ReduceOp.SUM)
+                    flat /= world
+                    for g, merged in zip(
+                            grads, torch._utils._unflatten_dense_tensors(flat, grads)):
+                        g.copy_(merged)
             torch.nn.utils.clip_grad_norm_(model.parameters(), rec.grad_clip)
             opt.step()
             if ema is not None:
@@ -812,9 +861,20 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
 
             vl = None
             if val_triples and step % rec.eval_every == 0:
-                vl = mnrl_val_loss(model, val_triples, device, rec)
+                # Rank 0 evaluates and every rank is told the answer. Letting each rank
+                # decide from its own shard would let them stop on different steps, and a
+                # rank that exits the loop early leaves the others hanging in all_reduce.
+                if rank == 0:
+                    vl = mnrl_val_loss(model, val_triples, device, rec)
+                if ddp:
+                    buf = torch.tensor([vl if vl is not None else 0.0],
+                                       dtype=torch.float64, device=device)
+                    torch.distributed.broadcast(buf, src=0)
+                    vl = float(buf.item())
                 if vl < best_loss - rec.min_delta:
-                    best_loss, best_state, since_best = vl, snapshot(), 0
+                    best_loss, since_best = vl, 0
+                    if rank == 0:
+                        best_state = snapshot()
                 else:
                     since_best += 1
 
@@ -871,6 +931,10 @@ def mnrl_val_loss(model, triples: list[Triple], device: str, rec: "Recipe",
     # is 0.0 — a "perfect" validation loss that silently stops training on the first
     # evaluation. The inner split holds ~116 queries against a default batch of 128, so
     # this is the normal case, not an edge one.
+    if rec.val_max_triples and len(triples) > rec.val_max_triples:
+        # Deterministic subsample: the same triples every evaluation, so a change in the
+        # loss is a change in the model rather than a change in the sample.
+        triples = random.Random(12345).sample(list(triples), rec.val_max_triples)
     n_queries = len({t.query_hash for t in triples})
     batch = max(8, min(batch, n_queries))
     parts = query_disjoint_batches(triples, batch, random.Random(0))

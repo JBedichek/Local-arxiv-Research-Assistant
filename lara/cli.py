@@ -527,6 +527,7 @@ def finetune_pairs(
     contextual: bool = typer.Option(
         True, help="Render training documents as the corpus is embedded "
                    "(title > section | text). --no-contextual is the ablation."),
+    seed: int = typer.Option(0, help="Training seed; vary it to get error bars"),
     sam_rho: float = typer.Option(
         0.0, help="Sharpness-Aware Minimisation radius; 0 off. Doubles step cost."),
     ema_decay: float = typer.Option(
@@ -564,7 +565,7 @@ def finetune_pairs(
     rec = KF.Recipe(lr_muon=lr_muon, lr_adam=lr_muon / 5, batch_size=batch_size,
                     micro_batch=micro_batch, epochs=epochs, max_seq_length=max_seq_length,
                     patience=patience, eval_every=eval_every,
-                    sam_rho=sam_rho, ema_decay=ema_decay,
+                    sam_rho=sam_rho, ema_decay=ema_decay, seed=seed,
                     compile_mode=None if compile_mode.lower() == "none" else compile_mode)
     console.print(f"[bold]{len(triples):,}[/bold] triples from {n_q:,} queries · "
                   f"MultipleNegativesRanking · batch {batch_size} · seq {max_seq_length} · "
