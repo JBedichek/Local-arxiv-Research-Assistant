@@ -7,6 +7,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from lara.serve import passages as PSG
 from lara.serve.deps import require_state
 
 router = APIRouter()
@@ -289,13 +290,7 @@ def heatmap(req: HeatmapRequest) -> JSONResponse:
     r = s.retriever
     r._ensure_fp16_current()
 
-    rows = s.conn().execute(
-        "SELECT chunk_id, vector_row, anchor_start, char_start, anchor_end, char_end, "
-        "       section_anchor, kind, substr(text,1,160) AS preview "
-        "FROM chunks WHERE arxiv_id=? AND vector_row IS NOT NULL ORDER BY ordinal",
-        (req.arxiv_id,),
-    ).fetchall()
-    rows = [x for x in rows if 0 <= x["vector_row"] < r.n_vector_rows]
+    rows = PSG.paper_chunks(s.conn(), r, req.arxiv_id)
     if not rows:
         return JSONResponse({"mode": req.mode, "chunks": []})
 
@@ -314,21 +309,12 @@ def heatmap(req: HeatmapRequest) -> JSONResponse:
         ref = r.query_for(embed_queries(r.embedder, [req.query])[0])
     ref = ref / max(float(np.linalg.norm(ref)), 1e-12)
 
-    idx = np.fromiter((x["vector_row"] for x in rows), dtype=np.int64, count=len(rows))
-    scores = r.vectors_for(idx) @ ref
-    k = max(1, min(req.k, 25))
-    top = np.argsort(-scores)[:k]
+    # Deliberately not re-normalised: these are the stored vectors, and the heatmap is
+    # shading relative magnitudes within one paper rather than reporting a cosine.
+    scores = r.vectors_for(PSG.vector_rows(rows)) @ ref
+    top = np.argsort(-scores)[: max(1, min(req.k, 25))]
 
     return JSONResponse({
         "mode": req.mode,
-        "chunks": [
-            {
-                "chunk_id": rows[i]["chunk_id"], "anchor": rows[i]["anchor_start"],
-                "char_start": rows[i]["char_start"], "char_end": rows[i]["char_end"],
-                "anchor_end": rows[i]["anchor_end"], "section": rows[i]["section_anchor"],
-                "kind": rows[i]["kind"], "preview": rows[i]["preview"],
-                "score": round(float(scores[i]), 4), "rank": int(rank) + 1,
-            }
-            for rank, i in enumerate(top)
-        ],
+        "chunks": [PSG.passage(rows[i], scores[i], rank) for rank, i in enumerate(top)],
     })

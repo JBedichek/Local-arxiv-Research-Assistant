@@ -6,6 +6,7 @@ from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from lara.serve import passages as PSG
 from lara.serve.deps import memory_root, require_state
 
 router = APIRouter()
@@ -183,20 +184,13 @@ def taste_paper(arxiv_id: str, reduce: str = Query(default="lse"),
     if V.shape[0] == 0:
         return JSONResponse({"chunks": [], "n_marks": 0, "reduce": reduce})
 
-    rows = s.conn().execute(
-        "SELECT chunk_id, vector_row, anchor_start, char_start, anchor_end, char_end, "
-        "       section_anchor, kind, ordinal, substr(text,1,160) AS preview "
-        "FROM chunks WHERE arxiv_id=? AND vector_row IS NOT NULL ORDER BY ordinal",
-        (arxiv_id,),
-    ).fetchall()
+    rows = PSG.paper_chunks(s.conn(), r, arxiv_id)
     # A passage the reader already marked would otherwise score 1.0 and top its own list.
     marked = {m["chunk_id"] for m in marks}
-    rows = [x for x in rows if 0 <= x["vector_row"] < r.n_vector_rows]
     if not rows:
         return JSONResponse({"chunks": [], "n_marks": len(marks), "reduce": reduce})
 
-    idx = np.fromiter((x["vector_row"] for x in rows), dtype=np.int64, count=len(rows))
-    C = r.vectors_for(idx)
+    C = r.vectors_for(PSG.vector_rows(rows))
     C = C / np.maximum(np.linalg.norm(C, axis=1, keepdims=True), 1e-12)
     scores = _reduce_taste(C @ V.T, reduce if reduce in TASTE_REDUCTIONS else "lse", temp)
 
@@ -213,14 +207,7 @@ def taste_paper(arxiv_id: str, reduce: str = Query(default="lse"),
             for i in range(len(rows))
         ],
         # The jump list.
-        "chunks": [
-            {"chunk_id": rows[i]["chunk_id"], "anchor": rows[i]["anchor_start"],
-             "char_start": rows[i]["char_start"], "char_end": rows[i]["char_end"],
-             "anchor_end": rows[i]["anchor_end"], "section": rows[i]["section_anchor"],
-             "kind": rows[i]["kind"], "preview": rows[i]["preview"],
-             "score": round(float(scores[i]), 4), "rank": rank + 1}
-            for rank, i in enumerate(top)
-        ],
+        "chunks": [PSG.passage(rows[i], scores[i], rank) for rank, i in enumerate(top)],
     })
 
 
