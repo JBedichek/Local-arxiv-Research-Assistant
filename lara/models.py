@@ -21,6 +21,8 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from lara.serve.runtimes import BACKENDS
+
 # Architectures vLLM serves that we would plausibly use as a generator. Not exhaustive —
 # vLLM's registry is the authority; this is a conservative allowlist for the picker.
 VLLM_ARCHS = {
@@ -253,8 +255,6 @@ def survey(hf_home: str | Path, preferred: str | None = None) -> list[dict]:
     Each entry names the backend that would serve it, whether that backend is installed,
     and why it is unusable if it is not.
     """
-    from lara.serve import generator as GEN
-
     by_repo: dict[str, dict] = {}
     order = [b for b in ((preferred,) if preferred else ()) if b] + \
             [b for b in SURVEY_BACKENDS if b != preferred]
@@ -272,7 +272,7 @@ def survey(hf_home: str | Path, preferred: str | None = None) -> list[dict]:
     out: list[dict] = []
     for entry in by_repo.values():
         backends = entry.pop("backends")
-        installed = [b for b in backends if GEN.BACKENDS[b].available()]
+        installed = [b for b in backends if BACKENDS[b].available()]
         # Prefer a backend that is both able and installed; fall back to naming one that
         # would work if installed, which is actionable in a way that silence is not.
         chosen = (installed or backends or [None])[0]
@@ -280,7 +280,7 @@ def survey(hf_home: str | Path, preferred: str | None = None) -> list[dict]:
         entry["servable"] = bool(installed)
         entry["needs_install"] = bool(backends) and not installed
         if entry["needs_install"]:
-            b = GEN.BACKENDS[backends[0]]
+            b = BACKENDS[backends[0]]
             entry["hint"] = f"needs {b.label} — {b.install_hint}"
         elif not backends:
             entry["hint"] = "; ".join(entry["reasons"]) or "no backend can serve this"
