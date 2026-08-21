@@ -117,8 +117,7 @@ def serve(
     # version of this that survives a hurried evening.
     from lara.serve import auth as AUTH
 
-    tokens = AUTH.resolve_tokens(cfg)
-    token = next(iter(tokens.values()), None)
+    token = AUTH.resolve_token(cfg)
     if AUTH.require_token_for(host, cfg) and not token:
         fresh = AUTH.generate_token()
         console.print(
@@ -138,19 +137,11 @@ def serve(
     # login prompt on plain loopback, where the mode says none is needed. The token is a
     # credential to use when required, not a switch that requires it.
     if token and AUTH.require_token_for(host, cfg):
-        import json as _json
-        # The whole set, so each person can hold their own secret and be revoked alone.
-        os.environ["LARA_TOKENS"] = _json.dumps(tokens)
-        os.environ.pop("LARA_TOKEN", None)
-        console.print(
-            f"[green]authentication on[/green] — {len(tokens)} secret(s): "
-            f"{', '.join(sorted(tokens))}\n"
-            f"each person opens http://{host}:{port}/?token=<their own> once per browser")
+        os.environ["LARA_TOKEN"] = token          # the app builds its middleware from this
+        console.print(f"[green]authentication on[/green] — open "
+                      f"http://{host}:{port}/?token=<your token> once per browser")
     else:
-        # Stale env vars must not re-enable it, nor leak one person's secret into a run
-        # that is meant to be open.
-        os.environ.pop("LARA_TOKEN", None)
-        os.environ.pop("LARA_TOKENS", None)
+        os.environ.pop("LARA_TOKEN", None)         # a stale env var must not re-enable it
         if not AUTH.is_loopback(host):
             console.print("[yellow]serving without authentication[/yellow] (auth.mode: off)")
 
