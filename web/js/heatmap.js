@@ -1,6 +1,6 @@
 /* Shading a paper's passages by relevance to the question or to the answer. */
 
-import { api } from "./api.js";
+import { api, send } from "./api.js";
 import { $ } from "./dom.js";
 import { rangeFromOffsets, scrollToAnchor } from "./paper.js";
 import { prefs } from "./prefs.js";
@@ -56,14 +56,10 @@ export async function applyHeatmap() {
   }
 
   try {
-    const data = await api("/api/heatmap", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+    const data = await send("POST", "/api/heatmap", {
         arxiv_id: state.paper, query: q, anchor_chunk_id: anchorChunk,
         mode, k: Number(prefs.get("heatK", "5")),
-      }),
-    });
+      });
     paintHeatmap(data.chunks || [], mode);
   } catch { /* heatmap is decoration; never block reading */ }
 }

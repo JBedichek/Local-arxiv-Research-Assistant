@@ -1,6 +1,6 @@
 /* The system-prompt override editor. */
 
-import { api } from "./api.js";
+import { api, send } from "./api.js";
 import { $ } from "./dom.js";
 
 let promptState = { default: "", custom: null };
@@ -26,10 +26,7 @@ function setPromptState(kind, note) {
 $("#sysprompt-save")?.addEventListener("click", async () => {
   const text = $("#sysprompt").value;
   try {
-    promptState = await api("/api/settings/prompt", {
-      method: "PUT", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
+    promptState = await send("PUT", "/api/settings/prompt", { text });
     $("#sysprompt").value = promptState.active || "";
     setPromptState(promptState.is_custom ? "custom" : "default", "saved");
   } catch (err) {
@@ -39,10 +36,7 @@ $("#sysprompt-save")?.addEventListener("click", async () => {
 
 $("#sysprompt-reset")?.addEventListener("click", async () => {
   try {
-    promptState = await api("/api/settings/prompt", {
-      method: "PUT", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: "" }),
-    });
+    promptState = await send("PUT", "/api/settings/prompt", { text: "" });
     $("#sysprompt").value = promptState.active || "";
     setPromptState("default", "restored");
   } catch (err) {

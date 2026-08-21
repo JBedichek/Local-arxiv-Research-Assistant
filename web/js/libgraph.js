@@ -74,7 +74,7 @@ function renderLibGraph() {
   }).join("");
 
   const dots = nodes.map((n, i) =>
-    `<circle cx="7" cy="${PAD + i * ROW + ROW / 2}" r="3.4" fill="var(--fg)" opacity=".65"/>`
+    `<circle cx="7" cy="${PAD + i * ROW + ROW / 2}" r="3.4" fill="var(--text)" opacity=".65"/>`
   ).join("");
 
   const rows = nodes.map((n) => {

@@ -3,7 +3,7 @@
  *
  * One module because the two views share `searchData` and each can switch to the other. */
 
-import { api } from "./api.js";
+import { api, send } from "./api.js";
 import { $, escapeHtml, setStatus } from "./dom.js";
 import { heatColor, openPaper } from "./paper.js";
 import { prefs } from "./prefs.js";
@@ -42,11 +42,7 @@ export async function searchPapers(query, push = true) {
   $("#results-head").innerHTML = `<h2>Searching…</h2>`;
   try {
     const t0 = performance.now();
-    const data = await api("/api/search", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query, limit: Number($("#topk").value) || 20 }),
-    });
+    const data = await send("POST", "/api/search", { query, limit: Number($("#topk").value) || 20 });
     const ms = Math.round(performance.now() - t0);
     searchData = data;
     const nEdges = (data.edges || []).length;
@@ -110,11 +106,6 @@ document.addEventListener("keydown", (ev) => {
 $("#question").addEventListener("keydown", (ev) => {
   if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) $("#ask-form").requestSubmit();
 });
-
-export function syncQuant() {
-  const m = state.models.find((x) => x.repo === $("#model").value);
-  $("#quant").innerHTML = (m ? m.quant_options : []).map((q) => `<option>${q}</option>`).join("");
-}
 
 /* Layout: one row per paper, ordered by relevance rank (most relevant at top); x is the
  * submission date. Two variables, no collisions.

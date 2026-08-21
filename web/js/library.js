@@ -1,6 +1,6 @@
 /* The reading library as a tree: folders, entries, renaming, and drag-and-drop. */
 
-import { api } from "./api.js";
+import { api, send } from "./api.js";
 import { addMessage } from "./ask.js";
 import { $, escapeHtml } from "./dom.js";
 import { loadGraph, openPaper } from "./paper.js";
@@ -182,10 +182,7 @@ function beginRename(row) {
     done = true;
     const name = input.value;
     if (save && name.trim() && (!cur || name !== cur.name)) {
-      await api(`/api/memory/folder/${id}`, {
-        method: "PATCH", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name }),
-      }).catch(() => {});
+      await send("PATCH", `/api/memory/folder/${id}`, { name }).catch(() => {});
     }
     loadLibrary();
   };
@@ -209,10 +206,7 @@ $("#lib-tree")?.addEventListener("dblclick", (ev) => {
 $("#lib-newfolder")?.addEventListener("click", async () => {
   let created = null;
   try {
-    created = await api("/api/memory/folder", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: "New folder" }),
-    });
+    created = await send("POST", "/api/memory/folder", { name: "New folder" });
   } catch { return; }
   await loadLibrary();
   const row = document.querySelector(`.lib-row.lib-folder[data-folder="${created.id}"]`);
@@ -257,15 +251,9 @@ $("#lib-tree")?.addEventListener("drop", async (ev) => {
   if (moved.folder && moved.folder === target) return;   // dropping a folder on itself
   try {
     if (moved.entry) {
-      await api(`/api/memory/entry/${moved.entry}`, {
-        method: "PATCH", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ folder: target, refile: true }),
-      });
+      await send("PATCH", `/api/memory/entry/${moved.entry}`, { folder: target, refile: true });
     } else if (moved.folder) {
-      await api(`/api/memory/folder/${moved.folder}`, {
-        method: "PATCH", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ parent: target, reparent: true }),
-      });
+      await send("PATCH", `/api/memory/folder/${moved.folder}`, { parent: target, reparent: true });
     }
   } catch { /* reload below reveals whatever actually happened */ }
   loadLibrary();

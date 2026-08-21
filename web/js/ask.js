@@ -6,7 +6,7 @@
  * passage starts a retrieval before anything has been typed, which is where the latency
  * saving in the header comment comes from. */
 
-import { api } from "./api.js";
+import { api, send } from "./api.js";
 import { $, escapeHtml, setStatus } from "./dom.js";
 import { applyHeatmap } from "./heatmap.js";
 import { loadLibrary } from "./library.js";
@@ -86,10 +86,7 @@ $("#taste-float").addEventListener("click", async () => {
   const btn = $("#taste-float");
   btn.textContent = "…";
   try {
-    await api("/api/taste/mark", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ arxiv_id: state.paper, text: state.candidate }),
-    });
+    await send("POST", "/api/taste/mark", { arxiv_id: state.paper, text: state.candidate });
     btn.textContent = "\u2605 Saved";
     btn.classList.add("done");
     loadTaste();
@@ -101,14 +98,10 @@ $("#taste-float").addEventListener("click", async () => {
 });
 
 function retrieve(query, selection) {
-  return api("/api/retrieve", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
+  return send("POST", "/api/retrieve", {
       query, selection, paper: state.paper,
       scope: $("#scope").value, k: 8,
-    }),
-  });
+    });
 }
 
 $("#ask-form").addEventListener("submit", async (ev) => {

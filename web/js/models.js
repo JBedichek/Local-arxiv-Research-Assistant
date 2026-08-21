@@ -1,8 +1,8 @@
 /* Choosing a generator, and downloading one from Hugging Face. */
 
-import { api } from "./api.js";
+import { api, send } from "./api.js";
 import { $, escapeHtml } from "./dom.js";
-import { syncQuant } from "./search.js";
+import {  } from "./search.js";
 import { state } from "./state.js";
 
 let dlResolved = null;
@@ -143,10 +143,7 @@ $("#dl-form").addEventListener("submit", async (ev) => {
   $("#dl-info").innerHTML = `<span class="dim">looking up…</span>`;
   $("#dl-start").hidden = true;
   try {
-    const r = await api("/api/model/resolve", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: q }),
-    });
+    const r = await send("POST", "/api/model/resolve", { query: q });
     dlResolved = r;
     if (!r.exists || r.error) {
       $("#dl-info").innerHTML = `<span class="bad">${escapeHtml(r.error || "not found")}</span>`;
@@ -163,17 +160,14 @@ $("#dl-start").addEventListener("click", async () => {
   $("#dl-start").hidden = true;
   $("#dl-progress").hidden = false;
   try {
-    await api("/api/model/download", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+    await send("POST", "/api/model/download", {
         repo: dlResolved.repo,
         size_gb: dlResolved.size_gb,
         // Only the picked quantisation's files. Null for safetensors repos, where the
         // whole snapshot is the model. Without this a GGUF repo fetches every
         // quantisation it ships.
         files: dlResolved.pick_files || null,
-      }),
-    });
+      });
   } catch (err) {
     $("#dl-progress-text").innerHTML = `<span class="bad">${escapeHtml(String(err.message || err))}</span>`;
     return;
@@ -230,7 +224,6 @@ export async function loadModels() {
     opts.push(`<option value="${DL_SENTINEL}">＋ Download new model…</option>`);
     state.models = m.models;
     $("#model").innerHTML = opts.join("");
-    syncQuant();
 
     /* Nothing to generate with, so the download dialog is the only useful next step.
      * Once per page load: re-opening it after every poll would trap the user. */
@@ -250,5 +243,4 @@ $("#model").addEventListener("change", (ev) => {
     ev.target.value = usable.find((x) => x.loaded)?.repo || usable[0]?.repo || "";
     openDownloadModal();
   }
-  syncQuant();
 });
