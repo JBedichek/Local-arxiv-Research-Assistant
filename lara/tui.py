@@ -1,4 +1,8 @@
-"""Arrow-key selection, with a typed fallback wherever that is not possible.
+"""Terminal UI: arrow-key selection, with a typed fallback wherever that is not possible.
+
+Named `tui`, not `prompt`. Everywhere else in this project a prompt is what gets sent
+to a model -- SYSTEM in generate.py, the controller schema in agent.py, the override
+behind /api/settings/prompt -- and this module has nothing to do with any of that.
 
 Deliberately stdlib-only. The obvious way to get a menu is ``questionary``, which
 drags in ``prompt_toolkit`` — several MB for one prompt, in a base install whose whole

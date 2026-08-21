@@ -144,7 +144,9 @@ def finetune_pairs(
 
     from lara import device as ldev
     from lara.finetune import evaluate as EV
-    from lara.finetune import kfold as KF
+    from lara.finetune import mnrl as MN
+    from lara.finetune import trainers as TR
+    from lara.finetune import triples as TRI
     from lara.index.embed import load_model
     from lara.store import db
 
@@ -152,12 +154,12 @@ def finetune_pairs(
     conn = db.connect(cfg.get_path("paths.metadata_db"))
     model_name = cfg.get_in("embedding.model")
 
-    triples = KF.make_triples(conn, max_per_query=max_per_query, contextual=contextual)
+    triples = TRI.make_triples(conn, max_per_query=max_per_query, contextual=contextual)
     n_q = len({t.query_hash for t in triples})
     if len(triples) < batch_size * 4:
         console.print(f"[red]only {len(triples):,} triples[/red] — run `lara explore` first")
         raise typer.Exit(1)
-    rec = KF.Recipe(lr_muon=lr_muon, lr_adam=lr_muon / 5, batch_size=batch_size,
+    rec = TR.Recipe(lr_muon=lr_muon, lr_adam=lr_muon / 5, batch_size=batch_size,
                     micro_batch=micro_batch, epochs=epochs, max_seq_length=max_seq_length,
                     patience=patience, eval_every=eval_every,
                     sam_rho=sam_rho, ema_decay=ema_decay, seed=seed,
@@ -175,7 +177,7 @@ def finetune_pairs(
     del base
     ldev.empty_cache(device)
 
-    train, val = KF.inner_split(triples, rec.inner_val_frac, seed=1)
+    train, val = TRI.inner_split(triples, rec.inner_val_frac, seed=1)
     console.print(f"\n[bold]training[/bold] on {len(train):,} triples "
                   f"({len(val):,} held back for early stopping)")
 
@@ -208,7 +210,7 @@ def finetune_pairs(
                 + f"  {st['elapsed']/60:.0f}m")
 
     pr = reporter(line)
-    model = KF.train_on_mnrl(list(train), model_name, device, rec,
+    model = MN.train_on_mnrl(list(train), model_name, device, rec,
                              progress=pr, val_triples=val)
     console.print(f"[green]trained[/green] {getattr(model, 'steps_trained', 0)} steps"
                   + (" (early stopped)" if getattr(model, "stopped_early", False) else ""))
@@ -269,16 +271,17 @@ def lr_sweep(
     """
     import json as _json
 
-    from lara.finetune import kfold as KF
+    from lara.finetune import trainers as TR
+    from lara.finetune import triples as TRI
     from lara.store import db
 
     cfg = config_mod.load(config)
     conn = db.connect(cfg.get_path("paths.metadata_db"))
-    triples = KF.make_triples(conn, max_per_query=max_per_query)
+    triples = TRI.make_triples(conn, max_per_query=max_per_query)
     n_q = len({t.query_hash for t in triples})
     grid = [float(x) for x in lrs.split(",") if x.strip()]
 
-    rec = KF.Recipe(batch_size=batch_size, micro_batch=micro_batch, epochs=epochs,
+    rec = TR.Recipe(batch_size=batch_size, micro_batch=micro_batch, epochs=epochs,
                     patience=patience, eval_every=eval_every)
     per_epoch = int(len(triples) * (1 - val_frac) * (1 - rec.inner_val_frac)) // batch_size
     console.print(
@@ -304,13 +307,13 @@ def lr_sweep(
     rows = []
     for lr in grid:
         console.print(f"\n[bold]muon lr {lr:.1e}[/bold]")
-        rows += KF.sweep(triples, cfg.get_in("embedding.model"), device, rec, [lr],
+        rows += TR.sweep(triples, cfg.get_in("embedding.model"), device, rec, [lr],
                          val_frac=val_frac, progress=p)
         console.print("  " + _json.dumps({k: rows[-1][k] for k in
                                           ("steps", "early_stopped", "d_pair_acc",
                                            "d_spearman", "d_margin_mae")}))
 
-    console.print("\n" + KF.format_sweep(rows))
+    console.print("\n" + TR.format_sweep(rows))
     if out:
         _P = __import__("pathlib").Path(out)
         _P.parent.mkdir(parents=True, exist_ok=True)
@@ -338,19 +341,21 @@ def fit_check(
     `kfold` splits by query to measure whether it generalises within-distribution.
     """
     from lara import device as ldev
-    from lara.finetune import kfold as KF
+    from dataclasses import replace as dc_replace
+    from lara.finetune import trainers as TR
+    from lara.finetune import triples as TRI
     from lara.store import db
 
     cfg = config_mod.load(config)
     conn = db.connect(cfg.get_path("paths.metadata_db"))
-    triples = KF.make_triples(conn)
+    triples = TRI.make_triples(conn)
     console.print(f"[bold]{len(triples):,}[/bold] triples from "
                   f"{len({t.query_hash for t in triples}):,} queries")
     if len(triples) < batch_size * 2:
         console.print("[red]not enough triples[/red] — run `lara explore` first")
         raise typer.Exit(1)
 
-    rec = KF.Recipe(lr_muon=lr_muon, batch_size=batch_size, epochs=epochs,
+    rec = TR.Recipe(lr_muon=lr_muon, batch_size=batch_size, epochs=epochs,
                     patience=patience, eval_every=eval_every)
     console.print(f"recipe: muon lr {rec.lr_muon:.1e} · adam lr {rec.lr_adam:.1e} · "
                   f"batch {rec.batch_size} · max {rec.epochs} epochs · "
@@ -373,16 +378,16 @@ def fit_check(
                       "(train == eval; this measures capacity, not generalisation)")
         from lara.index.embed import load_model
         base = load_model(model_name, device=device, max_seq_length=rec.max_seq_length)
-        before = KF.evaluate(base, sub, device)
+        before = TR.evaluate(base, sub, device)
         console.print(f"  before: pair_acc {before['pair_acc']:.3f}  "
                       f"margin_mae {before['margin_mae']:.3f}  spearman {before['spearman']}")
         del base
         ldev.empty_cache(device)
 
         p = reporter(line)
-        model = KF.train_on(list(sub), model_name, device,
-                            KF.replace(rec, patience=0), progress=p)
-        after = KF.evaluate(model, sub, device)
+        model = TR.train_on(list(sub), model_name, device,
+                            dc_replace(rec, patience=0), progress=p)
+        after = TR.evaluate(model, sub, device)
         console.print(f"  after : pair_acc {after['pair_acc']:.3f}  "
                       f"margin_mae {after['margin_mae']:.3f}  spearman {after['spearman']}")
         gain = after["pair_acc"] - before["pair_acc"]
@@ -398,7 +403,7 @@ def fit_check(
         conn.close()
         return
 
-    folds = KF.split_by_query(triples, k, seed=rec.seed)
+    folds = TRI.split_by_query(triples, k, seed=rec.seed)
     console.print(f"\n[bold]{k}-fold CV[/bold], split by query "
                   f"(sizes {[len(f) for f in folds]})")
     results = []
@@ -409,21 +414,21 @@ def fit_check(
         console.print(f"\n  fold {i+1}/{k}: train {len(train):,} · val {len(val):,}")
         from lara.index.embed import load_model
         base = load_model(model_name, device=device, max_seq_length=rec.max_seq_length)
-        before = KF.evaluate(base, val, device)
+        before = TR.evaluate(base, val, device)
         del base
         ldev.empty_cache(device)
         # Early stopping selects on an INNER split of the training folds. Selecting on
         # `val` would leak: the checkpoint would be chosen using the very data the fold
         # metrics are computed from, making them optimistic by an unknown amount.
-        inner_train, inner_val = (KF.inner_split(train, rec.inner_val_frac, rec.seed)
+        inner_train, inner_val = (TRI.inner_split(train, rec.inner_val_frac, rec.seed)
                                   if rec.patience else (train, []))
         if inner_val:
             console.print(f"    inner split: {len(inner_train):,} train · "
                           f"{len(inner_val):,} early-stop val (by query)")
         p = reporter(line)
-        model = KF.train_on(list(inner_train), model_name, device, rec, progress=p,
+        model = TR.train_on(list(inner_train), model_name, device, rec, progress=p,
                             val_triples=inner_val)
-        after = KF.evaluate(model, val, device)
+        after = TR.evaluate(model, val, device)
         note = ""
         if getattr(model, "stopped_early", False):
             note = f"   [dim](stopped at step {model.steps_trained})[/dim]"

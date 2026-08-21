@@ -17,7 +17,7 @@ import typer
 from rich.console import Group
 from rich.table import Table
 
-from lara import prompt as prompt_mod
+from lara import tui
 from lara.cli._base import console
 
 #: The fractions the slider stops at. Coarse at the top, fine at the bottom, because the
@@ -116,7 +116,7 @@ class BackendChooser:
         filled = round(self.keep * 24)
         bar = "█" * filled + "░" * (24 - filled)
         chunks = int(self.n_chunks * self.keep)
-        head = "[green]◀ ▶[/green]" if prompt_mod.interactive() else "   "
+        head = "[green]◀ ▶[/green]" if tui.interactive() else "   "
         return (f"  {head} corpus kept resident  [cyan]{bar}[/cyan]  "
                 f"[bold]{self.keep:>4.0%}[/bold]  ({chunks / 1e6:.1f}M of "
                 f"{self.n_chunks / 1e6:.1f}M chunks)")
@@ -171,7 +171,7 @@ class BackendChooser:
             self.print_legend()
             return self.plan.option, self.keep
 
-        if prompt_mod.interactive():
+        if tui.interactive():
             return self._arrow_keys()
         return self._typed()
 
@@ -180,7 +180,7 @@ class BackendChooser:
         console.print("  [dim]↑/↓ choose a search engine · ◀/▶ move the slider · "
                       "enter to confirm · esc for the recommendation.[/dim]")
         start = self.keys.index(self.recommended)
-        picked = prompt_mod.select(len(self.opts), self.screen, console=console,
+        picked = tui.select(len(self.opts), self.screen, console=console,
                                    initial=start, horizontal=self.nudge_keep)
         if picked is None:
             self.keep = self.default_keep     # esc restores the recommendation wholesale

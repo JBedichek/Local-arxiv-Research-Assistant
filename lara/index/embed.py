@@ -57,29 +57,14 @@ import torch
 from lara import device as dev
 from lara.index.vectors import VectorStore
 
-QUERY_PROMPT = "task: search result | query: "
-
-
-def document_text(title: str | None, section_title: str | None, text: str) -> str:
-    """Build the contextual document string. Mirrors EmbeddingGemma's native format."""
-    head = (title or "none").strip()
-    section = (section_title or "").strip()
-    if section and section.lower() not in head.lower():
-        head = f"{head} > {section}"
-    return f"title: {head} | text: {text}"
-
-
-#: The two document prefixes every trainer and evaluator needs, derived from the one
-#: function that defines the corpus format rather than retyped. Four hand-written copies
-#: had already drifted — kfold used "title: none", train used "title: {title}" — and
-#: judgements.py and kfold.py both record what a train/serve format mismatch cost when it
-#: last happened: 0.909 -> 0.741 cosine. Deriving them makes that drift impossible.
-DOC_PREFIX_UNTITLED = document_text(None, None, "")      # "title: none | text: "
-
-
-def doc_prefix_for(title: str | None) -> str:
-    """The document prefix for a paper-level document with this title."""
-    return document_text(title, None, "")
+# Re-exported: these live in a dependency-free module so lara/finetune can read them
+# without importing torch. See lara/index/prefixes.py.
+from lara.index.prefixes import (  # noqa: E402, F401 — re-exported
+    DOC_PREFIX_UNTITLED,
+    QUERY_PROMPT,
+    doc_prefix_for,
+    document_text,
+)
 
 
 def load_model(

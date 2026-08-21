@@ -8,7 +8,7 @@ from rich.table import Table
 from lara import config as config_mod
 from lara import models as models_mod
 from lara import preflight as preflight_mod
-from lara import prompt as prompt_mod
+from lara import tui
 from lara.cli._base import _require_hf, app, console
 
 
@@ -262,7 +262,7 @@ def setup(
                           f"{kv:.2f} GB", f"{total:.2f} GB",
                           "[green]fits[/green]" if fits
                           else f"[red]needs {total - spare:.1f} GB more[/red]")
-            arrows = "[green]◀ ▶[/green]" if prompt_mod.interactive() else "   "
+            arrows = "[green]◀ ▶[/green]" if tui.interactive() else "   "
             kv_label = ("[bold]q8_0[/bold] — half the cache, slight quality cost"
                         if kv_quant else "[bold]fp16[/bold] — full precision, full size")
             return Group(t, f"  {arrows} KV cache precision: {kv_label}")
@@ -297,9 +297,9 @@ def setup(
                  if ctx_size in SU.CONTEXT_CHOICES else 1)
         if non_interactive or show:
             console.print(ctx_screen(None))
-        elif prompt_mod.interactive():
+        elif tui.interactive():
             console.print("  [dim]↑/↓ context · ◀/▶ KV precision · enter to confirm[/dim]")
-            picked = prompt_mod.select(len(SU.CONTEXT_CHOICES), ctx_screen,
+            picked = tui.select(len(SU.CONTEXT_CHOICES), ctx_screen,
                                        console=console, initial=start,
                                        horizontal=toggle_kv)
             if picked is not None:
@@ -323,8 +323,8 @@ def setup(
         s_start = SLOT_CHOICES.index(slots) if slots in SLOT_CHOICES else 0
         if non_interactive or show:
             console.print(slots_table(None))
-        elif prompt_mod.interactive():
-            got = prompt_mod.select(len(SLOT_CHOICES), slots_table, console=console,
+        elif tui.interactive():
+            got = tui.select(len(SLOT_CHOICES), slots_table, console=console,
                                     initial=s_start)
             if got is not None:
                 slots = SLOT_CHOICES[got]

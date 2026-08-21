@@ -296,9 +296,9 @@ def test_empty_string_means_auto():
 # cosine). Four hand-written copies is how that recurs.
 
 def test_all_modules_agree_on_the_query_prefix():
-    from lara.finetune import kfold
+    from lara.finetune import mnrl, trainers
     from lara.index.embed import QUERY_PROMPT
-    assert kfold.QUERY_PREFIX == QUERY_PROMPT
+    assert trainers.QUERY_PREFIX == mnrl.QUERY_PREFIX == QUERY_PROMPT
 
 
 def test_the_citation_context_trainer_prefixes_nothing():
@@ -604,7 +604,7 @@ def test_reporter_render_can_carry_state_across_records():
 
 from types import SimpleNamespace
 
-import lara.prompt as _prompt_mod
+import lara.tui as _tui
 import lara.setup as _SU
 from lara.cli import setup_ui as _SUI
 
@@ -660,8 +660,8 @@ def test_escape_restores_the_recommended_fraction(monkeypatch):
     c = _chooser()
     c.nudge_keep(-3)
     assert c.keep != c.default_keep
-    monkeypatch.setattr(_prompt_mod, "interactive", lambda: True)
-    monkeypatch.setattr(_prompt_mod, "select", lambda *a, **k: None)
+    monkeypatch.setattr(_tui, "interactive", lambda: True)
+    monkeypatch.setattr(_tui, "select", lambda *a, **k: None)
     opt, keep = _quiet(lambda: c.run(allow_interactive=True))
     assert keep == c.default_keep == 0.50
     assert opt.key == "faiss-hnsw"
@@ -670,15 +670,15 @@ def test_escape_restores_the_recommended_fraction(monkeypatch):
 def test_arrow_keys_write_the_choice_back_onto_the_plan(monkeypatch):
     # Later sections size the generator from plan.option, not from the return value.
     c = _chooser()
-    monkeypatch.setattr(_prompt_mod, "interactive", lambda: True)
-    monkeypatch.setattr(_prompt_mod, "select", lambda *a, **k: 2)
+    monkeypatch.setattr(_tui, "interactive", lambda: True)
+    monkeypatch.setattr(_tui, "select", lambda *a, **k: 2)
     opt, _ = _quiet(lambda: c.run(allow_interactive=True))
     assert opt.key == "faiss-sq8" and c.plan.option.key == "faiss-sq8"
 
 
 def test_typed_prompt_rejects_a_backend_that_is_not_offered(monkeypatch):
     c = _chooser()
-    monkeypatch.setattr(_prompt_mod, "interactive", lambda: False)
+    monkeypatch.setattr(_tui, "interactive", lambda: False)
     answers = iter(["faiss-flatt", "torch-fp16", "0.25"])
     monkeypatch.setattr(_SUI.typer, "prompt", lambda *a, **k: next(answers))
     opt, keep = _quiet(lambda: c.run(allow_interactive=True))
@@ -687,7 +687,7 @@ def test_typed_prompt_rejects_a_backend_that_is_not_offered(monkeypatch):
 
 def test_typed_prompt_rejects_a_fraction_that_is_not_a_number_or_out_of_range(monkeypatch):
     c = _chooser()
-    monkeypatch.setattr(_prompt_mod, "interactive", lambda: False)
+    monkeypatch.setattr(_tui, "interactive", lambda: False)
     answers = iter(["faiss-hnsw", "half", "1.5", "0", "0.4"])
     monkeypatch.setattr(_SUI.typer, "prompt", lambda *a, **k: next(answers))
     _, keep = _quiet(lambda: c.run(allow_interactive=True))
@@ -815,3 +815,61 @@ def test_fingerprint_is_stable_and_order_independent():
     assert _fingerprint(["a", "b"]) == _fingerprint(["a", "b"])
     assert _fingerprint(["a", "b"]) != _fingerprint(["a", "c"])
     assert _fingerprint([]).startswith("0:")
+
+
+# ── training splits ───────────────────────────────────────────────────────────────
+#
+# Splitting BY QUERY rather than by triple is the whole correctness story of these two
+# functions: the same question appears in several triples with different passages, so a
+# random row split puts near-duplicates of a query on both sides and the held-out score
+# measures memorisation instead of generalisation. Cheap to get wrong, invisible when
+# wrong, and the number it corrupts is the one used to decide whether training worked.
+
+from lara.finetune.triples import Triple, canon_query, doc_input, inner_split, split_by_query
+
+
+def _triples(spec):
+    """spec: {query: n_triples}."""
+    out = []
+    for q, n in spec.items():
+        for i in range(n):
+            out.append(Triple(query=q, query_hash=canon_query(q), pos_text=f"{q}-p{i}",
+                              neg_text=f"{q}-n{i}", margin=0.5))
+    return out
+
+
+def test_canon_query_ignores_case_and_spacing():
+    assert canon_query("  What IS   Muon? ") == canon_query("what is muon?")
+    assert canon_query("what is muon") != canon_query("what is adam")
+
+
+def test_no_query_spans_two_folds():
+    ts = _triples({f"q{i}": 3 for i in range(9)})
+    folds = split_by_query(ts, k=3, seed=0)
+    assert sorted(i for f in folds for i in f) == list(range(len(ts)))
+    where = {}
+    for fi, f in enumerate(folds):
+        for i in f:
+            where.setdefault(ts[i].query_hash, fi)
+            assert where[ts[i].query_hash] == fi, "a query landed in two folds"
+
+
+def test_folds_are_deterministic_for_a_seed():
+    ts = _triples({f"q{i}": 2 for i in range(8)})
+    assert split_by_query(ts, 4, seed=7) == split_by_query(ts, 4, seed=7)
+    assert split_by_query(ts, 4, seed=7) != split_by_query(ts, 4, seed=8)
+
+
+def test_inner_split_shares_no_query_between_train_and_val():
+    ts = _triples({f"q{i}": 4 for i in range(10)})
+    train, val = inner_split(ts, 0.3, seed=3)
+    assert train and val and len(train) + len(val) == len(ts)
+    assert not ({t.query_hash for t in train} & {t.query_hash for t in val})
+
+
+def test_doc_input_does_not_prefix_text_that_is_already_prefixed():
+    # Chunks arrive already carrying the contextual prefix from ingest; adding a second
+    # one would train on a string the serving path never produces.
+    already = "title: A Paper | text: hello"
+    assert doc_input(already) == already
+    assert doc_input("hello").endswith("hello") and doc_input("hello").startswith("title:")
