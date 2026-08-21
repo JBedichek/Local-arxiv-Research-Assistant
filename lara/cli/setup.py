@@ -71,6 +71,7 @@ def setup(
     Detects the hardware, plans a tier-1 index that fits it, lets you pick a generator,
     and saves the result. The server reads that file on every start.
     """
+    from lara import localconfig as LC
     from lara import setup as SU
     from lara.cli import setup_ui as SUI
     from lara.index.vectors import VectorStore
@@ -336,7 +337,7 @@ def setup(
             slots = int(raw) if raw.strip().isdigit() and int(raw) > 0 else slots
 
     # ── 6. write ───────────────────────────────────────────────────────────────
-    overrides = SU.overrides_for(
+    overrides = LC.overrides_for(
         plan, model=model, quantization=quant, base_url=base_url,
         disk_root=str(cfg.get_path("disk.root")),
         devices=[int(g) for g in range(len(device.gpus))] if device.gpus else "auto",
@@ -358,14 +359,14 @@ def setup(
 
     if show:
         console.print("\n[bold]config.local.yaml would be:[/bold]\n")
-        console.print(SU.render(config_mod.deep_merge(existing, overrides), device, plan))
-        kept = SU.carry_forward(existing, overrides)
+        console.print(LC.render(config_mod.deep_merge(existing, overrides), device, plan))
+        kept = LC.carry_forward(existing, overrides)
         if kept:
             console.print(f"[dim]({', '.join(kept)} carried over from the existing "
                           f"file)[/dim]")
         return
 
-    path, backup, kept = SU.write_local(config_mod.LOCAL_CONFIG, overrides, device, plan,
+    path, backup, kept = LC.write_local(config_mod.LOCAL_CONFIG, overrides, device, plan,
                                         existing=existing)
     console.print(f"\n[green]wrote[/green] {path}")
     if backup:
