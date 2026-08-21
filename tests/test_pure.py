@@ -576,3 +576,102 @@ def test_reporter_render_can_carry_state_across_records():
         return _reporter(line)
 
     assert _lines(make, [2, 3, 5]) == ["2 so far", "5 so far", "10 so far"]
+
+
+# ── the setup wizard's backend chooser ────────────────────────────────────────────
+#
+# `lara setup --show` covers the non-interactive branch end to end, but not the two that
+# take input. These drive those directly against real backend options and a stand-in
+# machine, so the validation loops and the esc-restores-the-recommendation rule are
+# pinned without running the wizard or writing a config.
+
+from types import SimpleNamespace
+
+import lara.prompt as _prompt_mod
+import lara.setup as _SU
+from lara.cli import setup_ui as _SUI
+
+
+def _plan():
+    opts = [_SU.OPTIONS_BY_KEY[k] for k in ("torch-fp16", "faiss-hnsw", "faiss-sq8")]
+    return SimpleNamespace(
+        alternatives=[(o, 0.0, None) for o in opts], option=opts[1],
+        scope="required", scope_keep=0.50, dim=256, embedder_gb=1.2, reranker_gb=0.6,
+        hot_tier_bytes=0, overhead_gb=1.8, budget_gb=48.0, index_gb=3.0,
+    )
+
+
+def _chooser():
+    device = SimpleNamespace(accelerator="cuda", unified_memory=False, budget_gb=48.0,
+                             gpus=[], system="Linux", machine="x86_64")
+    return _SUI.BackendChooser(_plan(), device, n_chunks=10_000_000)
+
+
+def _quiet(fn):
+    from lara.cli._base import console
+    console.begin_capture()
+    try:
+        return fn()
+    finally:
+        console.end_capture()
+
+
+def test_chooser_starts_at_the_step_nearest_the_planned_fraction():
+    assert _chooser().keep == 0.50
+
+
+def test_nudge_keep_clamps_at_both_ends_and_says_whether_it_moved():
+    c = _chooser()
+    assert c.nudge_keep(1) is True and c.keep == 0.66
+    while c.nudge_keep(1):
+        pass
+    assert c.keep == 1.00 and c.nudge_keep(1) is False     # top of the range
+    while c.nudge_keep(-1):
+        pass
+    assert c.keep == _SUI.KEEP_STEPS[0] and c.nudge_keep(-1) is False
+
+
+def test_non_interactive_takes_the_recommendation_untouched():
+    c = _chooser()
+    opt, keep = _quiet(lambda: c.run(allow_interactive=False))
+    assert opt is c.plan.option and keep == 0.50
+
+
+def test_escape_restores_the_recommended_fraction(monkeypatch):
+    # The reader moved the slider, then pressed esc. That must undo the slider too, not
+    # just the row selection -- they are one decision.
+    c = _chooser()
+    c.nudge_keep(-3)
+    assert c.keep != c.default_keep
+    monkeypatch.setattr(_prompt_mod, "interactive", lambda: True)
+    monkeypatch.setattr(_prompt_mod, "select", lambda *a, **k: None)
+    opt, keep = _quiet(lambda: c.run(allow_interactive=True))
+    assert keep == c.default_keep == 0.50
+    assert opt.key == "faiss-hnsw"
+
+
+def test_arrow_keys_write_the_choice_back_onto_the_plan(monkeypatch):
+    # Later sections size the generator from plan.option, not from the return value.
+    c = _chooser()
+    monkeypatch.setattr(_prompt_mod, "interactive", lambda: True)
+    monkeypatch.setattr(_prompt_mod, "select", lambda *a, **k: 2)
+    opt, _ = _quiet(lambda: c.run(allow_interactive=True))
+    assert opt.key == "faiss-sq8" and c.plan.option.key == "faiss-sq8"
+
+
+def test_typed_prompt_rejects_a_backend_that_is_not_offered(monkeypatch):
+    c = _chooser()
+    monkeypatch.setattr(_prompt_mod, "interactive", lambda: False)
+    answers = iter(["faiss-flatt", "torch-fp16", "0.25"])
+    monkeypatch.setattr(_SUI.typer, "prompt", lambda *a, **k: next(answers))
+    opt, keep = _quiet(lambda: c.run(allow_interactive=True))
+    assert opt.key == "torch-fp16" and keep == 0.25
+
+
+def test_typed_prompt_rejects_a_fraction_that_is_not_a_number_or_out_of_range(monkeypatch):
+    c = _chooser()
+    monkeypatch.setattr(_prompt_mod, "interactive", lambda: False)
+    answers = iter(["faiss-hnsw", "half", "1.5", "0", "0.4"])
+    monkeypatch.setattr(_SUI.typer, "prompt", lambda *a, **k: next(answers))
+    _, keep = _quiet(lambda: c.run(allow_interactive=True))
+    assert keep == 0.4
