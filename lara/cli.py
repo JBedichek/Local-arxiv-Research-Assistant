@@ -1851,6 +1851,46 @@ def dataset_fetch(
     console.print("\n[green]done[/green]. Run `lara preflight`, then `lara serve`.")
 
 
+def _announce_when_ready(host: str, port: int, token: str | None,
+                         timeout: float = 900.0) -> None:
+    """Print the reader's URL once it will actually serve a page.
+
+    Model loading takes tens of seconds, and during it every endpoint answers 503. A URL
+    printed before that is an invitation to click something broken, so this waits for the
+    server to say it is ready and announces it then.
+
+    Daemon thread: the announcement is a convenience and must never hold up shutdown or
+    outlive the server it is describing.
+    """
+    import threading
+    import time
+
+    # 0.0.0.0 is a bind address, not somewhere to point a browser.
+    shown = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+    url = f"http://{shown}:{port}"
+
+    def watch() -> None:
+        import httpx
+
+        params = {"token": token} if token else None
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(1.0)
+            try:
+                r = httpx.get(f"{url}/api/health", params=params, timeout=2.0)
+                if r.status_code == 200 and r.json().get("ready"):
+                    break
+            except Exception:
+                continue        # not listening yet, or still warming
+        else:
+            console.print(f"[yellow]still warming after {timeout:.0f}s[/yellow] — {url}")
+            return
+        suffix = "/?token=<your token>" if token else ""
+        console.print(f"\n[bold green]ready[/bold green]  [bold]{url}{suffix}[/bold]")
+
+    threading.Thread(target=watch, daemon=True, name="ready-announcer").start()
+
+
 @app.command()
 def serve(
     config: str = typer.Option(None, help="Path to config.yaml"),
@@ -1950,7 +1990,11 @@ def serve(
                     console.print(f"[red]{gen.backend.label} did not come up[/red] — "
                                   f"see {gen.log_path}. Retrieval still works.")
 
-    console.print(f"[bold]http://{host}:{port}[/bold]  (warming models — first start is slow)")
+    # The URL used to be printed here, before uvicorn had even bound the port, so it was
+    # clickable for the ~30s of model loading during which every request 503s. Announce it
+    # from a watcher that waits for the server to report itself ready.
+    _announce_when_ready(host, port, token)
+    console.print("[dim]starting — loading models, the first start is the slow one[/dim]")
     try:
         # One worker: the GPU index, embedder and reranker are process-local and would be
         # duplicated per worker, tripling VRAM for no throughput gain on a single-user tool.
