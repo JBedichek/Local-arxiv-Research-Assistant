@@ -1365,18 +1365,22 @@ def setup(
     # ── 5b. context length ─────────────────────────────────────────────────────
     # The KV cache is per-token and at 32k outweighs the weights it serves, so this is
     # the largest generator-side memory decision and nothing used to surface it.
+    SLOT_CHOICES = (1, 2, 4)
     ctx_size = int(cfg.get_in("serving.generator.llamacpp.ctx_size", 32768) or 32768)
     kv_quant = bool(cfg.get_in("serving.generator.llamacpp.cache_type_k"))
+    slots = int(cfg.get_in("serving.generator.llamacpp.parallel", 2) or 2)
     if model and gen_backend in ("llamacpp", "ollama"):
         model_gb = next((m.size_gb for m in (cached if not base_url else [])
                          if model in (m.repo, m.spec)), 0.0)
         spare = SU.generator_headroom_gb(device.budget_gb, plan.overhead_gb
                                          + plan.planned_index_gb)
 
-        def ctx_table(cursor: int | None) -> Table:
+        def ctx_screen(cursor: int | None):
+            from rich.console import Group
+
             t = Table(show_header=True, header_style="bold")
-            for c, j in (("", "left"), ("context", "right"), ("KV cache", "right"),
-                         ("+ weights", "right"), ("verdict", "left")):
+            for c, j in (("", "left"), ("context", "right"), ("per request", "right"),
+                         ("KV cache", "right"), ("+ weights", "right"), ("verdict", "left")):
                 t.add_column(c, justify=j, overflow="fold")
             for i, n in enumerate(SU.CONTEXT_CHOICES):
                 kv = SU.kv_cache_gb(n, kv_quant)
@@ -1385,33 +1389,82 @@ def setup(
                 fits = total <= spare
                 t.add_row("❯" if on else ("→" if n == ctx_size else ""),
                           f"[bold cyan]{n:,}[/bold cyan]" if on else f"{n:,}",
+                          f"{n // max(1, slots):,}",
                           f"{kv:.2f} GB", f"{total:.2f} GB",
                           "[green]fits[/green]" if fits
                           else f"[red]needs {total - spare:.1f} GB more[/red]")
+            arrows = "[green]◀ ▶[/green]" if prompt_mod.interactive() else "   "
+            kv_label = ("[bold]q8_0[/bold] — half the cache, slight quality cost"
+                        if kv_quant else "[bold]fp16[/bold] — full precision, full size")
+            return Group(t, f"  {arrows} KV cache precision: {kv_label}")
+
+        def toggle_kv(_delta: int) -> bool:
+            nonlocal kv_quant
+            kv_quant = not kv_quant
+            return True
+
+        def slots_table(cursor: int | None) -> Table:
+            t = Table(show_header=True, header_style="bold")
+            for c, j in (("", "left"), ("slots", "right"), ("per request", "right"),
+                         ("what it buys", "left")):
+                t.add_column(c, justify=j, overflow="fold")
+            for i, n in enumerate(SLOT_CHOICES):
+                on = cursor is not None and i == cursor
+                t.add_row("❯" if on else ("→" if n == slots else ""),
+                          f"[bold cyan]{n}[/bold cyan]" if on else str(n),
+                          f"{ctx_size // n:,}",
+                          "one request at a time, whole window each"
+                          if n == 1 else f"{n} concurrent requests, window split {n} ways")
             return t
 
         console.print("\n[bold]5b. Context length[/bold]")
         console.print(f"  [dim]How much text the generator can hold at once — the question, "
                       f"the excerpts it cites, and the answer. Its KV cache costs "
-                      f"{SU.KV_BYTES_PER_TOKEN_FP16 / 1024:.0f} KB per token"
-                      f"{' (halved by q8_0)' if kv_quant else ''}, so this is usually the "
-                      f"largest generator-side memory decision.\n"
+                      f"{SU.KV_BYTES_PER_TOKEN_FP16 / 1024:.0f} KB per token at fp16, so "
+                      f"this is usually the largest generator-side memory decision.\n"
                       f"  Estimated for an 8B-class model; llama.cpp prints the exact "
                       f"figure when it loads. {spare:.1f} GB is free after retrieval.[/dim]")
         start = (list(SU.CONTEXT_CHOICES).index(ctx_size)
                  if ctx_size in SU.CONTEXT_CHOICES else 1)
         if non_interactive or show:
-            console.print(ctx_table(None))
+            console.print(ctx_screen(None))
         elif prompt_mod.interactive():
-            picked = prompt_mod.select(len(SU.CONTEXT_CHOICES), ctx_table,
-                                       console=console, initial=start)
+            console.print("  [dim]↑/↓ context · ◀/▶ KV precision · enter to confirm[/dim]")
+            picked = prompt_mod.select(len(SU.CONTEXT_CHOICES), ctx_screen,
+                                       console=console, initial=start,
+                                       horizontal=toggle_kv)
             if picked is not None:
                 ctx_size = SU.CONTEXT_CHOICES[picked]
-            console.print(f"  context: [bold]{ctx_size:,}[/bold]")
+            console.print(f"  context: [bold]{ctx_size:,}[/bold]   KV: "
+                          f"[bold]{'q8_0' if kv_quant else 'fp16'}[/bold]")
         else:
-            console.print(ctx_table(None))
+            console.print(ctx_screen(None))
             raw = typer.prompt("  context length", default=str(ctx_size))
             ctx_size = int(raw) if raw.strip().isdigit() else ctx_size
+            kv_quant = typer.confirm("  quantise the KV cache to q8_0 (halves it)",
+                                     default=kv_quant)
+
+        # Slots do not change total KV -- `-c` is the whole cache, split between them --
+        # so this is a throughput/window trade rather than a memory one, and belongs
+        # after the memory decision rather than tangled into it.
+        console.print("\n[bold]5c. Concurrent requests[/bold]")
+        console.print(f"  [dim]llama.cpp splits the {ctx_size:,}-token context evenly "
+                      f"between slots, so each extra slot halves what one request can "
+                      f"read. Total memory is unchanged.[/dim]")
+        s_start = SLOT_CHOICES.index(slots) if slots in SLOT_CHOICES else 0
+        if non_interactive or show:
+            console.print(slots_table(None))
+        elif prompt_mod.interactive():
+            got = prompt_mod.select(len(SLOT_CHOICES), slots_table, console=console,
+                                    initial=s_start)
+            if got is not None:
+                slots = SLOT_CHOICES[got]
+            console.print(f"  slots: [bold]{slots}[/bold] "
+                          f"({ctx_size // slots:,} tokens per request)")
+        else:
+            console.print(slots_table(None))
+            raw = typer.prompt("  concurrent slots", default=str(slots))
+            slots = int(raw) if raw.strip().isdigit() and int(raw) > 0 else slots
 
     # ── 6. write ───────────────────────────────────────────────────────────────
     overrides = SU.overrides_for(
@@ -1419,6 +1472,7 @@ def setup(
         disk_root=str(cfg.get_path("disk.root")),
         devices=[int(g) for g in range(len(device.gpus))] if device.gpus else "auto",
         topics=topics, backend=gen_backend, ctx_size=ctx_size,
+        kv_quant=kv_quant, slots=slots,
     )
     # Pin the filesystem the corpus actually lives on. Detectable, and the check that
     # catches a symlink quietly redirecting 30 GB onto the wrong disk.

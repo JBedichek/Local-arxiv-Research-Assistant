@@ -513,7 +513,9 @@ def overrides_for(plan: Plan, *, model: str | None = None,
                   devices: list[int] | str | None = None,
                   topics: list[str] | None = None,
                   backend: str = "vllm",
-                  ctx_size: int | None = None) -> dict:
+                  ctx_size: int | None = None,
+                  kv_quant: bool = False,
+                  slots: int | None = None) -> dict:
     """Build the override dict the wizard writes. Only non-default keys are included."""
     index: dict = {"backend": plan.option.backend, "precision": plan.option.precision}
     if plan.option.faiss_kind:
@@ -570,8 +572,15 @@ def overrides_for(plan: Plan, *, model: str | None = None,
             generator[backend] = {"model": model}
             # The KV cache is sized from this, and at 32k it outweighs the weights. It is
             # a per-backend setting, so it rides along with the model it applies to.
-            if ctx_size and backend in ("llamacpp", "ollama"):
-                generator[backend]["ctx_size"] = int(ctx_size)
+            if backend in ("llamacpp", "ollama"):
+                if ctx_size:
+                    generator[backend]["ctx_size"] = int(ctx_size)
+                if slots:
+                    generator[backend]["parallel"] = int(slots)
+                # Written explicitly either way: null means fp16, and leaving the key
+                # absent would let a previously-quantised cache persist unnoticed.
+                generator[backend]["cache_type_k"] = "q8_0" if kv_quant else None
+                generator[backend]["cache_type_v"] = "q8_0" if kv_quant else None
     if vllm:
         serving["vllm"] = vllm
     if generator:
