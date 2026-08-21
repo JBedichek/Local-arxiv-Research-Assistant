@@ -108,6 +108,67 @@ def health() -> dict:
     }
 
 
+@app.get("/api/memory")
+def memory_breakdown() -> JSONResponse:
+    """Where the resident bytes actually are.
+
+    Added because the process was 8.9 GB against a planner that budgeted 3.8, and there
+    was no way to ask it why. Reports what can be measured directly rather than what the
+    plan assumed: torch's own accounting for device tensors, real sizes for the index and
+    the row map, and the process RSS to compare them against.
+    """
+    import subprocess
+    import sys
+
+    s = _state()
+    out: dict = {}
+
+    try:
+        rss_kb = subprocess.run(["ps", "-o", "rss=", "-p", str(os.getpid())],
+                                capture_output=True, text=True, timeout=5).stdout.strip()
+        out["process_rss_gb"] = round(int(rss_kb) / 1048576, 2)
+    except Exception:
+        out["process_rss_gb"] = None
+
+    import torch
+    if s.device == "mps" and hasattr(torch, "mps"):
+        # Unified memory: these Metal buffers live in this process's footprint, so they
+        # are part of the RSS above rather than separate from it.
+        out["torch_mps_allocated_gb"] = round(torch.mps.current_allocated_memory() / 1e9, 2)
+        try:
+            out["torch_mps_driver_gb"] = round(torch.mps.driver_allocated_memory() / 1e9, 2)
+        except Exception:
+            pass
+    elif s.device.startswith("cuda"):
+        out["torch_cuda_allocated_gb"] = round(torch.cuda.memory_allocated() / 1e9, 2)
+        out["torch_cuda_reserved_gb"] = round(torch.cuda.memory_reserved() / 1e9, 2)
+
+    r = s.retriever
+    if r is not None:
+        dense = getattr(r, "dense", None)
+        if dense is not None and hasattr(dense, "memory_bytes"):
+            out["tier1_index_gb"] = round(dense.memory_bytes() / 1e9, 2)
+            out["tier1_rows"] = getattr(dense, "n", None)
+            out["tier1_precision"] = getattr(dense, "precision", None)
+            out["tier1_search_block"] = getattr(dense, "search_block", None)
+        rowmap = getattr(r, "_row_to_chunk", None)
+        if rowmap is not None:
+            # A dict of one int->int pair per vector row in the WHOLE corpus, so it does
+            # not shrink when the corpus is scoped. Measured at ~23 bytes per entry.
+            out["row_map_entries"] = len(rowmap)
+            out["row_map_gb"] = round(sys.getsizeof(rowmap) / 1e9, 2)
+        out["tier2_source"] = "fp16 mmap" if getattr(r, "fp16", None) is not None else "int8 mmap"
+        out["cross_encoder_loaded"] = getattr(r, "cross_encoder", None) is not None
+    if getattr(s, "paper_index", None) is not None:
+        out["paper_index_gb"] = round(s.paper_index.vram_bytes() / 1e9, 2)
+
+    # The planner reserves this, but nothing in the serving path allocates it.
+    out["hot_tier_configured_gb"] = round(
+        float(s.cfg.get_in("hot_tier.max_bytes", 0) or 0) / 1e9, 2)
+    out["hot_tier_allocated"] = False
+    return JSONResponse(out)
+
+
 @app.get("/healthz")
 def healthz() -> JSONResponse:
     """Liveness, reachable without a token so a tunnel can probe it without a credential."""

@@ -1090,7 +1090,10 @@ def setup(
     # ── 3. retrieval ───────────────────────────────────────────────────────────
     plan = SU.plan_index(
         device, n_chunks, int(ecfg["dim_truncated"]),
-        hot_tier_bytes=int(cfg.get_in("hot_tier.max_bytes", 2_000_000_000)),
+        # Zero, not the configured value: hot_tier.max_bytes is read by this planner
+        # and by nothing that serves, so budgeting for it shrank every machine by
+        # 2 GB in favour of a cache that is never allocated.
+        hot_tier_bytes=0,
         cross_encoder=bool(cfg.get_in("index.rerank.cross_encoder.enabled", True)),
         prefer=prefer,
     )
@@ -1168,7 +1171,13 @@ def setup(
     fixed = [f"embedder {plan.embedder_gb:.1f}"]
     if plan.reranker_gb:
         fixed.append(f"cross-encoder reranker {plan.reranker_gb:.1f}")
-    fixed.append(f"tier-0 hot cache {plan.hot_tier_bytes / 1e9:.1f}")
+    # Whole-corpus regardless of scoping, which is exactly why it is worth naming: it is
+    # the one fixed cost the slider cannot move.
+    row_map = n_chunks * SU.ROW_MAP_BYTES_PER_ROW / 1e9
+    if row_map >= 0.05:
+        fixed.append(f"row map {row_map:.1f}")
+    if plan.hot_tier_bytes:
+        fixed.append(f"tier-0 hot cache {plan.hot_tier_bytes / 1e9:.1f}")
     width = "fp32" if device.accelerator == "cpu" else "half precision"
     pool = ("This machine shares one pool of memory between the search index and the AI "
             "model, so every GB one takes is a GB the other cannot have."

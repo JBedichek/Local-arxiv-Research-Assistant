@@ -157,7 +157,8 @@ class Plan:
     #: cache alone exceed the budget, so those have to be named separately.
     overhead_advice: list[str] = field(default_factory=list)
     disable_cross_encoder: bool = False
-    hot_tier_bytes: int = 2_000_000_000
+    #: Configured but never allocated -- see overhead_gb. Zero until it exists.
+    hot_tier_bytes: int = 0
     #: The addends behind ``overhead_gb``, kept so the wizard can show its working
     #: rather than presenting one opaque figure.
     embedder_gb: float = 0.0
@@ -209,15 +210,28 @@ class Plan:
         return generator_params_at_4bit(self.generator_headroom_gb)
 
 
-def overhead_gb(hot_tier_bytes: int = 2_000_000_000, cross_encoder: bool = True,
-                accelerator: str = "cpu") -> float:
+#: The retriever's row map: one int->int entry per vector row in the WHOLE corpus,
+#: measured at ~23 bytes per entry on CPython 3.12. Worth naming because it does not
+#: shrink when the corpus is scoped -- keeping 10% leaves it untouched -- so a plan that
+#: ignores it understates a small machine by two thirds of a gigabyte.
+ROW_MAP_BYTES_PER_ROW = 23
+
+
+def overhead_gb(hot_tier_bytes: int = 0, cross_encoder: bool = True,
+                accelerator: str = "cpu", n_chunks: int = 0) -> float:
     """Everything resident that is not the tier-1 index.
 
     ``accelerator`` defaults to the *conservative* case: fp32 on CPU is the largest the
     encoders ever get, so a caller that does not know its device is never told it has
     more room than it really has.
+
+    ``hot_tier_bytes`` defaults to zero. The tier-0 cache is configured but never
+    allocated -- ``hot_tier.max_bytes`` appears in this planner and nowhere in the
+    serving path -- so reserving 2 GB for it made every machine look 2 GB smaller than
+    it is and pushed scoping harder than the evidence supports.
     """
     over = model_gb(EMBEDDER_PARAMS, accelerator) + hot_tier_bytes / 1e9
+    over += n_chunks * ROW_MAP_BYTES_PER_ROW / 1e9
     if cross_encoder:
         over += model_gb(RERANKER_PARAMS, accelerator)
     return over
@@ -238,7 +252,7 @@ def keep_fraction_for(budget_gb: float, overhead: float, option: IndexOption,
 
 
 def plan_index(device: DV.Device | None = None, n_chunks: int = 0, dim: int = 256,
-               *, hot_tier_bytes: int = 2_000_000_000, cross_encoder: bool = True,
+               *, hot_tier_bytes: int = 0, cross_encoder: bool = True,
                prefer: str = "balanced") -> Plan:
     """Choose a tier-1 configuration for this machine.
 
@@ -250,7 +264,7 @@ def plan_index(device: DV.Device | None = None, n_chunks: int = 0, dim: int = 25
     # single_device_gb, not budget_gb: the index is one tensor on one card and is
     # never sharded, so the sum across GPUs is the wrong number to plan against.
     budget = device.single_device_gb
-    over = overhead_gb(hot_tier_bytes, cross_encoder, device.accelerator)
+    over = overhead_gb(hot_tier_bytes, cross_encoder, device.accelerator, n_chunks)
     cuda = device.accelerator == "cuda"
     reasons: list[str] = []
 
@@ -338,7 +352,8 @@ def plan_index(device: DV.Device | None = None, n_chunks: int = 0, dim: int = 25
                 "open paper's neighbourhood, so this costs latency on citation follows, "
                 "not correctness.")
         if drop_ce or hot != hot_tier_bytes:
-            new_over = overhead_gb(hot, cross_encoder and not drop_ce, device.accelerator)
+            new_over = overhead_gb(hot, cross_encoder and not drop_ce,
+                                   device.accelerator, n_chunks)
             advice.append(f"Together those bring fixed costs to {new_over:.1f} GB.")
             over = new_over
             keep = keep_fraction_for(budget, over, chosen, n_chunks, dim,
