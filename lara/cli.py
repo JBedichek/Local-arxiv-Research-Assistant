@@ -1131,7 +1131,8 @@ def setup(
             gen = (f"{head:.1f} GB\n~{SU.format_params(params)} @4bit" if params >= 5e8
                    else f"{head:.1f} GB\n[red]no room[/red]")
             t.add_row(mark, cell, idx_cell, f"{resident:.1f} GB", gen,
-                      f"{opt.p50_ms:.1f}ms", f"{opt.recall:.3f}", opt.note)
+                      f"{SU.p50_for(opt, device.accelerator):.1f}ms",
+                      f"{opt.recall:.3f}", opt.note)
         return t
 
     # Scoping shrinks only the index, and "unnecessary" leaves scope_keep at whatever the

@@ -35,6 +35,9 @@ class AppState:
         self.raw_root = self.cfg.get_path("paths.raw_cache")
         self._local = threading.local()
         self.ready = False
+        #: Last time anything touched the API. The cache reaper reads it so it only
+        #: releases device memory while the server is idle.
+        self.last_query_at = 0.0
         self.warmup_ms: dict[str, float] = {}
 
         ecfg = self.cfg.get_in("embedding")
@@ -160,6 +163,35 @@ class AppState:
                 pass
         self.warmup_ms["warmup_queries"] = (time.time() - t0) * 1000
         self.ready = True
+        self._start_cache_reaper()
+
+    def _start_cache_reaper(self) -> None:
+        """Hand cached-but-unused device memory back on a timer.
+
+        Torch's allocator keeps freed blocks for reuse, which is the right default when
+        it is the only tenant. Here it is not: the generator wants several gigabytes of
+        the *same* unified pool, and on Metal losing that race does not raise -- searches
+        come back with uniformly zero scores. /api/meminfo measured 0.91 GB held and
+        unused, which is most of a quantised model's headroom.
+
+        Idle-only, so a burst of queries is never slowed by releasing blocks it is about
+        to want again: the reaper skips any interval in which a search ran.
+        """
+        interval = float(self.cfg.get_in("serving.empty_cache_sec", 60) or 0)
+        if interval <= 0 or self.device == "cpu":
+            return
+
+        def reap() -> None:
+            while True:
+                time.sleep(interval)
+                try:
+                    if time.time() - self.last_query_at < interval:
+                        continue        # busy; releasing now would only cost a realloc
+                    dev.empty_cache(self.device)
+                except Exception:
+                    pass                # advisory, never load-bearing
+
+        threading.Thread(target=reap, daemon=True, name="mps-cache-reaper").start()
 
     # ── data access ───────────────────────────────────────────────────────────────
 

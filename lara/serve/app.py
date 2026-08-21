@@ -51,6 +51,10 @@ def _startup() -> None:
 def _state() -> AppState:
     if state is None or not state.ready:
         raise HTTPException(503, "still warming up")
+    # Every data endpoint goes through here, which makes it the one place that knows the
+    # server is not idle. The cache reaper reads this so it never releases device memory
+    # out from under a burst of queries.
+    state.last_query_at = time.time()
     return state
 
 

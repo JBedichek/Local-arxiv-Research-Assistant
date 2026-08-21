@@ -129,7 +129,8 @@ OPTIONS: tuple[IndexOption, ...] = (
     # backends.py only rejects it on CPU. Flagging it CUDA-only hid a working option from
     # every Apple Silicon machine, contradicting this row's own note.
     IndexOption("torch-int8", "torch", "int8", None, 256, 8.2, 0.996, False,
-                "half the memory for 0.4% recall — CUDA/MPS only, 25x slower on CPU"),
+                "half the memory for 0.4% recall — a CUDA optimisation; 14x slower on "
+                "Metal, 25x on CPU"),
     IndexOption("faiss-hnsw", "faiss", "fp16", "hnsw", 1280, 2.1, 0.979, False,
                 "approximate; fastest at scale but the largest, and slow to build"),
     IndexOption("faiss-flat", "faiss", "fp16", "flat", 1024, 61.3, 0.996, False,
@@ -139,6 +140,19 @@ OPTIONS: tuple[IndexOption, ...] = (
 )
 
 OPTIONS_BY_KEY = {o.key: o for o in OPTIONS}
+
+#: p50 in OPTIONS is measured on CUDA. Dequantising options are dominated by that
+#: dequantisation, which CUDA absorbs and other devices do not, so quoting the CUDA figure
+#: on a Mac promised 8.2 ms for something measured at 403. Only entries measured elsewhere
+#: appear here; anything absent falls back to the CUDA number.
+P50_BY_DEVICE: dict[tuple[str, str], float] = {
+    ("torch-int8", "mps"): 403.0,      # 2.76 M rows, dim 256, M-series
+    ("torch-fp16", "mps"): 28.9,       # same corpus, same machine
+}
+
+
+def p50_for(option: IndexOption, accelerator: str) -> float:
+    return P50_BY_DEVICE.get((option.key, accelerator), option.p50_ms)
 
 
 @dataclass
@@ -273,6 +287,18 @@ def plan_index(device: DV.Device | None = None, n_chunks: int = 0, dim: int = 25
     if device.accelerator == "cpu":
         usable = [o for o in usable if o.key not in ("torch-int8", "faiss-sq8")]
 
+    # int8 is a CUDA optimisation. The per-block dequantisation a CUDA card absorbs is
+    # the dominant cost everywhere else: measured on Metal over 2.76 M rows, int8 is
+    # 403 ms/query against 28.9 ms for fp16 — 14x slower to save 0.70 GB — and it is the
+    # only path that returns corrupt scores when the device is short of memory, because
+    # it is the only one that allocates a large float32 transient per search. Still
+    # listed and still selectable; just never the recommendation.
+    int8_is_slow_here = device.accelerator not in ("cuda", "rocm")
+    def recommendable(o: IndexOption) -> bool:
+        if int8_is_slow_here and o.precision == "int8":
+            return False
+        return o.recommendable
+
     def fits(o: IndexOption) -> bool:
         return o.index_gb(n_chunks, dim) + over <= budget * 0.8
 
@@ -283,7 +309,7 @@ def plan_index(device: DV.Device | None = None, n_chunks: int = 0, dim: int = 25
     else:
         order = sorted(usable, key=lambda o: (not fits(o), -o.recall, o.p50_ms))
 
-    order = [o for o in order if o.recommendable]
+    order = [o for o in order if recommendable(o)]
     chosen = next((o for o in order if fits(o)), None)
     if chosen is None:
         # Nothing fits whole. Pick the best option on its merits and scope the corpus,

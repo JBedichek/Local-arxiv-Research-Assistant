@@ -75,7 +75,11 @@ from lara import device as dev
 #: of bounds` from row-id translation, three frames from the cause and looking nothing like
 #: an allocation failure. The same code is correct in a fresh process; it is the pressure
 #: from the resident embedder, reranker and hot cache that tips it over.
-SEARCH_BLOCK_BYTES = {"mps": 256_000_000, "cuda": 1_000_000_000, "cpu": 512_000_000}
+#: 256 MB on Metal was still too much in practice: `normalize(raw.float())` holds the cast
+#: and the normalised copy at once, so the peak is twice the figure, and with a 5 GB
+#: generator resident alongside the index a 250,000-row block still came back degenerate.
+#: 64 MB keeps the peak near 128 MB, and the caller retries smaller before failing.
+SEARCH_BLOCK_BYTES = {"mps": 64_000_000, "cuda": 1_000_000_000, "cpu": 512_000_000}
 
 
 def default_search_block(device: str, dim: int) -> int:
@@ -331,32 +335,52 @@ class TorchBackend(_Resident):
     def describe(self) -> str:
         return f"torch {self.precision} on {self.device} ({self.n:,} vectors)"
 
+    @staticmethod
+    def _degenerate(scores: torch.Tensor) -> bool:
+        """Output that cannot arise from unit vectors, so the computation did not happen.
+
+        Metal does not raise when it runs short of memory; it returns wrong answers. The
+        two shapes seen are a uniformly zero score vector and NaN.
+        """
+        return bool(not torch.isfinite(scores).all() or float(scores.abs().max()) == 0.0)
+
     def _scores_for(self, q: torch.Tensor, idx: torch.Tensor | None) -> torch.Tensor:
         """Inner products against all rows, or a subset, dequantising if needed."""
         if self.precision == "fp16":
             m = self.matrix if idx is None else self.matrix[idx]
             return q @ m.T
+
+        # Retry smaller before giving up. The failure is memory pressure, and pressure is
+        # transient -- a generator loading 5 GB alongside the index tips it over, and the
+        # same query succeeds once the block is small enough to fit in what is left.
+        # Refusing to answer when a quarter-size block would have worked is a bad trade
+        # for a few milliseconds.
+        block = self.search_block
+        for attempt in range(3):
+            scores = self._scores_once(q, idx, block)
+            if not self._degenerate(scores):
+                return scores
+            del scores
+            dev.empty_cache(self.device)
+            block = max(8_192, block // 4)
+        raise RuntimeError(
+            f"dense search produced degenerate scores on {self.device} even at "
+            f"{block:,}-row blocks ({self.n:,} rows). On Metal this means the device is "
+            f"out of room and is returning wrong answers rather than raising. Free memory: "
+            f"stop the generator, scope the corpus smaller, or disable the cross-encoder."
+        )
+
+    def _scores_once(self, q: torch.Tensor, idx: torch.Tensor | None,
+                     block: int) -> torch.Tensor:
         n = self.n if idx is None else int(idx.numel())
         out = torch.empty((1, n), dtype=torch.float32, device=self.device)
-        for s in range(0, n, self.search_block):
-            e = min(s + self.search_block, n)
+        for s in range(0, n, block):
+            e = min(s + block, n)
             raw = self.matrix[s:e] if idx is None else self.matrix[idx[s:e]]
             blk = torch.nn.functional.normalize(raw.float(), dim=1)
             out[0, s:e] = (q.float() @ blk.T)[0]
             del blk
-        # Cheap next to the matmul, and the difference between a diagnosis and a puzzle.
-        # Corrupt scores do not raise on their own: topk consumes them and hands back
-        # uninitialised indices, which fail much later in row-id translation with a
-        # nonsense subscript. Unit vectors cannot produce a uniformly zero score vector,
-        # so both checks below indicate the computation did not really happen.
-        if not torch.isfinite(out).all() or float(out.abs().max()) == 0.0:
-            raise RuntimeError(
-                f"dense search produced degenerate scores on {self.device} "
-                f"({self.n:,} rows, block {self.search_block:,}). On Metal this means "
-                f"the device ran out of room and returned wrong answers rather than "
-                f"raising: lower index.search_block, scope the corpus smaller, or "
-                f"disable the cross-encoder to free memory."
-            )
+        # Validated by the caller, which retries at a smaller block before failing.
         return out
 
     def search(self, query: np.ndarray, k: int = 200, rows: np.ndarray | None = None):
