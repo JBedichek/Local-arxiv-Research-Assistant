@@ -198,6 +198,14 @@ index:
 
 hot_tier:
   # Tier 0: pin the open paper + its 1-hop citation neighbourhood at full fp16.
+  #
+  # NOT IMPLEMENTED. These keys are read by nothing that serves — grep finds max_bytes in
+  # the setup planner and nowhere else, and /api/meminfo reports hot_tier_allocated:
+  # false. Tier 0 is currently a filtered case of tier 1 (see lara/index/search.py), which
+  # needs no separate cache. The planner used to reserve max_bytes anyway, which made
+  # every machine look 2 GB smaller than it is and pushed corpus scoping harder than the
+  # evidence supported; it now reserves nothing. Left here as the design intent, so
+  # whoever implements tier 0 has the knobs — but it costs no memory today.
   max_bytes: 2_000_000_000
   pin_open_paper: true
   pin_neighbors_hops: 1
