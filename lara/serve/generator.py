@@ -235,6 +235,41 @@ def choose(accelerator: str, requested: str | None = None) -> Backend:
     return BACKENDS[order[0]] if order else BACKENDS["external"]
 
 
+def resolve_backend(cfg, accelerator: str, hf_home=None) -> str:
+    """The backend to use, taking into account which models are actually present.
+
+    :func:`choose` ranks by platform fit and installation, which is right until both
+    candidates are installed and only one of them can read anything you own. On a Mac
+    with mlx-lm present it returns MLX; a user whose only cached generator is a GGUF
+    then gets a backend that can serve none of their models, a wizard that scans for
+    MLX conversions and finds nothing, and no generator configured at all -- while the
+    picker lists the GGUF as perfectly servable.
+
+    An explicit ``serving.generator.backend`` always wins: this only breaks ties that
+    ``auto`` left open, and only in favour of a backend that can serve something.
+    """
+    requested = ((cfg.get_in("serving.generator") or {}) or {}).get("backend")
+    if requested and str(requested).lower() != "auto":
+        return choose(accelerator, requested).name
+
+    default = choose(accelerator, None).name
+    if hf_home is None:
+        return default
+
+    from lara.models import servable as _servable
+
+    order = [default] + [n for n in ("llamacpp", "mlx", "vllm") if n != default]
+    for name in order:
+        if not BACKENDS[name].available():
+            continue
+        try:
+            if _servable(hf_home, backend=name):
+                return name
+        except Exception:       # a cache we cannot read is not a reason to fail startup
+            continue
+    return default
+
+
 def effective_backend(cfg, accelerator: str) -> str:
     """The backend that will actually serve, as a canonical name.
 

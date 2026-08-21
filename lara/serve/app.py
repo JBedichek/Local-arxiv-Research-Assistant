@@ -733,14 +733,15 @@ def device_info() -> JSONResponse:
         "total_vram_gb": d.total_vram_gb, "budget_gb": d.budget_gb,
         # d.backend is the advisory description; effective_backend is what will really
         # run, which differs on a Mac with mlx-lm installed and wants a different format.
-        "backend": GEN.effective_backend(cfg, d.accelerator),
+        "backend": GEN.resolve_backend(cfg, d.accelerator, cfg.get_path("huggingface.home")),
         "backend_advisory": d.backend,
         "backend_reason": d.backend_reason, "notes": d.notes,
         "generator_headroom_gb": headroom,
         "generator_max_params_4bit": max_params,
         # Which weight format this machine's runtime can actually load, so the download
         # dialog can say so before someone fetches 8 GB of the wrong one.
-        "wants_format": wants_format(GEN.effective_backend(cfg, d.accelerator)),
+        "wants_format": wants_format(
+            GEN.resolve_backend(cfg, d.accelerator, cfg.get_path("huggingface.home"))),
     })
 
 
@@ -1245,7 +1246,8 @@ def models() -> JSONResponse:
     from lara.serve import devices as DV
     from lara.serve import generator as GEN
 
-    backend = GEN.effective_backend(s.cfg, DV.detect().accelerator)
+    backend = GEN.resolve_backend(s.cfg, DV.detect().accelerator,
+                                 s.cfg.get_path("huggingface.home"))
     found = survey(s.cfg.get_path("huggingface.home"), preferred=backend)
 
     # Which model vLLM is actually serving. The picker lists everything in the cache, but

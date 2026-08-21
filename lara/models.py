@@ -76,6 +76,21 @@ class CachedModel:
     n_gguf: int
     servable: bool
     reasons: list[str] = field(default_factory=list)
+    #: For a GGUF repo: one entry per quantisation present locally, smallest first.
+    #: A publisher ships many, llama.cpp loads exactly one, so summing them describes
+    #: nothing that will ever be in memory at once.
+    quants: list[dict] = field(default_factory=list)
+    #: The quantisation this entry is sized against, and what `model` should name.
+    quant_pick: str | None = None
+
+    @property
+    def spec(self) -> str:
+        """What to put in ``serving.generator.llamacpp.model``.
+
+        A GGUF repo needs the quantisation as well as the name -- "Qwen/Qwen3-8B-GGUF"
+        alone does not identify a file.
+        """
+        return f"{self.repo}:{self.quant_pick}" if self.quant_pick else self.repo
 
     @property
     def size_gb(self) -> float:
@@ -178,6 +193,26 @@ def scan(hf_home: str | Path, min_bytes: int = MIN_WEIGHT_BYTES,
                 pass
 
         repo = repo_dir.name[len("models--"):].replace("--", "/")
+
+        # A GGUF repo commonly holds Q4_K_M through Q8_0 of the same model. llama.cpp
+        # loads one of them, so `weight_bytes` summed over all of them said 32 GB for an
+        # 8B model and the wizard concluded it needed 43 GB of an 11 GB budget -- for a
+        # file that is 4.7 GB. Size against the quantisation that would actually be used.
+        quants: list[dict] = []
+        quant_pick: str | None = None
+        if gguf:
+            from lara.serve.downloads import gguf_variants, pick_4bit
+
+            local = [{"path": f.name,
+                      "size": (Path(os.path.realpath(f)).stat().st_size
+                               if Path(os.path.realpath(f)).exists() else 0)}
+                     for f in gguf]
+            quants = gguf_variants(local)
+            quant_pick = pick_4bit(quants) or (quants[0]["quant"] if quants else None)
+            chosen = next((q for q in quants if q["quant"] == quant_pick), None)
+            if chosen:
+                weight_bytes = int(chosen["size_gb"] * 1e9)
+
         reasons = _reasons_for(fmt, repo, arch, len(safet), len(gguf))
         if weight_bytes < min_bytes:
             reasons.append(
@@ -189,6 +224,7 @@ def scan(hf_home: str | Path, min_bytes: int = MIN_WEIGHT_BYTES,
             repo=repo, path=snap, arch=arch, weight_bytes=weight_bytes, quantization=quant,
             n_safetensors=len(safet), n_gguf=len(gguf),
             servable=not reasons, reasons=reasons,
+            quants=quants, quant_pick=quant_pick,
         ))
 
     found.sort(key=lambda m: (-m.servable, -m.weight_bytes))

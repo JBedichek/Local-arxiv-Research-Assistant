@@ -1302,7 +1302,8 @@ def setup(
     # Not device.backend: that is advisory prose and says "llama.cpp" on any Mac, while
     # the runtime actually chosen prefers MLX when mlx-lm is installed. They name
     # different weight formats, so the list of servable models has to follow the real one.
-    gen_backend = GEN.effective_backend(cfg, device.accelerator)
+    gen_backend = GEN.resolve_backend(cfg, device.accelerator,
+                                      cfg.get_path("huggingface.home"))
     console.print(f"  [dim]backend [bold]{gen_backend}[/bold], which loads "
                   f"{models_mod.wants_format(gen_backend)} weights[/dim]")
     running = _probe_generators()
@@ -1333,18 +1334,21 @@ def setup(
             t.add_column("fits?", justify="left")
             for m in sorted(cached, key=lambda m: m.size_gb)[:12]:
                 f = DV.fits(m.size_gb, device)
-                t.add_row(f"{m.size_gb:.1f}", m.repo,
+                t.add_row(f"{m.size_gb:.1f}", m.spec,
                           f"[green]yes[/green] ({f['margin_gb']:.0f} GB spare)" if f["fits"]
                           else f"[red]no[/red] (needs {f['needed_gb']:.0f} of "
                                f"{f['budget_gb']:.0f} GB {f['where']})")
             console.print(t)
             if fitting and not non_interactive and not show:
-                model = typer.prompt("  model repo (blank to skip)",
-                                     default=fitting[-1].repo, show_default=True) or None
-            elif fitting and non_interactive:
-                model = fitting[-1].repo
+                model = typer.prompt("  model (blank to skip)",
+                                     default=fitting[-1].spec, show_default=True) or None
+            elif fitting and (non_interactive or show):
+                # --show previews what --non-interactive would do, as it already does for
+                # an already-running generator. Without `show` here it previewed a config
+                # with no model at all, which is not what running it would produce.
+                model = fitting[-1].spec
             if model:
-                m = next((x for x in cached if x.repo == model), None)
+                m = next((x for x in cached if model in (x.repo, x.spec)), None)
                 if m and m.runtime_quant_options():
                     quant = m.runtime_quant_options()[0]
 
