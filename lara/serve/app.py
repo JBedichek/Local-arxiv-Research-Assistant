@@ -108,7 +108,25 @@ def health() -> dict:
     }
 
 
-@app.get("/api/memory")
+def _parse_size(text: str) -> float | None:
+    """vmmap's '  7.8G' or '892.3M' -> gigabytes."""
+    t = text.strip().rstrip("B").strip()
+    if not t:
+        return None
+    mult = 1.0
+    scale = {"K": 1e-6, "M": 1e-3, "G": 1.0, "T": 1e3}
+    if t[-1].upper() in scale:
+        mult, t = scale[t[-1].upper()], t[:-1]
+    try:
+        return round(float(t) * mult, 2)
+    except ValueError:
+        return None
+
+
+# NOT /api/memory: that is the reading library, and registering this there shadowed it,
+# because FastAPI matches the first route declared. The library pane silently received
+# memory statistics instead of its entries.
+@app.get("/api/meminfo")
 def memory_breakdown() -> JSONResponse:
     """Where the resident bytes actually are.
 
@@ -123,12 +141,33 @@ def memory_breakdown() -> JSONResponse:
     s = _state()
     out: dict = {}
 
+    pid = os.getpid()
     try:
-        rss_kb = subprocess.run(["ps", "-o", "rss=", "-p", str(os.getpid())],
+        rss_kb = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)],
                                 capture_output=True, text=True, timeout=5).stdout.strip()
         out["process_rss_gb"] = round(int(rss_kb) / 1048576, 2)
     except Exception:
         out["process_rss_gb"] = None
+
+    # On macOS `ps` RSS is not the number anyone means. Metal buffers live in
+    # IOAccelerator regions that it does not count, so it reported 0.04 GB for a process
+    # whose real footprint was 7.8 GB -- off by two orders of magnitude, and precisely on
+    # the memory this endpoint exists to explain. `vmmap --summary` agrees with Activity
+    # Monitor. It walks the address space, so it costs a second or two; this is a
+    # diagnostic endpoint and that is the right trade.
+    if sys.platform == "darwin":
+        try:
+            vm = subprocess.run(["vmmap", "--summary", str(pid)],
+                                capture_output=True, text=True, timeout=30).stdout
+            for line in vm.splitlines():
+                if "Physical footprint:" in line and "peak" not in line.lower():
+                    out["process_footprint_gb"] = _parse_size(line.split(":", 1)[1])
+                elif "Physical footprint (peak):" in line:
+                    out["process_footprint_peak_gb"] = _parse_size(line.split(":", 1)[1])
+        except Exception:
+            out["process_footprint_gb"] = None
+        out["process_rss_note"] = ("ps RSS excludes Metal/IOAccelerator memory on macOS; "
+                                   "use process_footprint_gb")
 
     import torch
     if s.device == "mps" and hasattr(torch, "mps"):
