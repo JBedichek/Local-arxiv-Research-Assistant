@@ -988,11 +988,24 @@ def reload_index() -> JSONResponse:
     """
     s = _state()
     assert s.retriever is not None
-    from lara.index import search as S
+    from lara.index import backends as BK
+    from lara.index import scope as SC
 
     before = s.retriever.dense.n
     papers_before = s.paper_index.n if s.paper_index is not None else 0
-    s.retriever.dense = S.DenseIndex(s.store.load_int8(), device=s.device)
+    # Rebuild through the same factory the retriever was constructed with. Calling
+    # DenseIndex directly dropped the D22 keep-set, the configured precision and the
+    # backend choice, so one reload silently made the WHOLE corpus resident — on exactly
+    # the machines that were scoped because they cannot hold it.
+    icfg = s.cfg.get_in("index") or {}
+    s.scope = SC.Scope.load(s.cfg.get_path("disk.root"))
+    resident = s.scope.rows if s.scope is not None else None
+    chosen = BK.choose_backend(icfg.get("backend", "auto"))
+    s.retriever.dense = BK.make_index(
+        s.store.load_int8(mmap=(chosen == "faiss" or resident is not None)),
+        backend=chosen, precision=icfg.get("precision", "fp16"), device=s.device,
+        row_ids=resident, faiss_cfg=BK.FaissConfig(**(icfg.get("faiss") or {})),
+    )
     s.retriever.remap_vectors()
     s.retriever.refresh_row_map()
     s._load_paper_index()
@@ -1619,7 +1632,16 @@ async def ask(req: AskRequest) -> StreamingResponse:
     from lara.serve.generate import stream_answer
 
     breadth = AG.resolve(req.breadth)
-    restrict = [req.paper] if (req.scope == "paper" and req.paper) else None
+    # Every scope the UI offers must be honoured here. `neighbourhood` was accepted and
+    # silently treated as whole-corpus, so choosing it changed nothing and said nothing —
+    # /api/retrieve resolved it correctly, which made the two endpoints disagree about
+    # what the same request meant.
+    restrict = None
+    if req.scope == "paper" and req.paper:
+        restrict = [req.paper]
+    elif req.scope == "neighbourhood" and req.paper:
+        n = s.neighbours(req.paper)
+        restrict = [req.paper, *n["cites"], *n["cited_by"]]
 
     # The thread is keyed by paper, so opening another one starts a fresh conversation.
     turns = TH.turns_for(_memory_root(), req.paper)

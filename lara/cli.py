@@ -1597,7 +1597,19 @@ def bench_index(
         console.print("[yellow]faiss not installed[/yellow] — skipping those "
                       "(pip install 'lara[cpu]')\n")
 
+    # Recall is meaningless without a fixed reference. Taking "whatever ran first" meant
+    # `--only "faiss hnsw"` made HNSW its own gold and reported 1.000 — the one number the
+    # flag exists to interrogate, silently inverted. Exact fp16 is always the reference,
+    # built separately when it is not among the selected rows (it is also the cheapest to
+    # build, so this costs little).
     gold: list[set[int]] = []
+    if not any(name == "torch fp16" for name, _ in candidates):
+        console.print("[dim]building exact fp16 as the recall reference "
+                      "(not selected for timing)…[/dim]")
+        ref = BK.TorchBackend(mat, precision="fp16")
+        gold = [set(ref.search(q, k=k)[0].tolist()) for q in qs]
+        del ref
+        ldev.empty_cache()
     table = Table(show_header=True, header_style="bold")
     for col, just in (("backend", "left"), ("memory", "right"), ("build", "right"),
                       ("p50", "right"), ("p95", "right"), ("recall@k", "right")):
