@@ -644,3 +644,8 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 .mfrac .mden { padding: 0 .22em; }
 /* The radical glyph supplies the hook; the overline supplies the vinculum. */
 .msqrt { border-top: 1px solid currentColor; padding: 0 .12em 0 .06em; margin-left: -.06em; }
+
+/* A restored thread reads as history, not as a fresh answer; the clicked turn is marked
+   so a long thread does not lose the entry you came in through. */
+.msg.restored .text { opacity: .88; }
+.msg.restored.focused { box-shadow: inset 3px 0 0 var(--accent, #7a6); }

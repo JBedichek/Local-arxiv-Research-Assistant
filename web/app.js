@@ -376,7 +376,14 @@ $("#ask-form").addEventListener("submit", async (ev) => {
         if (!ev || !dm) continue;
         if (ev[1] === "step") {
           const st = JSON.parse(dm[1]);
-          addStep(answerEl, st.kind, st.detail);
+          // Show what was actually searched. A follow-up is rewritten into a standalone
+          // query before retrieval, and silently searching for something other than what
+          // the reader typed is the kind of helpfulness that erodes trust when noticed.
+          if (st.kind === "rewrite") {
+            addStep(answerEl, "rewrite", `searched for: "${st.detail}"`);
+          } else {
+            addStep(answerEl, st.kind, st.detail);
+          }
         } else if (ev[1] === "hits") {
           // Later rounds append material; keep the citation list in sync so the
           // markers the model emits always resolve.
@@ -933,20 +940,42 @@ function renderLibrary() {
 
 /* Restoring a question puts the reader back where they were: the paper open, the question
  * in the box, and the answer they already paid for shown rather than regenerated. */
+/* Clicking a question restores the whole THREAD, not the single exchange.
+ *
+ * Threads are keyed by paper, exactly as the server keys them, so what is shown here is
+ * what the model will be given as history on the next question. Restoring one turn in
+ * isolation would show the reader less context than the model has, which makes the next
+ * answer look like it came from nowhere. */
 async function restoreEntry(e) {
   if (e.arxiv_id) await openPaper(e.arxiv_id);
   if (e.kind !== "question") return;
-  $("#question").value = e.question || "";
-  state.heatRef = { text: e.question, kind: "question" };
-  loadGraph();
-  if (e.answer) {
-    addMessage("user", e.question, e.selection || null);
+
+  const key = e.arxiv_id || "";
+  const thread = library.entries
+    .filter((x) => x.kind === "question" && (x.arxiv_id || "") === key)
+    .sort((a, b) => String(a.created_utc || "").localeCompare(String(b.created_utc || "")));
+
+  $("#messages").innerHTML = "";
+  let clicked = null;
+  for (const t of thread) {
+    addMessage("user", t.question, t.selection || null);
     const el = addMessage("assistant", "");
     el.classList.add("restored");
+    if (t.id === e.id) { el.classList.add("focused"); clicked = el; }
+    const when = escapeHtml((t.created_utc || "").slice(0, 16).replace("T", " "));
     el.querySelector(".text").innerHTML =
-      `<span class="dim">from your library · ${escapeHtml((e.created_utc || "").slice(0, 16).replace("T", " "))}</span><br>`
-      + escapeHtml(e.answer);
+      `<span class="dim">from your library · ${when}</span><br>` +
+      // Same rendering as a live answer: maths and citations, not escaped source.
+      renderMath(escapeHtml(t.answer || "(no answer recorded)"));
   }
+
+  $("#question").value = "";
+  $("#question").placeholder = thread.length > 1
+    ? `Continue this thread (${thread.length} questions)…`
+    : "Ask a follow-up…";
+  state.heatRef = { text: e.question, kind: "question" };
+  loadGraph();
+  clicked?.scrollIntoView({ block: "center" });
 }
 
 function libFindEntry(id) { return library.entries.find((e) => e.id === id); }

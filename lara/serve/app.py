@@ -255,6 +255,24 @@ def get_paper(arxiv_id: str) -> JSONResponse:
     })
 
 
+def _vectors_for_chunks(s, chunk_ids: list[int]) -> list:
+    """Full-precision vectors for chunks a previous answer cited.
+
+    These become feedback vectors on the next retrieval — each runs its own dense search
+    and joins the rank fusion, so a follow-up starts from where the last answer landed
+    rather than from cold. Failure is silent: losing the seed degrades recall slightly,
+    while raising would fail the question outright.
+    """
+    if not chunk_ids:
+        return []
+    try:
+        from lara.serve.synthesis import vectors_for
+        vecs = vectors_for(s, chunk_ids)
+        return [vecs[c] for c in chunk_ids if c in vecs]
+    except Exception:
+        return []
+
+
 def _capture_judgements(s, query: str, hits, source: str) -> None:
     """Store the reranker's verdict on every retrieved passage.
 
@@ -1521,14 +1539,25 @@ async def ask(req: AskRequest) -> StreamingResponse:
     import time
 
     from lara.serve import agent as AG
+    from lara.serve import thread as TH
     from lara.serve.generate import stream_answer
 
     breadth = AG.resolve(req.breadth)
     restrict = [req.paper] if (req.scope == "paper" and req.paper) else None
 
+    # The thread is keyed by paper, so opening another one starts a fresh conversation.
+    turns = TH.turns_for(_memory_root(), req.paper)
+    history = TH.history_block(turns)
+    # Passages the last answers cited are strong candidates for a follow-up, and cost
+    # nothing to reuse: they were already retrieved and reranked.
+    seed_ids = TH.prior_chunk_ids(turns)
+    feedback = _vectors_for_chunks(s, seed_ids) if seed_ids else []
+    search_query = {"q": req.query}
+
     def run_search(query: str, k: int) -> list[dict]:
         result = s.retriever.retrieve(
-            query, papers=restrict, selection=req.selection, final_k=k
+            query, papers=restrict, selection=req.selection, final_k=k,
+            feedback=feedback,
         )
         return [
             {"chunk_id": h.chunk_id, "arxiv_id": h.arxiv_id, "version": h.version,
@@ -1547,6 +1576,15 @@ async def ask(req: AskRequest) -> StreamingResponse:
             return f"event: step\ndata: {json.dumps({'kind': kind, 'detail': detail, **payload})}\n\n"
 
         try:
+            # Reference resolution happens BEFORE retrieval. "why is that?" embedded
+            # verbatim matches nothing; history in the answer prompt cannot repair a
+            # search that already fetched the wrong passages.
+            if turns:
+                rw = await TH.rewrite(s.cfg, req.query, turns, req.model, stream_answer)
+                if rw["rewritten"]:
+                    search_query["q"] = rw["query"]
+                    yield step("rewrite", rw["query"], original=req.query, why=rw["why"])
+
             hits = req.hits
             if hits is None:
                 # A compound question embeds to a single vector sitting BETWEEN its parts,
@@ -1555,7 +1593,7 @@ async def ask(req: AskRequest) -> StreamingResponse:
                 # decomposition call rather than N retrievals.
                 split = {"kind": "atomic", "parts": []}
                 if breadth.decompose:
-                    split = await AG.decompose(s.cfg, req.query, req.model)
+                    split = await AG.decompose(s.cfg, search_query["q"], req.model)
 
                 if split["parts"]:
                     yield step(
@@ -1575,9 +1613,11 @@ async def ask(req: AskRequest) -> StreamingResponse:
                     )
                 else:
                     yield step("search", f"Searching ({breadth.label})…")
-                    hits = await run_in_threadpool(run_search, req.query, breadth.k)
+                    hits = await run_in_threadpool(run_search, search_query["q"], breadth.k)
             yield f"event: hits\ndata: {json.dumps(hits)}\n\n"
-            _capture_hit_dicts(s, req.query, hits, "ask")
+            # The resolved query is what should retrieve these passages, so it is the
+            # honest training pair; the pronoun the reader typed is not.
+            _capture_hit_dicts(s, search_query["q"], hits, "ask")
 
             rounds = 0
             while rounds < breadth.max_rounds:
@@ -1591,7 +1631,7 @@ async def ask(req: AskRequest) -> StreamingResponse:
 
                 yield step("decide", "Assessing whether the excerpts answer the question…")
                 verdict = await AG.decide(
-                    s.cfg, req.query, hits, breadth, rounds, req.model
+                    s.cfg, search_query["q"], hits, breadth, rounds, req.model
                 )
                 action = verdict.get("action", "answer")
 
@@ -1649,7 +1689,7 @@ async def ask(req: AskRequest) -> StreamingResponse:
             # the model quietly filling the gap from parametric memory, which is the most
             # common way a RAG answer goes wrong while looking right.
             yield step("assess", "Checking whether the excerpts answer the question…")
-            verdict = await AG.assess(s.cfg, req.query, hits, req.model)
+            verdict = await AG.assess(s.cfg, search_query["q"], hits, req.model)
             coverage = verdict.get("coverage", "full")
             yield f"event: coverage\ndata: {json.dumps(verdict)}\n\n"
             label = {"full": "Answering", "partial": "Answering what is supported",
@@ -1665,7 +1705,11 @@ async def ask(req: AskRequest) -> StreamingResponse:
 
             answer = ""
             async for token in stream_answer(
-                s.cfg, req.query, hits, selection=req.selection,
+                # Deliberately req.query, not the rewrite: retrieval needed a
+                # self-contained query, but the answer must address the question the
+                # reader actually asked. History is in the prompt, so the model can
+                # resolve the reference itself.
+                s.cfg, req.query, hits, selection=req.selection, history=history,
                 model=req.model, temperature=req.temperature, max_tokens=req.max_tokens,
                 coverage=coverage, system=custom_prompt,
             ):

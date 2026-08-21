@@ -105,9 +105,15 @@ def order_for_attention(hits: list[dict]) -> list[dict]:
 
 
 def build_prompt(
-    query: str, hits: list[dict], selection: str | None = None
+    query: str, hits: list[dict], selection: str | None = None, history: str = ""
 ) -> tuple[str, str]:
-    """Return (stable_prefix, tail). Split at the prefix-cache boundary."""
+    """Return (stable_prefix, tail). Split at the prefix-cache boundary.
+
+    ``history`` sits between the system block and the excerpts, which is the only place it
+    can go without cost. It is append-only across a thread, so everything before the
+    excerpts stays byte-identical from turn to turn and the prefix cache still hits;
+    putting it after the excerpts would invalidate them on every question instead.
+    """
     lines = []
     # Bind each citation marker to the excerpt's ORIGINAL rank first, so reordering for
     # attention never renumbers what the reader ends up clicking.
@@ -128,7 +134,8 @@ def build_prompt(
         )
     excerpts = "\n\n".join(lines) if lines else "(no excerpts retrieved)"
 
-    prefix = f"{SYSTEM}\n\n{FEWSHOT}\n\n---\n\nExcerpts:\n{excerpts}\n"
+    past = f"{history}\n---\n\n" if history else ""
+    prefix = f"{SYSTEM}\n\n{FEWSHOT}\n\n---\n\n{past}Excerpts:\n{excerpts}\n"
     tail = ""
     if selection:
         tail += f"\nThe reader has highlighted this passage:\n\"{selection.strip()}\"\n"
@@ -153,6 +160,7 @@ async def stream_answer(
     system: str | None = None,
     raw_user: bool = False,
     coverage: str = "full",
+    history: str = "",
 ) -> AsyncIterator[str]:
     """Stream a completion.
 
@@ -165,7 +173,7 @@ async def stream_answer(
     vcfg = cfg.get_in("serving.vllm")
     base_url = vcfg["base_url"].rstrip("/")
     model_name = model or vcfg.get("default_model")
-    prefix, tail = build_prompt(query, hits, selection)
+    prefix, tail = build_prompt(query, hits, selection, history)
 
     # Chat completions, not raw completions: the generator is instruction tuned, so its
     # chat template is what it was trained to answer in. Raw prompting works but produces
