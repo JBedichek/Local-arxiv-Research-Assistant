@@ -215,16 +215,6 @@ def check_hf_access(cfg: Config) -> list[Check]:
     legitimate state and a flaky network is not a misconfiguration, so it would be wrong
     to block setup on it — the same reasoning ``check_gpu`` applies to having no GPU.
     """
-    # TEMPORARILY DISABLED via huggingface.verify_access (default false).
-    #
-    # Reported as a passing row rather than dropped from the list: a check that silently
-    # vanishes is indistinguishable from one that passed, and the whole point of this one
-    # is that its failure mode is otherwise invisible until first search.
-    if not bool(cfg.get_in("huggingface.verify_access", False)):
-        return [Check("hf access", True,
-                      "not verified — huggingface.verify_access is false. A gated or "
-                      "unauthorised embedder will now fail at first use instead of here.")]
-
     model = str(cfg.get_in("embedding.model") or "").strip()
     if not model:
         return [Check("hf access", False, "embedding.model is unset in config.yaml")]
@@ -290,11 +280,7 @@ def require_hf_access(cfg: Config) -> None:
     working around it (an air-gapped mirror, a substituted encoder):
     ``LARA_SKIP_HF_CHECK=1``.
     """
-    # Two independent off switches, deliberately. The env var is per-invocation, for
-    # someone working around the gate once; the config flag is the standing setting.
     if os.environ.get("LARA_SKIP_HF_CHECK"):
-        return
-    if not bool(cfg.get_in("huggingface.verify_access", False)):
         return
     failed = [c for c in check_hf_access(cfg) if not c.ok]
     if failed:

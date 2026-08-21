@@ -41,14 +41,6 @@ paths:
 # elsewhere — check it is a real directory and not a symlink onto a full filesystem.
 huggingface:
   home: ~/.cache/huggingface
-  # TEMPORARILY DISABLED. When true, `lara preflight` verifies that the embedding model
-  # is actually fetchable with your token, and `lara setup` / `lara dataset pull` refuse
-  # to start if it is not — google/embeddinggemma-300m is a gated repo whose approval is
-  # manual, and without the check that failure surfaces at first search, after a 50 GB
-  # download, as a GatedRepoError from inside sentence-transformers.
-  #
-  # Set back to true to re-enable. `LARA_SKIP_HF_CHECK=1` bypasses it for one command.
-  verify_access: false
   offline: false
 
 corpus:
