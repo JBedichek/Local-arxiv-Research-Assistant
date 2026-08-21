@@ -102,6 +102,16 @@ lara = "lara.cli:app"
 [tool.hatch.build.targets.wheel]
 packages = ["lara"]
 
+# Ship the portable defaults INSIDE the package. `packages = ["lara"]` alone excludes the
+# repo-root config.yaml, so a non-editable `pip install .` produced a wheel with no config
+# at all and every command failed with FileNotFoundError. One source of truth, copied in
+# at build time — see lara.config.PACKAGED_DEFAULT.
+[tool.hatch.build.targets.wheel.force-include]
+"config.yaml" = "lara/config.default.yaml"
+
+[tool.hatch.build.targets.sdist]
+include = ["lara", "config.yaml", "README.md", "LICENSE", "SETUP_INSTRUCTIONS.md", "docs", "web"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"

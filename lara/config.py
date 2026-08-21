@@ -33,9 +33,60 @@ import yaml
 
 _INTERP = re.compile(r"\$\{([a-zA-Z0-9_.]+)\}")
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG = REPO_ROOT / "config.yaml"
-LOCAL_CONFIG = REPO_ROOT / "config.local.yaml"
+PACKAGE_ROOT = Path(__file__).resolve().parent          # …/lara
+REPO_ROOT = PACKAGE_ROOT.parent                         # …/  (the checkout, if there is one)
+
+#: Shipped inside the wheel by ``[tool.hatch.build.force-include]``. Without it, a
+#: non-editable ``pip install .`` puts the package in site-packages, ``REPO_ROOT`` becomes
+#: site-packages, and there is no config.yaml beside it — so every command died with a
+#: FileNotFoundError naming a path the user had never heard of.
+PACKAGED_DEFAULT = PACKAGE_ROOT / "config.default.yaml"
+
+
+def _candidates() -> list[Path]:
+    """Where a base config may live, most-specific first.
+
+    ``cwd`` comes before the checkout so that running inside one repo while another is
+    pip-installed uses the one you are standing in, which is what anyone would expect.
+    """
+    return [Path.cwd() / "config.yaml", REPO_ROOT / "config.yaml", PACKAGED_DEFAULT]
+
+
+def default_config_path() -> Path:
+    """The base config to load. Raises with every path tried, not just the last."""
+    for path in _candidates():
+        if path.is_file():
+            return path
+    tried = "\n  ".join(str(p) for p in _candidates())
+    raise FileNotFoundError(
+        f"no config.yaml found. Looked in:\n  {tried}\n"
+        f"Run lara from a checkout, pass --config /path/to/config.yaml, or reinstall "
+        f"(`pip install -e .`) so the packaged default is present."
+    )
+
+
+def local_config_path() -> Path:
+    """Where ``config.local.yaml`` lives: beside the base config, unless that is the
+    packaged default — site-packages is the wrong place to write a machine's settings,
+    and may not even be writable."""
+    base = None
+    for path in _candidates():
+        if path.is_file():
+            base = path
+            break
+    if base is None or base == PACKAGED_DEFAULT:
+        return Path.cwd() / "config.local.yaml"
+    return base.parent / "config.local.yaml"
+
+
+def __getattr__(name: str):
+    # Module-level lazy attributes, so `config_mod.LOCAL_CONFIG` and `DEFAULT_CONFIG`
+    # answer for wherever the process actually is rather than where it was imported.
+    if name == "LOCAL_CONFIG":
+        return local_config_path()
+    if name == "DEFAULT_CONFIG":
+        return default_config_path()
+    raise AttributeError(name)
 
 
 def deep_merge(base: dict[str, Any], over: dict[str, Any]) -> dict[str, Any]:
@@ -95,7 +146,7 @@ class Config(dict):
     @property
     def has_local(self) -> bool:
         """Whether a machine-specific override file was found."""
-        return any(p.name == LOCAL_CONFIG.name for p in self.sources)
+        return any(p.name == "config.local.yaml" for p in self.sources)
 
     def get_path(self, dotted: str) -> Path:
         """Return a config path resolved through realpath (symlinks collapsed).
@@ -128,7 +179,7 @@ def load(path: str | Path | None = None, *, local: bool = True) -> Config:
     separately would freeze the defaults' paths against the default root — the override
     would appear to apply while the data quietly went somewhere else.
     """
-    p = Path(path) if path else DEFAULT_CONFIG
+    p = Path(path) if path else default_config_path()
     with open(p) as fh:
         raw = yaml.safe_load(fh) or {}
     sources = [p]
@@ -136,12 +187,18 @@ def load(path: str | Path | None = None, *, local: bool = True) -> Config:
     # An explicit --config selects that file alone. Layering a machine's overrides onto a
     # config the caller deliberately named would make the flag mean something other than
     # "use this configuration".
-    if local and path is None and LOCAL_CONFIG.exists():
-        with open(LOCAL_CONFIG) as fh:
+    local_path = local_config_path()
+    if local and path is None and local_path.is_file():
+        with open(local_path) as fh:
             raw = deep_merge(raw, yaml.safe_load(fh) or {})
-        sources.append(LOCAL_CONFIG)
+        sources.append(local_path)
 
     cfg = Config(_interpolate(raw, raw))
     cfg.sources = sources
-    cfg.base_dir = p.resolve().parent
+    # Relative paths resolve against the config's own directory — except for the packaged
+    # default, where that would be site-packages and `./data` would try to write the corpus
+    # inside the installed package. There, the user's working directory is the only sane
+    # anchor.
+    cfg.base_dir = (Path.cwd() if p.resolve() == PACKAGED_DEFAULT
+                    else p.resolve().parent)
     return cfg
