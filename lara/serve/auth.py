@@ -73,11 +73,20 @@ def require_token_for(host: str, cfg) -> bool:
     the check entirely and exists so that someone who genuinely wants the old behaviour
     has to say so in writing.
     """
-    mode = "auto"
+    raw = "auto"
     try:
-        mode = (cfg.get_in("serving.auth.mode") or "auto").strip().lower()
+        raw = cfg.get_in("serving.auth.mode")
     except Exception:
-        pass
+        raw = "auto"
+    # YAML 1.1 turns a bare `off` into the boolean False (and `on`/`yes`/`no` likewise).
+    # Reading that as "unset" and falling back to `auto` would leave authentication ON
+    # while the config file plainly says off — failing *closed*, but silently and against
+    # the operator's stated intent. Both spellings are honoured.
+    if raw is False:
+        return False
+    if raw is True:
+        return True
+    mode = (raw or "auto").strip().lower() if isinstance(raw, str) else "auto"
     if mode == "off":
         return False
     if mode == "always":

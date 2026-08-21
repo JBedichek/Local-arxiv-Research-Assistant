@@ -220,16 +220,24 @@ serving:
   # The token itself belongs in config.local.yaml or, better, in $LARA_TOKEN so it is
   # never written to disk. Generate one with: python -c "import secrets;print(secrets.token_urlsafe(32))"
   auth:
+    # `auto` never prompts on loopback, so ordinary local use asks for nothing. It only
+    # demands a token when you bind somewhere reachable. Turn it off for a machine in
+    # config.local.yaml rather than here — this default protects `--host 0.0.0.0`.
+    #
+    # Quote the value if you set "off": YAML 1.1 reads a bare `off` as the boolean False.
+    # lara handles both spellings, but other tools reading this file may not.
     mode: auto           # auto | always | off
     token: null
 
   # 127.0.0.1 keeps the reader on this machine only. Set 0.0.0.0 to reach it from other
   # devices on the LAN (or run `lara serve --host 0.0.0.0`).
   #
-  # There is NO authentication on any endpoint, so 0.0.0.0 exposes the corpus, the model
-  # picker and the generator to everything that can route to this host. Fine on a trusted
-  # home network; do not do it on a shared or public one without putting a reverse proxy
-  # with auth in front. Note vLLM already binds 0.0.0.0:8000 by default.
+  # With auth.mode: off there is NO authentication on any endpoint, so 0.0.0.0 exposes to
+  # everything that can route here: the corpus, `/api/model/download` (which pulls
+  # arbitrary HF repos onto this disk using your HF_TOKEN), `/api/ask` (free inference on
+  # your GPU), `/api/fetch` (makes this machine crawl arXiv), and the memory endpoints
+  # (which can delete your library). Fine on a trusted home network; on a shared, café or
+  # conference network, set mode back to `auto`. Note vLLM already binds 0.0.0.0:8000.
   host: 127.0.0.1
   port: 8080
   # Which inference server generates answers, and whether `lara serve` starts it for you.

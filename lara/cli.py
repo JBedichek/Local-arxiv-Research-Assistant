@@ -2044,12 +2044,18 @@ def serve(
             f"deliberately, set serving.auth.mode: off[/dim]"
         )
         raise typer.Exit(1)
-    if token:
+    # Only turn auth ON where this bind actually demands it. Keying off "a token exists"
+    # alone meant a token left in config.local.yaml — one `lara setup` writes — forced a
+    # login prompt on plain loopback, where the mode says none is needed. The token is a
+    # credential to use when required, not a switch that requires it.
+    if token and AUTH.require_token_for(host, cfg):
         os.environ["LARA_TOKEN"] = token          # the app builds its middleware from this
         console.print(f"[green]authentication on[/green] — open "
                       f"http://{host}:{port}/?token=<your token> once per browser")
-    elif not AUTH.is_loopback(host):
-        console.print("[yellow]serving without authentication[/yellow] (auth.mode: off)")
+    else:
+        os.environ.pop("LARA_TOKEN", None)         # a stale env var must not re-enable it
+        if not AUTH.is_loopback(host):
+            console.print("[yellow]serving without authentication[/yellow] (auth.mode: off)")
 
     gen = None
     if not no_llm and cfg.get_in("serving.generator.autostart", True):
