@@ -26,6 +26,9 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
+from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
+
 from lara.serve.generate import SYSTEM, stream_answer
 
 # ── the speed <-> accuracy spectrum ────────────────────────────────────────────────
@@ -433,3 +436,349 @@ def merge_parts(part_hits: list[tuple[str, list[dict]]], cap: int) -> list[dict]
             if len(merged) >= cap:
                 return merged
     return merged
+
+
+# ── the driver ────────────────────────────────────────────────────────────────────────
+#
+# What `/api/ask` actually runs. It lives here rather than inside the endpoint because it
+# is the agent loop -- rewrite, scope, decompose, decide, assess, answer -- and an SSE
+# generator is a poor place to keep three hundred lines of control flow: nothing in it can
+# be read, tested or reasoned about without a live HTTP connection. The endpoint is now
+# transport only, and this mirrors `synthesis.run_synthesis`: results are pushed through
+# `emit(name, payload)` as they happen, and the caller decides how to frame them.
+
+
+class AskRequest(BaseModel):
+    query: str
+    selection: str | None = None
+    paper: str | None = None
+    scope: str = "corpus"
+    hits: list[dict] | None = None       # reuse speculative retrieval; skip re-retrieving
+    model: str | None = None
+    temperature: float = 0.2
+    max_tokens: int = 1024
+    breadth: str | None = None           # instant | fast | balanced | thorough | exhaustive
+
+
+def vectors_for_chunks(s, chunk_ids: list[int]) -> list:
+    """Full-precision vectors for chunks a previous answer cited.
+
+    These become feedback vectors on the next retrieval — each runs its own dense search
+    and joins the rank fusion, so a follow-up starts from where the last answer landed
+    rather than from cold. Failure is silent: losing the seed degrades recall slightly,
+    while raising would fail the question outright.
+    """
+    if not chunk_ids:
+        return []
+    try:
+        from lara.serve.synthesis import vectors_for
+        vecs = vectors_for(s, chunk_ids)
+        return [vecs[c] for c in chunk_ids if c in vecs]
+    except Exception:
+        return []
+
+
+def capture_hit_dicts(s, query: str, hits: list[dict], source: str) -> None:
+    """Store what retrieval returned as training data. Never fails a user's question."""
+    try:
+        from lara.finetune import judgements as J
+        from lara.store import db
+
+        items = J.from_hits(query, hits, source=source)
+        if not items:
+            return
+        conn = db.connect(s.db_path)
+        try:
+            J.record(conn, items)
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+async def run_ask(s, cfg, req: AskRequest, *, emit) -> None:
+    """One grounded answer, start to finish, reporting progress through ``emit``.
+
+    Emits, in order: ``step`` throughout, ``hits`` whenever the excerpt set changes,
+    optionally ``clarify``, then ``coverage``, a run of ``token``, ``context``, ``perf``,
+    optionally ``grounding``, and finally ``done``. ``error`` replaces the tail if
+    anything raises.
+    """
+    import asyncio
+    import time
+
+    from lara.serve import thread as TH
+    from lara.serve.deps import memory_root
+
+    started = time.time()
+    breadth = resolve(req.breadth)
+
+    def step(kind: str, detail: str, **payload) -> None:
+        emit("step", {"kind": kind, "detail": detail, **payload})
+
+    # Every scope the UI offers must be honoured here. `neighbourhood` was accepted and
+    # silently treated as whole-corpus, so choosing it changed nothing and said nothing —
+    # /api/retrieve resolved it correctly, which made the two endpoints disagree about
+    # what the same request meant.
+    restrict = None
+    if req.scope == "paper" and req.paper:
+        restrict = [req.paper]
+    elif req.scope == "neighbourhood" and req.paper:
+        n = s.neighbours(req.paper)
+        restrict = [req.paper, *n["cites"], *n["cited_by"]]
+
+    # The thread is keyed by paper, so opening another one starts a fresh conversation.
+    root = memory_root()
+    turns = TH.turns_for(root, req.paper)
+    from lara.serve import memory as MEM
+    thread_summary = MEM.get_thread_summary(root, TH.thread_id(req.paper))
+    history = TH.history_block(turns, summary=thread_summary)
+    # Passages the last answers cited are strong candidates for a follow-up, and cost
+    # nothing to reuse: they were already retrieved and reranked.
+    seed_ids = TH.prior_chunk_ids(turns)
+    feedback = vectors_for_chunks(s, seed_ids) if seed_ids else []
+    search_query = {"q": req.query}
+
+    def run_search(query: str, k: int) -> list[dict]:
+        result = s.retriever.retrieve(
+            query, papers=restrict, selection=req.selection, final_k=k,
+            feedback=feedback,
+        )
+        return [h.to_dict() for h in result.hits]
+
+    cap = breadth.k * (breadth.max_rounds + 2)
+
+    try:
+        # Reference resolution happens BEFORE retrieval. "why is that?" embedded
+        # verbatim matches nothing; history in the answer prompt cannot repair a
+        # search that already fetched the wrong passages.
+        if turns:
+            rw = await TH.rewrite(cfg, req.query, turns, req.model, stream_answer)
+            if rw["rewritten"]:
+                search_query["q"] = rw["query"]
+                step("rewrite", rw["query"], original=req.query, why=rw["why"])
+
+        hits = req.hits
+
+        # Hierarchical scope: with a paper open and no scope pinned, start inside that
+        # paper and widen only if the model says the answer is not there. The dropdown
+        # still wins when the reader sets it — "this paper" and "citation
+        # neighbourhood" are instructions, not hints, and overriding them would make
+        # the control a lie.
+        hcfg = cfg.get_in("retrieval.hierarchy") or {}
+        use_walk = (hits is None and req.paper and req.scope == "corpus"
+                    and hcfg.get("enabled", True))
+        if use_walk:
+            from lara.serve import hierarchy as HR
+
+            walked = await HR.walk(
+                s, cfg, search_query["q"], req.paper,
+                selection=req.selection, final_k=breadth.k,
+                model=req.model, stream_answer=stream_answer,
+                on_step=lambda tier, note: step("scope", f"{tier}: {note}"),
+            )
+            if walked is not None and walked.hits:
+                hits = walked.hits
+                path = walked.path or "corpus"
+                kept = sum(len(d.kept) for d in walked.decisions if d.kind == "tag")
+                step("scope", f"searched {path} · {kept} passage(s) confirmed "
+                              f"in the paper", path=path)
+            else:
+                # The paper had nothing embedded, or the walk failed. Fall through to
+                # the flat search rather than answering from nothing.
+                use_walk = False
+
+        if hits is None:
+            # A compound question embeds to a single vector sitting BETWEEN its parts,
+            # retrieving well for none of them. Splitting first and searching each
+            # part is the fix; the parts run concurrently, so the extra cost is one
+            # decomposition call rather than N retrievals.
+            split = {"kind": "atomic", "parts": []}
+            if breadth.decompose:
+                split = await decompose(cfg, search_query["q"], req.model)
+
+            if split["parts"]:
+                step(
+                    "decompose",
+                    f"Split into {len(split['parts'])} parts: "
+                    + " | ".join(p[:48] for p in split["parts"]),
+                    # not `kind=`: that is step()'s own positional parameter
+                    parts=split["parts"], split_kind=split["kind"],
+                )
+                per_part = max(3, breadth.k // len(split["parts"]) + 2)
+                results = await asyncio.gather(*[
+                    run_in_threadpool(run_search, part, per_part)
+                    for part in split["parts"]
+                ])
+                hits = merge_parts(list(zip(split["parts"], results)), breadth.k * 2)
+            else:
+                step("search", f"Searching ({breadth.label})…")
+                hits = await run_in_threadpool(run_search, search_query["q"], breadth.k)
+        emit("hits", hits)
+        # The resolved query is what should retrieve these passages, so it is the
+        # honest training pair; the pronoun the reader typed is not.
+        capture_hit_dicts(s, search_query["q"], hits, "ask")
+
+        rounds = 0
+        while rounds < breadth.max_rounds:
+            if time.time() - started > breadth.budget_sec:
+                step("budget", "Time budget reached; answering with what I have.")
+                break
+            # A single round needs no controller turn: there is nothing yet to judge
+            # against, and the extra LLM call would double "instant" latency.
+            if breadth.max_rounds == 1:
+                break
+
+            step("decide", "Assessing whether the excerpts answer the question…")
+            verdict = await decide(cfg, search_query["q"], hits, breadth, rounds, req.model)
+            action = verdict.get("action", "answer")
+
+            if action == "clarify" and breadth.allow_clarify:
+                emit("clarify", {
+                    "question": verdict.get("question") or "Could you be more specific?",
+                    "options": verdict.get("options", [])[:4],
+                    "reason": verdict.get("reason", ""),
+                })
+                # Non-blocking by design: the reader still gets an answer from what we
+                # have, with the refinements offered alongside. A model that stops to
+                # ask a question and returns nothing is worse than one that guesses
+                # well and offers to narrow down.
+                break
+
+            if action == "expand" and breadth.expand_context:
+                ids = [int(i) for i in verdict.get("chunk_ids", [])[:6] if str(i).isdigit()]
+                step("expand", f"Reading around {len(ids)} excerpt(s) for context…")
+                extra = await run_in_threadpool(expand_chunks, s.conn(), ids)
+                hits, added = merge_hits(hits, extra, cap)
+                emit("hits", hits)
+                if added == 0:
+                    break
+                rounds += 1
+                continue
+
+            if action == "search":
+                queries = [q for q in verdict.get("queries", []) if isinstance(q, str)][:3]
+                if not queries:
+                    break
+                step("search", f"Searching again: {'; '.join(queries)[:110]}",
+                     queries=queries)
+                total_added = 0
+                for q in queries:
+                    more = await run_in_threadpool(run_search, q, breadth.k)
+                    hits, added = merge_hits(hits, more, cap)
+                    total_added += added
+                emit("hits", hits)
+                # No new evidence means another round would ask the same question of
+                # the same excerpts. Stop rather than spend the budget.
+                if total_added == 0:
+                    step("converged", "No new material found; answering.")
+                    break
+                rounds += 1
+                continue
+
+            break   # "answer"
+
+        # Coverage gate. Naming an insufficient result set explicitly is what stops
+        # the model quietly filling the gap from parametric memory, which is the most
+        # common way a RAG answer goes wrong while looking right.
+        step("assess", "Checking whether the excerpts answer the question…")
+        verdict = await assess(cfg, search_query["q"], hits, req.model)
+        coverage = verdict.get("coverage", "full")
+        emit("coverage", verdict)
+        label = {"full": "Answering", "partial": "Answering what is supported",
+                 "none": "Summarising what was found"}[coverage]
+        step("answer", f"{label} from {len(hits)} excerpts…",
+             rounds=rounds, coverage=coverage)
+
+        try:
+            custom_prompt = MEM.get_prompt(root)
+        except Exception:
+            custom_prompt = None
+
+        answer = ""
+        prompt_parts: list = []
+        usage: dict = {}
+        gen_started = time.time()
+        first_token_at = None
+        async for token in stream_answer(
+            # Deliberately req.query, not the rewrite: retrieval needed a
+            # self-contained query, but the answer must address the question the
+            # reader actually asked. History is in the prompt, so the model can
+            # resolve the reference itself.
+            cfg, req.query, hits, selection=req.selection, history=history,
+            model=req.model, temperature=req.temperature, max_tokens=req.max_tokens,
+            coverage=coverage, system=custom_prompt,
+            prompt_parts=prompt_parts, usage_out=usage,
+        ):
+            if first_token_at is None:
+                first_token_at = time.time()
+            answer += token
+            emit("token", token)
+
+        # Context accounting and throughput, both from the generator itself rather
+        # than estimated here — see generate.count_tokens.
+        try:
+            from lara.serve import generate as GEN
+
+            vcfg = cfg.get_in("serving.vllm") or {}
+            base_url = vcfg.get("base_url", "http://127.0.0.1:8000/v1")
+            model_name = req.model or vcfg.get("default_model") or ""
+            parts = list(prompt_parts)
+
+            counts = await GEN.count_tokens(base_url, model_name,
+                                            [t for _, t in parts]) if parts else None
+            limit = await GEN.context_limit(base_url, model_name) or int(
+                vcfg.get("max_model_len", 32768))
+            emit("context", {
+                "limit": limit,
+                "reserved": int(req.max_tokens),
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "exact": counts is not None,
+                "parts": [
+                    {"name": n, "chars": len(t),
+                     "tokens": (counts[i] if counts else round(len(t) / 4))}
+                    for i, (n, t) in enumerate(parts)
+                ],
+            })
+
+            done_at = time.time()
+            out_tokens = usage.get("completion_tokens")
+            gen_s = done_at - (first_token_at or gen_started)
+            emit("perf", {
+                "ttft_ms": round(((first_token_at or done_at) - gen_started) * 1000),
+                "completion_tokens": out_tokens,
+                "prompt_tokens": usage.get("prompt_tokens"),
+                # Measured from FIRST TOKEN, not from the request: including the
+                # prefill in a decode rate makes a long prompt look like a slow model.
+                "tok_per_sec": (round((out_tokens - 1) / gen_s, 1)
+                                if out_tokens and out_tokens > 1 and gen_s > 0 else None),
+                "generate_ms": round((done_at - gen_started) * 1000),
+            })
+        except Exception:
+            pass
+
+        try:
+            paper_title = next(
+                (h.get("paper_title", "") for h in hits
+                 if req.paper and h.get("arxiv_id") == req.paper), "")
+            MEM.record_question(
+                root, question=req.query, answer=answer,
+                arxiv_id=req.paper, title=paper_title,
+                scope=req.scope, selection=req.selection,
+            )
+        except Exception:
+            pass      # never lose a finished answer because the library write failed
+
+        # Post-hoc grounding check: score every cited sentence against the excerpt it
+        # actually cites. A citation marker makes a claim look verified, so an
+        # unsupported one is worse than none at all.
+        if answer.strip() and s.retriever.cross_encoder is not None:
+            checks = await run_in_threadpool(
+                check_grounding, s.retriever.cross_encoder, answer, hits
+            )
+            if checks:
+                emit("grounding", checks)
+    except Exception as exc:
+        emit("error", str(exc)[:300])
+    emit("done", {"elapsed_ms": round((time.time() - started) * 1000)})

@@ -13,6 +13,8 @@ property that decides whether anyone runs it.
 
 from __future__ import annotations
 
+import pathlib
+
 import numpy as np
 import pytest
 
@@ -376,3 +378,96 @@ def test_a_generator_error_returns_the_default_rather_than_raising(monkeypatch):
 def test_complete_returns_empty_string_on_error(monkeypatch):
     monkeypatch.setattr(GEN, "stream_answer", _fake_stream(exc=OSError("connrefused")))
     assert asyncio.run(GEN.complete(None, "p", system="s")) == ""
+
+
+# ── the SSE driver ────────────────────────────────────────────────────────────────
+#
+# Both streaming endpoints share one queue-and-drain helper, so the framing and the
+# disconnect semantics are worth pinning down. No server and no model: the driver is
+# handed a plain coroutine and the frames are collected from the generator directly.
+
+from lara.serve.routes.research import _sse
+
+
+def _drain(resp, stop_after=None):
+    """Collect SSE frames, optionally closing the connection partway through."""
+    async def go():
+        out = []
+        agen = resp.body_iterator
+        try:
+            async for frame in agen:
+                out.append(frame)
+                if stop_after is not None and len(out) >= stop_after:
+                    await agen.aclose()      # what a browser closing the tab looks like
+                    break
+        except asyncio.CancelledError:
+            pass
+        return out
+    return asyncio.run(go())
+
+
+def test_sse_frames_each_emitted_event():
+    async def run(emit, should_stop):
+        emit("step", {"kind": "search", "detail": "looking"})
+        emit("token", "hello")
+
+    frames = _drain(_sse(run, hard_stop=True))
+    assert frames == [
+        'event: step\ndata: {"kind": "search", "detail": "looking"}\n\n',
+        'event: token\ndata: "hello"\n\n',
+    ]
+
+
+def test_sse_reports_a_driver_exception_as_an_error_event():
+    async def run(emit, should_stop):
+        emit("step", {"kind": "search", "detail": "looking"})
+        raise RuntimeError("vLLM down")
+
+    frames = _drain(_sse(run, hard_stop=True))
+    assert frames[-1] == 'event: error\ndata: "vLLM down"\n\n'
+
+
+def test_sse_serialises_payloads_it_cannot_json_encode():
+    # default=str, because an answer's payload can carry a Path or a datetime and losing
+    # the whole stream over one unserialisable field is the wrong trade.
+    async def run(emit, should_stop):
+        emit("done", {"where": pathlib.Path("/tmp/x")})
+
+    assert _drain(_sse(run, hard_stop=True)) == ['event: done\ndata: {"where": "/tmp/x"}\n\n']
+
+
+def test_hard_stop_cancels_the_driver_when_the_client_disconnects():
+    """/api/ask: nobody is reading the tokens, so the GPU should stop making them."""
+    reached_end = {"v": False}
+
+    async def run(emit, should_stop):
+        emit("token", "a")
+        await asyncio.sleep(0.05)
+        reached_end["v"] = True
+        emit("token", "b")
+
+    frames = _drain(_sse(run, hard_stop=True), stop_after=1)
+    assert frames == ['event: token\ndata: "a"\n\n']
+    assert not reached_end["v"]
+
+
+def test_soft_stop_asks_the_driver_to_wind_down_instead_of_killing_it():
+    """/api/synthesize: minutes of retrieval get saved, so it consolidates rather than dies."""
+    saw = {}
+
+    async def run(emit, should_stop):
+        emit("round", 1)
+        await asyncio.sleep(0.05)
+        saw["stop"] = should_stop()          # observed the disconnect, still running
+
+    async def go():
+        resp = _sse(run, hard_stop=False)
+        agen = resp.body_iterator
+        first = await agen.__anext__()
+        await agen.aclose()
+        await asyncio.sleep(0.1)             # let the driver finish on its own terms
+        return first
+
+    first = asyncio.run(go())
+    assert first == 'event: round\ndata: 1\n\n'
+    assert saw["stop"] is True
