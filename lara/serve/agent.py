@@ -166,6 +166,8 @@ def expand_chunks(conn, chunk_ids: list[int], before: int = 2, after: int = 1,
     usual failure is a chunk that refers backwards ("this shows that...", "the above
     bound").
     """
+    from lara.index import search as S
+
     if not chunk_ids:
         return []
     out: list[dict] = []

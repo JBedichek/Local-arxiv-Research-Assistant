@@ -471,3 +471,57 @@ def test_soft_stop_asks_the_driver_to_wind_down_instead_of_killing_it():
     first = asyncio.run(go())
     assert first == 'event: round\ndata: 1\n\n'
     assert saw["stop"] is True
+
+
+# ── context expansion ─────────────────────────────────────────────────────────────
+#
+# expand_chunks is pure SQL plus a URL builder, so it runs against an in-memory database
+# with no index, no model and no server. Added because it silently referenced an
+# unimported module: every "expand_context" round raised NameError at the first row it
+# built, and nothing here exercised the path.
+
+import sqlite3
+
+import lara.serve.agent as AG
+
+
+def _corpus():
+    c = sqlite3.connect(":memory:")
+    c.row_factory = sqlite3.Row
+    c.executescript("""
+        CREATE TABLE papers (arxiv_id TEXT, title TEXT);
+        CREATE TABLE sections (arxiv_id TEXT, version INT, anchor TEXT, title TEXT);
+        CREATE TABLE chunks (chunk_id INT, arxiv_id TEXT, version INT, ordinal INT,
+                             section_anchor TEXT, anchor_start TEXT, char_start INT,
+                             anchor_end TEXT, char_end INT, kind TEXT, text TEXT);
+        INSERT INTO papers VALUES ('2401.00001', 'A Paper');
+        INSERT INTO sections VALUES ('2401.00001', 2, 'S3', 'Method');
+    """)
+    for i in range(6):
+        c.execute("INSERT INTO chunks VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                  (100 + i, '2401.00001', 2, i, 'S3', 'S3', i * 10, 'S3', i * 10 + 9,
+                   'text', f'chunk {i}'))
+    return c
+
+
+def test_expand_chunks_reads_more_before_than_after():
+    out = AG.expand_chunks(_corpus(), [103], before=2, after=1)
+    assert [o["chunk_id"] for o in out] == [101, 102, 103, 104]
+    assert all(o["via"] == "context" for o in out)
+
+
+def test_expand_chunks_builds_a_citation_url():
+    # The regression: this line called an unimported module.
+    out = AG.expand_chunks(_corpus(), [103], before=0, after=0)
+    assert out[0]["url"] == "/p/2401.00001v2#S3:30-39"
+
+
+def test_expand_chunks_prefers_the_section_title_over_its_anchor():
+    out = AG.expand_chunks(_corpus(), [103], before=0, after=0)
+    assert out[0]["section"] == "Method"
+
+
+def test_expand_chunks_never_returns_the_same_chunk_twice():
+    out = AG.expand_chunks(_corpus(), [102, 103], before=2, after=1)
+    ids = [o["chunk_id"] for o in out]
+    assert len(ids) == len(set(ids))
