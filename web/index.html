@@ -25,6 +25,7 @@
   </label>
   <label>model <select id="model"><option value="">(loading)</option></select></label>
   <label>quant <select id="quant"></select></label>
+  <button type="button" id="deep-btn" title="Iterative corpus-wide research (minutes)">Deep Automated Research</button>
   <button type="button" id="adv-btn" title="Advanced settings">⚙</button>
   <div id="dl-modal" hidden>
     <div class="dl-box">
@@ -136,6 +137,41 @@
   </label>
   <span id="status" class="status"></span>
 </header>
+
+<section id="deep" hidden>
+  <header id="deep-bar">
+    <h2>Deep Automated Research</h2>
+    <form id="deep-form">
+      <input id="deep-q" type="text" spellcheck="false" autocomplete="off"
+             placeholder="e.g. What is the most sample-efficient Muon-based optimizer in the literature?">
+      <button type="submit" id="deep-go">Research</button>
+      <button type="button" id="deep-stop" hidden>Stop</button>
+    </form>
+    <span id="deep-status" class="status"></span>
+    <select id="deep-history" title="Past runs"><option value="">past runs…</option></select>
+    <button type="button" id="deep-close" title="Back to the reader">close</button>
+  </header>
+
+  <div id="deep-body">
+    <section id="deep-left">
+      <h3>Retrieval <small id="deep-rounds"></small></h3>
+      <div id="deep-graph"></div>
+    </section>
+    <div class="splitter" id="split-deep" title="Drag to resize"></div>
+    <section id="deep-right">
+      <div id="deep-answers">
+        <details id="deep-tldr-box" open>
+          <summary>TLDR <small>the minimum complete answer</small></summary>
+          <div id="deep-tldr" class="deep-answer"></div>
+        </details>
+        <details id="deep-thorough-box" open>
+          <summary>Thorough <small>everything found, organised</small></summary>
+          <div id="deep-thorough" class="deep-answer"></div>
+        </details>
+      </div>
+    </section>
+  </div>
+</section>
 
 <main>
   <section id="library-pane">

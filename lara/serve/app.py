@@ -1426,6 +1426,86 @@ class AskRequest(BaseModel):
     breadth: str | None = None           # instant | fast | balanced | thorough | exhaustive
 
 
+class SynthRequest(BaseModel):
+    question: str
+    model: str | None = None
+
+
+@app.post("/api/synthesize")
+async def synthesize(req: SynthRequest) -> StreamingResponse:
+    """Deep automated research, streamed as it happens.
+
+    Runs for minutes rather than seconds, so every intermediate result is emitted the
+    moment it exists: a run whose progress is invisible is indistinguishable from one that
+    has hung, and the user is being asked to wait on faith otherwise.
+    """
+    s = _state()
+    assert s.retriever is not None
+
+    import asyncio
+
+    from lara.serve import synthesis as SY
+    from lara.serve.generate import stream_answer
+
+    queue: asyncio.Queue = asyncio.Queue()
+    cancelled = {"v": False}
+
+    def emit(name: str, payload) -> None:
+        queue.put_nowait((name, payload))
+
+    async def driver() -> None:
+        try:
+            await SY.run_synthesis(
+                s, s.cfg, req.question, model=req.model, stream_answer=stream_answer,
+                emit=emit, should_stop=lambda: cancelled["v"],
+            )
+        except Exception as exc:
+            emit("error", str(exc)[:400])
+        finally:
+            queue.put_nowait((None, None))
+
+    async def events():
+        task = asyncio.create_task(driver())
+        try:
+            while True:
+                name, payload = await queue.get()
+                if name is None:
+                    break
+                yield f"event: {name}\ndata: {json.dumps(payload, default=str)}\n\n"
+        except asyncio.CancelledError:
+            # The browser closed the connection. Let the run wind down and consolidate
+            # what it has rather than abandoning minutes of retrieval mid-flight.
+            cancelled["v"] = True
+            raise
+        finally:
+            if not task.done():
+                cancelled["v"] = True
+
+    return StreamingResponse(
+        events(), media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.get("/api/synthesis/runs")
+def synthesis_runs(limit: int = 50) -> JSONResponse:
+    """Past runs, newest first."""
+    from lara.serve import synthesis as SY
+
+    return JSONResponse({"runs": SY.list_runs(_state().conn(), limit)})
+
+
+@app.get("/api/synthesis/run/{run_id}")
+def synthesis_run(run_id: str) -> JSONResponse:
+    """One saved run in full: rounds, claims and both answers."""
+    from lara.serve import synthesis as SY
+
+    d = SY.load_run(_state().conn(), run_id)
+    if d is None:
+        raise HTTPException(404, f"no synthesis run {run_id}")
+    return JSONResponse(d)
+
+
 @app.post("/api/ask")
 async def ask(req: AskRequest) -> StreamingResponse:
     """Stream a grounded answer over SSE.

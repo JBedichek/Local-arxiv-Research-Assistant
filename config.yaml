@@ -140,6 +140,19 @@ retrieval:
     allow_neighbourhood: true
     allow_corpus: true
 
+  # Deep automated research: iterative retrieval, structured extraction, consolidation.
+  # No round cap — a run ends when consecutive rounds stop finding anything new, or when
+  # the model reports no remaining gap. Minutes, not seconds; cancellable from the UI.
+  synthesis:
+    per_round: 12            # excerpts read per round
+    over_fetch: 4            # retrieve this many times per_round, then drop seen + diversify
+    cap_per_paper: 3         # so one long on-topic paper cannot fill a round
+    dry_rounds: 2            # consecutive rounds with nothing new before stopping
+    min_rounds: 4            # the model's stop vote is ignored below this depth
+    stop_votes: 2            # consecutive stop votes needed to end a run
+    max_feedback_vectors: 6
+    expand_every: 2          # every Nth round walks the citation graph instead of dense
+
 index:
   # Tier-1 search backend. `lara bench-index` measures these on your machine and
   # `lara setup` writes the answer into config.local.yaml.

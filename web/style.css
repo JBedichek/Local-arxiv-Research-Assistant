@@ -550,3 +550,80 @@ label.adv select { flex: 1 1 100%; }
 label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px; }
 #advanced h4 { margin-top: 4px; }
 #advanced h4:first-child { margin-top: 0; }
+
+/* ── Deep Automated Research ─────────────────────────────────────────────────
+   A full-window takeover rather than a fourth pane. A run lasts minutes and its
+   intermediate results are the point, so it needs the whole surface; squeezing a
+   growing evidence graph into a sidebar would make the part worth watching the
+   part you cannot read. */
+#deep {
+  position: fixed; inset: 0; z-index: 40;
+  display: flex; flex-direction: column;
+  background: var(--bg); color: var(--fg);
+}
+#deep-bar {
+  display: flex; align-items: center; gap: .6rem;
+  padding: .5rem .8rem; border-bottom: 1px solid var(--rule);
+  background: var(--bg-raised, var(--bg)); flex: 0 0 auto; flex-wrap: wrap;
+}
+#deep-bar h2 { font-size: 1rem; margin: 0; white-space: nowrap; }
+#deep-form { display: flex; gap: .4rem; flex: 1 1 26rem; min-width: 16rem; }
+#deep-q { flex: 1 1 auto; min-width: 0; }
+#deep-body { flex: 1 1 auto; display: flex; min-height: 0; }
+#deep-left  { flex: 1 1 55%; overflow: auto; padding: .7rem 1rem; min-width: 0; }
+#deep-right { flex: 1 1 45%; overflow: auto; padding: .7rem 1.1rem; min-width: 0;
+              border-left: 1px solid var(--rule); }
+#deep-left h3 { margin: 0 0 .5rem; font-size: .85rem; text-transform: uppercase;
+                letter-spacing: .06em; opacity: .75; }
+#deep-left h3 small { text-transform: none; letter-spacing: 0; opacity: .8; }
+
+/* One round = one collapsible group. Open while it is the newest, collapsed after,
+   so a long run stays readable without hiding what is happening now. */
+.deep-round { border: 1px solid var(--rule); border-radius: 6px; margin-bottom: .55rem; }
+.deep-round > summary {
+  cursor: pointer; padding: .45rem .6rem; font-size: .88rem;
+  display: flex; gap: .5rem; align-items: baseline; flex-wrap: wrap;
+}
+.deep-round > summary::-webkit-details-marker { color: var(--muted); }
+.deep-round .rq { opacity: .72; font-style: italic; }
+.deep-round .tag {
+  font-size: .72rem; padding: .05rem .4rem; border-radius: 999px;
+  border: 1px solid var(--rule); opacity: .85; white-space: nowrap;
+}
+.deep-round .tag.cit { border-color: var(--accent, #6a9); }
+.deep-claims { padding: .1rem .6rem .55rem; display: flex; flex-direction: column; gap: .3rem; }
+
+/* Each confirmed chunk: the model's own name for it, then the compressed claim, then
+   whatever it measured. The name is what makes a 60-claim run scannable. */
+.deep-claim { border-left: 2px solid var(--rule); padding: .18rem 0 .18rem .55rem; }
+.deep-claim a.cname { font-weight: 600; text-decoration: none; }
+.deep-claim a.cname:hover { text-decoration: underline; }
+.deep-claim .cpaper { opacity: .6; font-size: .78rem; margin-left: .35rem; }
+.deep-claim .cclaim { display: block; font-size: .87rem; opacity: .92; margin-top: .1rem; }
+.deep-claim .cmeas {
+  display: inline-block; margin-top: .15rem; font-size: .78rem;
+  padding: .05rem .35rem; border-radius: 4px;
+  background: var(--hl, rgba(127,127,127,.14));
+}
+.deep-claim .ccond { opacity: .6; font-size: .76rem; margin-left: .3rem; }
+.deep-note { font-size: .82rem; opacity: .7; padding: .1rem .6rem .5rem; }
+.deep-gap { font-size: .82rem; padding: .3rem .6rem .5rem; opacity: .85; }
+.deep-gap b { font-weight: 600; }
+
+#deep-answers > details { border-bottom: 1px solid var(--rule); padding-bottom: .6rem;
+                          margin-bottom: .8rem; }
+#deep-answers > details > summary {
+  cursor: pointer; font-size: .85rem; text-transform: uppercase;
+  letter-spacing: .06em; opacity: .8; padding: .2rem 0;
+}
+#deep-answers > details > summary small { text-transform: none; letter-spacing: 0; opacity: .7; }
+.deep-answer { padding-top: .4rem; line-height: 1.62; }
+.deep-answer h2, .deep-answer h3 { margin: 1rem 0 .35rem; font-size: 1rem; }
+.deep-answer p { margin: .5rem 0; }
+.deep-answer a.cite {
+  font-size: .78em; vertical-align: super; text-decoration: none;
+  padding: 0 .12em; opacity: .85;
+}
+#deep-tldr { font-size: 1.02em; }
+@media (max-width: 900px) { #deep-body { flex-direction: column; }
+                            #deep-right { border-left: 0; border-top: 1px solid var(--rule); } }
