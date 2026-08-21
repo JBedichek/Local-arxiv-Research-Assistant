@@ -87,16 +87,70 @@ class Cycle:
     n_negative: int = 0
 
 
+#: How many candidate ids to draw per row wanted. The filters (kind, length, embedded)
+#: reject most rows, so over-drawing avoids a second round trip in the common case.
+_ID_OVERDRAW = 12
+
+
+def _random_ids(conn: sqlite3.Connection, n: int, rng: random.Random) -> list[int]:
+    """Random chunk_ids by range sampling, not by sorting the table.
+
+    ``ORDER BY RANDOM()`` assigns a random key to every row and sorts: over 28.7 M chunks
+    that is a full scan costing **16.2 seconds**, measured. ``mine_negatives`` called it
+    once per cycle, so a 300-question harvest spent roughly 81 of its 120 minutes
+    generating random numbers.
+
+    ``chunk_id`` is INTEGER PRIMARY KEY, so it is the rowid and lookups by it are a
+    B-tree seek. Drawing ids uniformly from ``[min, max]`` and fetching those is
+    microseconds. Deleted or filtered rows make the draw slightly non-uniform across
+    gaps, which does not matter for sampling distractors.
+    """
+    lo, hi = _id_range(conn)
+    if lo is None:
+        return []
+    return [rng.randint(lo, hi) for _ in range(n)]
+
+
+_ID_RANGE_CACHE: dict[int, tuple[int | None, int | None]] = {}
+
+
+def _id_range(conn: sqlite3.Connection) -> tuple[int | None, int | None]:
+    """min and max chunk_id, as two statements and cached.
+
+    SQLite rewrites a lone ``MIN(x)`` or ``MAX(x)`` over an indexed column into a B-tree
+    endpoint seek, but **asking for both in one SELECT defeats that** and it scans the
+    whole table instead: 1,563 ms here against 0.02 ms for the two split statements. The
+    id range also does not move during a harvest, so it is read once.
+    """
+    key = id(conn)
+    if key not in _ID_RANGE_CACHE:
+        lo = conn.execute("SELECT MIN(chunk_id) FROM chunks").fetchone()[0]
+        hi = conn.execute("SELECT MAX(chunk_id) FROM chunks").fetchone()[0]
+        _ID_RANGE_CACHE[key] = (lo, hi)
+    return _ID_RANGE_CACHE[key]
+
+
 def sample_chunks(conn: sqlite3.Connection, n: int, seed: int = 0) -> list[sqlite3.Row]:
     """Body chunks long enough to support a question, spread across papers."""
-    return conn.execute(
-        """SELECT c.chunk_id, c.arxiv_id, c.text
-           FROM chunks c
-           WHERE c.kind='body' AND length(c.text) BETWEEN 600 AND 1500
-             AND c.vector_row IS NOT NULL
-           ORDER BY RANDOM() LIMIT ?""",
-        (n,),
-    ).fetchall()
+    rng = random.Random(seed)
+    out: list[sqlite3.Row] = []
+    seen: set[int] = set()
+    for _ in range(6):                       # bounded retries; each is a cheap seek
+        ids = [i for i in _random_ids(conn, n * _ID_OVERDRAW, rng) if i not in seen]
+        if not ids:
+            break
+        seen.update(ids)
+        ph = ",".join("?" * len(ids))
+        out += conn.execute(
+            f"""SELECT c.chunk_id, c.arxiv_id, c.text
+                FROM chunks c
+                WHERE c.chunk_id IN ({ph})
+                  AND c.kind='body' AND length(c.text) BETWEEN 600 AND 1500
+                  AND c.vector_row IS NOT NULL""", ids).fetchall()
+        if len(out) >= n:
+            break
+    rng.shuffle(out)
+    return out[:n]
 
 
 def sample_chunks_by_topic(conn: sqlite3.Connection, retriever, topics: list[str],
@@ -179,13 +233,20 @@ def mine_negatives(conn: sqlite3.Connection, retrieved_ids: list[int],
     """Random chunks as easy negatives, anchoring the low end of the scale."""
     if n_random <= 0:
         return []
-    rows = conn.execute(
-        "SELECT chunk_id FROM chunks WHERE kind='body' AND length(text) > 400 "
-        "AND vector_row IS NOT NULL ORDER BY RANDOM() LIMIT ?",
-        (n_random * 2,),
-    ).fetchall()
     seen = set(retrieved_ids)
-    return [r[0] for r in rows if r[0] not in seen][:n_random]
+    picked: list[int] = []
+    for _ in range(4):
+        ids = _random_ids(conn, n_random * _ID_OVERDRAW, rng)
+        if not ids:
+            break
+        ph = ",".join("?" * len(ids))
+        rows = conn.execute(
+            f"SELECT chunk_id FROM chunks WHERE chunk_id IN ({ph}) AND kind='body' "
+            f"AND length(text) > 400 AND vector_row IS NOT NULL", ids).fetchall()
+        picked += [r[0] for r in rows if r[0] not in seen and r[0] not in picked]
+        if len(picked) >= n_random:
+            break
+    return picked[:n_random]
 
 
 def score_pairs(cross_encoder, query: str, texts: list[str], batch: int = 32) -> list[float]:
@@ -198,25 +259,21 @@ def score_pairs(cross_encoder, query: str, texts: list[str], batch: int = 32) ->
 
 async def run_cycles(cfg, conn, retriever, cross_encoder, *, n: int = 50,
                      k: int = 20, n_random_neg: int = 6, model: str | None = None,
-                     seed: int = 0, topics: list[str] | None = None, progress=None) -> dict:
+                     seed: int = 0, topics: list[str] | None = None,
+                     gen_concurrency: int = 32, progress=None) -> dict:
     """Generate questions, retrieve, judge, and store. Returns a summary."""
     from lara.finetune import judgements as J
     from lara.serve.generate import stream_answer
 
+    import asyncio
+
     rng = random.Random(seed)
     rows = (sample_chunks_by_topic(conn, retriever, topics, n * 2, seed)
             if topics else sample_chunks(conn, n * 2, seed))
-    stats = {"cycles": 0, "questions": 0, "rejected": 0, "stored": 0,
-             "source_missed": 0, "positives": 0, "negatives": 0, "styles": {}}
-    cycles: list[Cycle] = []
 
-    for row in rows:
-        if stats["questions"] >= n:
-            break
-        # Round-robin, not random choice: sampling uniformly at random leaves some
-        # styles under-represented in a short run, and query-TYPE diversity matters more
-        # to the trained model than the number of examples.
-        style, instruction = QUESTION_STYLES[stats["questions"] % len(QUESTION_STYLES)]
+    async def ask_one(row, i: int):
+        """One question from one passage. Independent of every other, so they can overlap."""
+        style, instruction = QUESTION_STYLES[i % len(QUESTION_STYLES)]
         buf = ""
         try:
             async for tok in stream_answer(
@@ -226,61 +283,98 @@ async def run_cycles(cfg, conn, retriever, cross_encoder, *, n: int = 50,
             ):
                 buf += tok
         except Exception:
-            continue
+            return row, style, None
+        return row, style, clean_question(buf)
 
-        q = clean_question(buf)
-        if not q:
-            stats["rejected"] += 1
-            continue
-        stats["questions"] += 1
-        stats["styles"][style] = stats["styles"].get(style, 0) + 1
+    async def generate_batch(batch, start_i: int):
+        """Generate a whole batch of questions at once.
 
-        result = retriever.retrieve(q, final_k=k)
-        hits = result.hits
-        ids = [h.chunk_id for h in hits]
+        vLLM serves `max_num_seqs` sequences concurrently — 64 here — and the loop issued
+        one request at a time, so 63/64 of the server sat idle while a 80-token completion
+        trickled back. Question generation is embarrassingly parallel: each passage is
+        independent, and nothing downstream depends on the order they finish in.
 
-        cyc = Cycle(question=q, style=style, source_chunk=row["chunk_id"],
-                    source_paper=row["arxiv_id"], retrieved=ids)
-        cyc.source_rank = ids.index(row["chunk_id"]) + 1 if row["chunk_id"] in ids else None
-        if cyc.source_rank is None:
-            stats["source_missed"] += 1
+        Retrieval and judging stay sequential on purpose. They contend for the same GPUs
+        as the embedder and the cross-encoder, so overlapping them buys nothing and makes
+        memory harder to reason about.
+        """
+        sem = asyncio.Semaphore(gen_concurrency)
 
-        items = J.from_hits(q, [
-            {"chunk_id": h.chunk_id, "score": h.score, "provenance": h.provenance}
-            for h in hits
-        ], source="explore")
+        async def guarded(row, i):
+            async with sem:
+                return await ask_one(row, i)
 
-        # The source chunk is a known positive by construction. When retrieval missed it,
-        # that is the example worth having: a relevance the embedder cannot currently see.
-        if cyc.source_rank is None:
-            items.append(J.Judgement(query=q, chunk_id=row["chunk_id"], score=1.0,
-                                     label=1, teacher="synthetic", rank=None,
-                                     source="explore_missed"))
+        return await asyncio.gather(*(guarded(r, start_i + j)
+                                      for j, r in enumerate(batch)))
+    stats = {"cycles": 0, "questions": 0, "rejected": 0, "stored": 0,
+             "source_missed": 0, "positives": 0, "negatives": 0, "styles": {}}
+    cycles: list[Cycle] = []
 
-        # Easy negatives, scored honestly rather than assumed — a random chunk is usually
-        # irrelevant but occasionally is not, and labelling it 0 regardless would inject
-        # noise into exactly the pairs meant to anchor the scale.
-        neg_ids = mine_negatives(conn, ids, n_random_neg, rng)
-        if neg_ids:
-            ph = ",".join("?" * len(neg_ids))
-            neg_rows = conn.execute(
-                f"SELECT chunk_id, text FROM chunks WHERE chunk_id IN ({ph})", neg_ids
-            ).fetchall()
-            scores = score_pairs(cross_encoder, q, [r["text"] for r in neg_rows])
-            for r, sc in zip(neg_rows, scores):
-                items.append(J.Judgement(query=q, chunk_id=r["chunk_id"], score=sc,
-                                         label=1 if sc >= 0.5 else 0,
-                                         teacher="cross_encoder", rank=None,
-                                         source="explore_random"))
+    # Generate in waves, then judge each wave sequentially. Styles are assigned by row
+    # index rather than by accepted-question count, because with concurrent generation the
+    # acceptance order is nondeterministic and counting would make the round-robin uneven.
+    pending: list = []
+    for wave_start in range(0, len(rows), gen_concurrency):
+        if stats["questions"] >= n:
+            break
+        wave = rows[wave_start:wave_start + gen_concurrency]
+        pending = await generate_batch(wave, wave_start)
 
-        stats["stored"] += J.record(conn, items)
-        stats["positives"] += sum(1 for i in items if i.label == 1)
-        stats["negatives"] += sum(1 for i in items if i.label == 0)
-        stats["cycles"] += 1
-        cycles.append(cyc)
-        if progress is not None:
-            progress.send({**stats, "last_q": q, "style": style,
-                           "source_rank": cyc.source_rank})
+        for row, style, q in pending:
+            if stats["questions"] >= n:
+                break
+            if not q:
+                stats["rejected"] += 1
+                continue
+            stats["questions"] += 1
+            stats["styles"][style] = stats["styles"].get(style, 0) + 1
+
+            result = retriever.retrieve(q, final_k=k)
+            hits = result.hits
+            ids = [h.chunk_id for h in hits]
+
+            cyc = Cycle(question=q, style=style, source_chunk=row["chunk_id"],
+                        source_paper=row["arxiv_id"], retrieved=ids)
+            cyc.source_rank = ids.index(row["chunk_id"]) + 1 if row["chunk_id"] in ids else None
+            if cyc.source_rank is None:
+                stats["source_missed"] += 1
+
+            items = J.from_hits(q, [
+                {"chunk_id": h.chunk_id, "score": h.score, "provenance": h.provenance}
+                for h in hits
+            ], source="explore")
+
+            # The source chunk is a known positive by construction. When retrieval missed it,
+            # that is the example worth having: a relevance the embedder cannot currently see.
+            if cyc.source_rank is None:
+                items.append(J.Judgement(query=q, chunk_id=row["chunk_id"], score=1.0,
+                                         label=1, teacher="synthetic", rank=None,
+                                         source="explore_missed"))
+
+            # Easy negatives, scored honestly rather than assumed — a random chunk is usually
+            # irrelevant but occasionally is not, and labelling it 0 regardless would inject
+            # noise into exactly the pairs meant to anchor the scale.
+            neg_ids = mine_negatives(conn, ids, n_random_neg, rng)
+            if neg_ids:
+                ph = ",".join("?" * len(neg_ids))
+                neg_rows = conn.execute(
+                    f"SELECT chunk_id, text FROM chunks WHERE chunk_id IN ({ph})", neg_ids
+                ).fetchall()
+                scores = score_pairs(cross_encoder, q, [r["text"] for r in neg_rows])
+                for r, sc in zip(neg_rows, scores):
+                    items.append(J.Judgement(query=q, chunk_id=r["chunk_id"], score=sc,
+                                             label=1 if sc >= 0.5 else 0,
+                                             teacher="cross_encoder", rank=None,
+                                             source="explore_random"))
+
+            stats["stored"] += J.record(conn, items)
+            stats["positives"] += sum(1 for i in items if i.label == 1)
+            stats["negatives"] += sum(1 for i in items if i.label == 0)
+            stats["cycles"] += 1
+            cycles.append(cyc)
+            if progress is not None:
+                progress.send({**stats, "last_q": q, "style": style,
+                               "source_rank": cyc.source_rank})
 
     found = [c.source_rank for c in cycles if c.source_rank]
     stats["source_recall"] = round(len(found) / max(len(cycles), 1), 3)

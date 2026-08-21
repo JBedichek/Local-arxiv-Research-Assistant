@@ -438,6 +438,8 @@ def explore(
     device: str = typer.Option(None, help="Override device; default auto-detects"),
     seed: int = typer.Option(0),
     topics: str = typer.Option(None, help="Semicolon-separated topics to focus sampling on"),
+    concurrency: int = typer.Option(
+        32, help="Question generations in flight at once; vLLM serves max_num_seqs=64"),
 ) -> None:
     """Generate questions, retrieve, and judge — harvesting training pairs.
 
@@ -490,7 +492,8 @@ def explore(
     if topic_list:
         console.print(f"focusing on {len(topic_list)} topics: " + ", ".join(topic_list))
     stats = asyncio.run(EX.run_cycles(cfg, conn, retr, ce, n=n, k=k, seed=seed,
-                                      topics=topic_list or None, progress=p))
+                                      topics=topic_list or None,
+                                      gen_concurrency=concurrency, progress=p))
     console.print(
         f"\n[green]{stats['cycles']} cycles[/green] · {stats['stored']:,} new judgements "
         f"({stats['positives']} pos / {stats['negatives']} neg) · "
