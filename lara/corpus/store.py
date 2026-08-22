@@ -43,6 +43,15 @@ DEFAULT_TEXT_BUDGET = 512 << 20      # 512 MB of text, roughly 100 M words
 MIN_FREE_BYTES = 5 << 30
 
 
+def human(n: float) -> str:
+    """Bytes as something a person reads without counting digits."""
+    for unit, scale in (("TB", 1 << 40), ("GB", 1 << 30), ("MB", 1 << 20),
+                        ("kB", 1 << 10)):
+        if n >= scale:
+            return f"{n / scale:.1f} {unit}"
+    return f"{int(n)} B"
+
+
 def slugify(name: str) -> str:
     """A directory name that is safe, lowercase and recognisable as what the user typed."""
     slug = SAFE_NAME.sub("-", name.strip().lower()).strip("-.")

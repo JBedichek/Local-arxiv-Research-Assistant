@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import typer
 from rich.table import Table
 
@@ -17,6 +19,7 @@ def search(
     no_rerank: bool = typer.Option(False, "--no-rerank", help="Skip the cross-encoder"),
     no_bm25: bool = typer.Option(False, "--no-bm25", help="Dense only"),
     paper: str = typer.Option(None, help="Restrict to one arXiv id"),
+    corpus: str = typer.Option(None, help="Search a `lara kb` corpus instead of arXiv"),
     device: str = typer.Option(None, help="Override device; default auto-detects"),
 ) -> None:
     """Retrieve chunks for a query and show anchored citations with timings."""
@@ -28,9 +31,28 @@ def search(
 
     cfg = config_mod.load(config)
     ecfg, icfg = cfg.get_in("embedding"), cfg.get_in("index")
-    conn = db.connect(cfg.get_path("paths.metadata_db"))
+
+    # A built corpus exposes `papers` and `sections` as views over its own tables, so the
+    # retriever below does not know or care which kind it was handed. See the schema note
+    # in lara/corpus/build.py.
+    if corpus:
+        from lara.corpus import build as C
+        from lara.corpus.store import Registry
+
+        c = Registry(Path(cfg.get_in("paths")["corpora"])).get(corpus)
+        if not c.built:
+            console.print(f"[red]{corpus} is not built[/red] — "
+                          f"run [bold]lara kb build {corpus}[/bold]")
+            raise typer.Exit(1)
+        conn = C.connect(c.db_path)
+        db_paths = (c.fp16_path, c.int8_path)
+    else:
+        conn = db.connect(cfg.get_path("paths.metadata_db"))
+        db_paths = (cfg.get_path("paths.vectors_fp16"),
+                    cfg.get_path("paths.vectors_int8"))
+
     store = VectorStore(
-        cfg.get_path("paths.vectors_fp16"), cfg.get_path("paths.vectors_int8"),
+        *db_paths,
         dim_full=int(ecfg["dim_full"]), dim_trunc=int(ecfg["dim_truncated"]),
     )
     edev = ldev.resolve(device) if device else ldev.first(ecfg.get("devices"))

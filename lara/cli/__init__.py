@@ -19,6 +19,7 @@ from lara.cli._base import app, console
 # silently reorder the help.
 from lara.cli import setup      # noqa: F401 — imported for its command registrations
 from lara.cli import corpus     # noqa: F401
+from lara.cli import kb         # noqa: F401
 from lara.cli import search     # noqa: F401
 from lara.cli import finetune   # noqa: F401
 from lara.cli import serve      # noqa: F401
