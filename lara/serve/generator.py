@@ -60,10 +60,21 @@ def choose(accelerator: str, requested: str | None = None) -> Backend:
         return BACKENDS.get(requested, BACKENDS["external"])
 
     if accelerator == "mps":
-        # MLX first: it targets Apple Silicon directly and is usually the fastest here.
-        # Ollama before llama.cpp because on a Mac it is far more often already installed,
-        # and it is llama.cpp underneath anyway.
-        order = ("mlx", "ollama", "llamacpp")
+        # llama.cpp first. It is the most mature of the three, it reads GGUF -- the format
+        # most local models are actually published in -- and it is what lara/serve/devices.py
+        # has always advised on this hardware. Ranking MLX ahead of it contradicted that
+        # advice, so the same machine was told two different things depending on which
+        # module you asked.
+        #
+        # MLX stays as the fallback rather than the default, and the ordering is
+        # deliberate in both directions: MLX is often faster, but it arrives automatically
+        # with `pip install -e '.[mac]'` while llama.cpp is a brew binary the user has to
+        # install on purpose. Defaulting to the thing that installs itself is how the
+        # default stopped matching the documentation. Preferring llama.cpp and falling
+        # back to MLX means a pip-only install still generates instead of finding nothing
+        # available. Ollama sits between them for the reason it always did: on a Mac it is
+        # far more often already running, and it is llama.cpp underneath anyway.
+        order = ("llamacpp", "ollama", "mlx")
     elif accelerator in ("cuda", "rocm"):
         order = ("vllm", "llamacpp", "ollama")
     else:
@@ -84,10 +95,11 @@ def resolve_backend(cfg, accelerator: str, hf_home=None) -> str:
 
     :func:`choose` ranks by platform fit and installation, which is right until both
     candidates are installed and only one of them can read anything you own. On a Mac
-    with mlx-lm present it returns MLX; a user whose only cached generator is a GGUF
-    then gets a backend that can serve none of their models, a wizard that scans for
-    MLX conversions and finds nothing, and no generator configured at all -- while the
-    picker lists the GGUF as perfectly servable.
+    with llama.cpp installed it returns llama.cpp; a user whose only cached generator is
+    an MLX conversion then gets a backend that can serve none of their models, a wizard
+    that scans for GGUF and finds nothing, and no generator configured at all -- while
+    the picker lists the MLX model as perfectly servable. The roles here swap with the
+    platform default; the tie-break is what stops either of them being a dead end.
 
     An explicit ``serving.generator.backend`` always wins: this only breaks ties that
     ``auto`` left open, and only in favour of a backend that can serve something.

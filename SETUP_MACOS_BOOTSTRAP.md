@@ -52,7 +52,7 @@ gh repo clone JBedichek/Local-arxiv-Research-Assistant
 | `xcode-select --install` | **Nothing else works first.** `git` and `python3` are stubs until this lands |
 | Homebrew | the only way to get Python 3.12 and `llama.cpp`; macOS ships neither |
 | `brew install python@3.12` | system Python is **3.9.6**; this project requires **≥3.12** |
-| `brew install llama.cpp` | generation backend — a binary, so pip cannot install it |
+| `brew install llama.cpp` | **the default generator on Apple Silicon** — a binary, so pip cannot install it |
 | `brew install gh` | **`SETUP_INSTRUCTIONS.md` opens with `gh repo clone`** — that command does not exist on a new Mac |
 | `git config --global` | git refuses to commit without an identity |
 | `gh auth login` | credentials for pushing. Prefer keys? [Step 6](#6-github-access) has the SSH route |
@@ -207,10 +207,14 @@ which is why it cannot come in through `pip` with the rest and has to be handled
 layer. `SETUP_INSTRUCTIONS.md` refers to `brew install llama.cpp` and assumes Homebrew is
 already present — step 2 is what makes that true.
 
-This is optional in the strict sense: MLX arrives with `pip install -e '.[mac]'` and is often
-faster on Apple Silicon. Install both and benchmark them — the repo documents
-`lara backends` and `lara bench-generate` for exactly that comparison. Getting llama.cpp now
-costs one command and saves a second round-trip through Homebrew later.
+**This is the default generator on Apple Silicon, and the one component pip cannot supply.**
+Without it the backend resolver falls back to MLX — which does work, since `mlx-lm` ships
+with `pip install -e '.[mac]'` — but you get a runtime the documentation does not describe,
+reading a different weight format, chosen because it was the thing that installed itself.
+Availability is decided purely by whether `llama-server` is on PATH.
+
+MLX is often faster on this hardware, so having both and benchmarking them is worth it —
+the repo documents `lara backends` and `lara bench-generate` for exactly that comparison.
 
 ### 5. git identity
 

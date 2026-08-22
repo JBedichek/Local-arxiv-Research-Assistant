@@ -88,6 +88,7 @@ gh repo clone JBedichek/Local-arxiv-Research-Assistant
 cd Local-arxiv-Research-Assistant
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -e '.[mac]'
+brew install llama.cpp
 
 hf auth login
 lara dataset pull --tiers core
@@ -118,6 +119,7 @@ pip install -e '.[cpu]'
 |---|---|
 | `python3.12 -m venv` | **macOS: use the version by name.** System `python3` is 3.9.6 and Homebrew does not displace it |
 | `pip install -e '.[mac]'` | Apple Silicon — faiss-cpu and mlx-lm. **Quotes required**: zsh globs `[...]` |
+| `brew install llama.cpp` | **the default generator on Apple Silicon.** A binary, so pip cannot supply it |
 | `pip install -e '.[cuda]'` | NVIDIA, CUDA 12 |
 | `pip install -e '.[cpu]'` | Linux without a GPU, and **all** Windows — even with an NVIDIA card |
 | `hf auth login` | token for the gated embedder; access must already be granted |
@@ -159,6 +161,7 @@ Everything below is detail.
 | **Disk** | 50 GB for `core`, 95 GB with `full`. Check with `df -h .` |
 | **RAM** | 8 GB works with a trimmed corpus; 32 GB+ runs everything untouched |
 | **GPU** | optional. Search runs fine on CPU (~12 ms); only *building* an index wants one |
+| **llama.cpp** | macOS: `brew install llama.cpp`. The default generator here, and pip cannot install it |
 
 ---
 
@@ -285,17 +288,25 @@ Retrieval works immediately after step 3. Written answers need an inference serv
 
 | backend | platform | format | install |
 |---|---|---|---|
+| **llama.cpp** | anywhere, Metal — **the default on Apple Silicon** | GGUF | `brew install llama.cpp` |
 | **vLLM** | NVIDIA | safetensors | `pip install -e '.[vllm]'` |
 | **MLX** | Apple Silicon | `mlx-community/*` | comes with `'.[mac]'` |
-| **llama.cpp** | anywhere | GGUF | `brew install llama.cpp` |
 | external | anywhere | whatever it serves | run Ollama/LM Studio yourself |
+
+> **On a Mac, llama.cpp is the default and is the one piece pip cannot install.** Without
+> `brew install llama.cpp` the resolver falls back to MLX, which works — it ships with
+> `'.[mac]'` — but is not what the wizard, this file, or `lara backends` describe. If
+> `lara setup` reports `backend mlx` on a machine where you wanted llama.cpp, the binary is
+> missing: check with `which llama-server`, since availability is decided on that alone.
 
 **vLLM has no Metal backend** — on a Mac it runs CPU-only and leaves the GPU idle, which is
 why Apple Silicon gets two purpose-built options.
 
-**On a Mac, try both.** MLX uses unified memory directly and is often faster; llama.cpp is
-more mature with richer KV-cache options. Benchmark on your own hardware — start a backend,
-then in a **second shell** run `lara bench-generate` for median TTFT and tok/s:
+**On a Mac, still try both.** llama.cpp is the default because it is the most mature and
+reads GGUF, the format most local models are actually published in — but MLX uses unified
+memory directly and is often faster on this hardware, so the default is a starting point
+rather than a verdict. Benchmark on your own machine — start a backend, then in a **second
+shell** run `lara bench-generate` for median TTFT and tok/s:
 
 ```zsh
 lara backends
@@ -467,6 +478,7 @@ returns you to the defaults.
 | Out of memory at startup | index does not fit — re-run `lara setup`, or scope the corpus |
 | Answers 404 | the selected model is not the one the generator loaded |
 | `lara serve-llm` fails on a Mac | expected; vLLM has no Metal backend — use llama.cpp or Ollama |
+| `lara setup` says `backend mlx` when you wanted llama.cpp | `llama-server` is not on PATH — `brew install llama.cpp`. An explicit `serving.generator.backend` in `config.local.yaml` also wins over the default, so re-run `lara setup` after installing |
 
 More detail: [`docs/setup/device_detection.md`](docs/setup/device_detection.md) for hardware
 and backends, [`docs/UI_guide/guide_layman.md`](docs/UI_guide/guide_layman.md) for the reader.
