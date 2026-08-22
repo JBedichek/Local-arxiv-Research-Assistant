@@ -104,7 +104,18 @@ document.addEventListener("keydown", (ev) => {
 });
 
 $("#question").addEventListener("keydown", (ev) => {
-  if (ev.key === "Enter" && (ev.metaKey || ev.ctrlKey)) $("#ask-form").requestSubmit();
+  if (ev.key !== "Enter") return;
+  // Enter sends, Shift+Enter starts a new line — the convention every chat box uses, so
+  // it is what a reader's hands already expect. Ctrl/Cmd+Enter keeps working for anyone
+  // who learned that here.
+  //
+  // `isComposing` is not optional: with a Japanese or Chinese IME, Enter commits the
+  // candidate the user is mid-way through choosing. Submitting on it would send half a
+  // word and clear the box.
+  if (ev.isComposing || ev.keyCode === 229) return;
+  if (ev.shiftKey) return;
+  ev.preventDefault();
+  $("#ask-form").requestSubmit();
 });
 
 /* Layout: one row per paper, ordered by relevance rank (most relevant at top); x is the
