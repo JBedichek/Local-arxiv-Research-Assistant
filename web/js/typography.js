@@ -46,14 +46,21 @@ const PRESETS = {
   contrast: { theme: "contrast", font: "atkinson", size: 19, leading: 1.85, measure: MEASURE_FULL, justify: false },
 };
 
+/* Sepia out of the box. The individual defaults are read from the preset rather than
+ * repeated as literals: a fresh browser has no stored prefs, so `currentStyle` is what
+ * actually decides the first paint, and a preset name that disagreed with the values
+ * beside it would show "Sepia" in the picker over a completely different page. */
+const DEFAULT_PRESET = "sepia";
+const D = PRESETS[DEFAULT_PRESET];
+
 function currentStyle() {
   return {
-    theme:   prefs.get("theme", "auto"),
-    font:    prefs.get("font", "system"),
-    size:    Number(prefs.get("fontsize", "16")),
-    leading: Number(prefs.get("leading", "1.6")),
-    measure: Number(prefs.get("measure", String(MEASURE_FULL))),
-    justify: prefs.get("justify", "0") === "1",
+    theme:   prefs.get("theme", D.theme),
+    font:    prefs.get("font", D.font),
+    size:    Number(prefs.get("fontsize", String(D.size))),
+    leading: Number(prefs.get("leading", String(D.leading))),
+    measure: Number(prefs.get("measure", String(D.measure))),
+    justify: prefs.get("justify", D.justify ? "1" : "0") === "1",
   };
 }
 
@@ -87,7 +94,7 @@ export function applyTypography() {
   $("#measure-val").textContent =
     st.measure >= MEASURE_FULL ? "full width" : `${st.measure} chars`;
   $("#justify").checked = st.justify;
-  $("#preset").value = prefs.get("preset", "default");
+  $("#preset").value = prefs.get("preset", DEFAULT_PRESET);
   drawSearchGraph();
 }
 
