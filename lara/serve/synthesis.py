@@ -523,6 +523,21 @@ def list_runs(conn, limit: int = 50) -> list[dict]:
 # ── the run ───────────────────────────────────────────────────────────────────────
 
 
+def round_limit_reached(rounds_done: int, max_rounds: int) -> bool:
+    """Whether the run has used up its hard round budget.
+
+    Every other stop condition is evidence-driven -- the corpus went dry, or the model
+    voted to stop twice -- and a broad question satisfies none of them. "code LLMs"
+    matches a large enough slice of the corpus that each round keeps turning up genuinely
+    new, genuinely relevant claims, so saturation never arrives and the model never votes
+    stop. The run does not hang; it makes progress forever, which is worse, because it
+    looks like it is working.
+
+    ``max_rounds <= 0`` disables the cap, for someone who has decided they want that.
+    """
+    return max_rounds > 0 and rounds_done >= max_rounds
+
+
 async def run_synthesis(state, cfg, question: str, *, model=None, stream_answer=None,
                         emit=None, should_stop=None) -> Run:
     """Iterate retrieval until saturated, then consolidate.
@@ -539,6 +554,12 @@ async def run_synthesis(state, cfg, question: str, *, model=None, stream_answer=
     expand_every = int(scfg.get("expand_every", 2))
     min_rounds = int(scfg.get("min_rounds", 4))
     stop_votes_needed = int(scfg.get("stop_votes", 2))
+    max_rounds = int(scfg.get("max_rounds", 10))
+    # A floor above the ceiling would have min_rounds forcing "continue" on rounds the cap
+    # will never allow. The cap still wins -- it is checked before any work -- but the
+    # forced-continue votes in between are noise, so fold the floor down to meet it.
+    if max_rounds > 0:
+        min_rounds = min(min_rounds, max_rounds)
 
     run = Run(run_id=uuid.uuid4().hex[:12], question=question)
     seen_chunks: set[int] = set()
@@ -558,6 +579,14 @@ async def run_synthesis(state, cfg, question: str, *, model=None, stream_answer=
     while True:
         if should_stop and should_stop():
             run.stopped_because = "cancelled by user"
+            break
+
+        # Checked before any work, so the limit is the number of rounds actually run.
+        if round_limit_reached(len(run.rounds), max_rounds):
+            run.stopped_because = (f"reached the {max_rounds}-round limit"
+                                   + (f"; last gap: {run.rounds[-1].gap}"
+                                      if run.rounds and run.rounds[-1].gap else ""))
+            ev("limit", {"rounds": len(run.rounds), "max_rounds": max_rounds})
             break
 
         n = len(run.rounds) + 1

@@ -144,6 +144,10 @@ retrieval:
     dry_rounds: 2            # consecutive rounds with nothing new before stopping
     min_rounds: 4            # the model's stop vote is ignored below this depth
     stop_votes: 2            # consecutive stop votes needed to end a run
+    max_rounds: 10           # hard ceiling on rounds; 0 disables it. Every other stop
+                             # condition needs the evidence to run out, which a broad
+                             # question ("code LLMs") never does -- it keeps finding new
+                             # relevant claims, so the run continues indefinitely.
     max_feedback_vectors: 6
     expand_every: 2          # every Nth round walks the citation graph instead of dense
 

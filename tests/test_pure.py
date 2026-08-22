@@ -978,3 +978,31 @@ def test_a_real_database_failure_still_raises(tmp_path):
     # broken database reads as an empty one and the UI shows nothing with no explanation.
     with pytest.raises(_sqlite3.OperationalError):
         _SY.list_runs(_readonly(tmp_path / "never-created.db"))
+
+
+# ── the auto-research round ceiling ───────────────────────────────────────────────
+#
+# Every other stop condition in `run_synthesis` is evidence-driven: the corpus went dry,
+# or the model voted stop twice. A broad question satisfies none of them -- "code LLMs"
+# matches enough of the corpus that each round keeps finding genuinely new, genuinely
+# relevant claims -- so the run made progress forever, which reads as working.
+
+
+def test_round_ceiling_counts_rounds_already_run():
+    assert not _SY.round_limit_reached(0, 10)
+    assert not _SY.round_limit_reached(9, 10)
+    # Checked before a round starts, so "10 done" is where it stops: exactly 10 run.
+    assert _SY.round_limit_reached(10, 10)
+    assert _SY.round_limit_reached(11, 10)
+
+
+def test_round_ceiling_can_be_turned_off_deliberately():
+    # 0 is the documented opt-out, for someone who has decided they want an unbounded run.
+    assert not _SY.round_limit_reached(9_999, 0)
+    assert not _SY.round_limit_reached(9_999, -1)
+
+
+def test_round_ceiling_of_one_still_allows_a_round():
+    # An off-by-one here would make the run do no work at all and consolidate nothing.
+    assert not _SY.round_limit_reached(0, 1)
+    assert _SY.round_limit_reached(1, 1)
