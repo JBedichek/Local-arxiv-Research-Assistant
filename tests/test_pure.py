@@ -923,3 +923,58 @@ def test_shard_size_never_degenerates_to_zero():
     # A vector wider than the ceiling would make the divisor win; one row per shard is
     # useless but finite, where zero is an infinite loop at load.
     assert _shard_rows("mps", 10, _MPS_MAX_ELEMENTS * 2) >= 1
+
+
+# ── reading synthesis runs over a read-only connection ────────────────────────────
+#
+# `list_runs` and `load_run` opened with `executescript(SCHEMA)`, and the server hands
+# them a `mode=ro` connection. SQLite tolerates that script only while every
+# `CREATE ... IF NOT EXISTS` is a no-op, so it passed on any database that had already
+# saved a run and raised "attempt to write a readonly database" on one that had not --
+# i.e. on every fresh install, which is where deep research is opened for the first time.
+
+import sqlite3 as _sqlite3
+
+import lara.serve.synthesis as _SY
+from lara.store import db as _db
+
+
+def _readonly(path):
+    c = _sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    c.row_factory = _sqlite3.Row
+    return c
+
+
+def test_reading_runs_before_any_exist_returns_empty(tmp_path):
+    # Only the main schema, exactly as server startup leaves it.
+    p = tmp_path / "fresh.db"
+    _db.connect(p).close()
+    conn = _readonly(p)
+    assert _SY.list_runs(conn) == []
+    assert _SY.load_run(conn, "whatever") is None
+
+
+def test_reading_runs_does_not_need_a_writable_connection(tmp_path):
+    p = tmp_path / "used.db"
+    w = _db.connect(p)
+    w.executescript(_SY.SCHEMA)
+    w.execute(
+        "INSERT INTO synthesis_runs (run_id, question, tldr, thorough, stopped_because,"
+        " n_rounds, n_claims, n_papers, ms) VALUES (?,?,?,?,?,?,?,?,?)",
+        ("r1", "does it read?", "yes", 0, "saturated", 3, 7, 5, 12.0))
+    w.commit()
+    w.close()
+
+    conn = _readonly(p)
+    runs = _SY.list_runs(conn)
+    assert [r["run_id"] for r in runs] == ["r1"]
+    assert runs[0]["question"] == "does it read?"
+    assert _SY.load_run(conn, "r1")["n_claims"] == 7
+    assert _SY.load_run(conn, "absent") is None
+
+
+def test_a_real_database_failure_still_raises(tmp_path):
+    # The missing-table case is degraded to "no runs"; anything else must not be, or a
+    # broken database reads as an empty one and the UI shows nothing with no explanation.
+    with pytest.raises(_sqlite3.OperationalError):
+        _SY.list_runs(_readonly(tmp_path / "never-created.db"))

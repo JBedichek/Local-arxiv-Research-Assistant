@@ -30,6 +30,7 @@ when consecutive rounds stop finding anything new regardless of what the model w
 
 from __future__ import annotations
 
+import sqlite3
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -461,9 +462,40 @@ def save(db_path, run: Run, rejected: list[tuple[str, int]]) -> None:
         pass
 
 
+def _no_table(exc: sqlite3.OperationalError) -> bool:
+    """Whether this is "the table is not there yet" rather than a real failure.
+
+    The synthesis tables are created by :func:`save`, so between a fresh install and the
+    first completed run they legitimately do not exist. Reading is still a reasonable
+    thing to do then -- the answer is "no runs" -- and it is worth distinguishing from a
+    corrupt or unreachable database, which must still raise.
+    """
+    return "no such table" in str(exc)
+
+
 def load_run(conn, run_id: str) -> dict | None:
-    conn.executescript(SCHEMA)
-    r = conn.execute("SELECT * FROM synthesis_runs WHERE run_id=?", (run_id,)).fetchone()
+    """One run by id, or None.
+
+    **Read-only.** This used to open with ``executescript(SCHEMA)``, which is DDL, while
+    the connection the server hands it is opened ``mode=ro``.
+
+    That combination is not always fatal, which is what made it survive: SQLite lets the
+    script through as long as every ``CREATE ... IF NOT EXISTS`` in it is a no-op, and
+    raises ``attempt to write a readonly database`` the moment one table is genuinely
+    absent and it would have to write. Measured: all three tables present succeeds, none
+    present fails, *one of three* present fails.
+
+    So it broke on exactly one database -- the one where no run has been saved yet, which
+    is every fresh install, and precisely the state someone is in when they open deep
+    research for the first time. Creating the schema is the writer's job; see :func:`save`.
+    """
+    try:
+        r = conn.execute("SELECT * FROM synthesis_runs WHERE run_id=?",
+                         (run_id,)).fetchone()
+    except sqlite3.OperationalError as exc:
+        if not _no_table(exc):
+            raise
+        return None
     if r is None:
         return None
     d = dict(r)
@@ -476,11 +508,16 @@ def load_run(conn, run_id: str) -> dict | None:
 
 
 def list_runs(conn, limit: int = 50) -> list[dict]:
-    conn.executescript(SCHEMA)
-    return [dict(r) for r in conn.execute(
-        "SELECT run_id, question, n_rounds, n_claims, n_papers, ms, created_utc,"
-        " substr(COALESCE(tldr,''),1,240) AS tldr FROM synthesis_runs"
-        " ORDER BY created_utc DESC LIMIT ?", (limit,))]
+    """Recent runs, newest first. Read-only; empty before the first run is saved."""
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT run_id, question, n_rounds, n_claims, n_papers, ms, created_utc,"
+            " substr(COALESCE(tldr,''),1,240) AS tldr FROM synthesis_runs"
+            " ORDER BY created_utc DESC LIMIT ?", (limit,))]
+    except sqlite3.OperationalError as exc:
+        if not _no_table(exc):
+            raise
+        return []
 
 
 # ── the run ───────────────────────────────────────────────────────────────────────
