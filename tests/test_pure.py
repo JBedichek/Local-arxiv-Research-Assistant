@@ -873,3 +873,53 @@ def test_doc_input_does_not_prefix_text_that_is_already_prefixed():
     already = "title: A Paper | text: hello"
     assert doc_input(already) == already
     assert doc_input("hello").endswith("hello") and doc_input("hello").startswith("title:")
+
+
+# ── Metal's element ceiling ───────────────────────────────────────────────────────
+#
+# A dense fp16 index of 29.6 M x 768 is 22.7 G elements, and MPSGraph indexes elements
+# with a signed 32-bit int, so every search raised "MPSGraph does not support tensor dims
+# larger than INT_MAX". Slicing was not the fix: a view resolves to its base storage, so
+# the allocation itself has to be split. These guard the arithmetic that decides when --
+# getting it wrong is either a crash on Metal or a pointless slowdown on CUDA.
+
+from lara.index.backends import _MPS_MAX_ELEMENTS, _exceeds_mps_limit, _shard_rows
+
+
+def test_only_metal_has_an_element_ceiling():
+    huge = 29_600_000
+    assert _exceeds_mps_limit("mps", huge, 768)
+    # The same index is fine everywhere that indexes with 64 bits, which is why this bug
+    # was invisible until someone ran it on a Mac.
+    for device in ("cuda", "cuda:0", "cpu"):
+        assert not _exceeds_mps_limit(device, huge, 768)
+
+
+def test_ceiling_is_about_elements_not_rows():
+    # 4 M rows is over at 768 dimensions and under at 64: it is the product that counts.
+    assert _exceeds_mps_limit("mps", 4_000_000, 768)
+    assert not _exceeds_mps_limit("mps", 4_000_000, 64)
+
+
+def test_non_metal_devices_stay_in_one_allocation():
+    # Sharding CUDA would cost throughput to solve a problem it does not have, so the
+    # helper must hand back the whole row count and leave that path exactly as it was.
+    for device in ("cuda", "cpu"):
+        assert _shard_rows(device, 29_600_000, 768) >= 29_600_000
+
+
+def test_metal_shards_only_once_it_must_and_every_shard_fits():
+    dim = 768
+    just_under = _MPS_MAX_ELEMENTS // dim
+    assert _shard_rows("mps", just_under, dim) >= just_under, "split an index that fit"
+    over = just_under + 1
+    rows = _shard_rows("mps", over, dim)
+    assert rows < over, "did not split an index that could not fit"
+    # The point of the whole exercise: no single allocation may reach the ceiling.
+    assert rows * dim <= _MPS_MAX_ELEMENTS
+
+
+def test_shard_size_never_degenerates_to_zero():
+    # A vector wider than the ceiling would make the divisor win; one row per shard is
+    # useless but finite, where zero is an infinite loop at load.
+    assert _shard_rows("mps", 10, _MPS_MAX_ELEMENTS * 2) >= 1

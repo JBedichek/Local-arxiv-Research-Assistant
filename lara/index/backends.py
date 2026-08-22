@@ -88,6 +88,41 @@ def default_search_block(device: str, dim: int) -> int:
     return max(65_536, budget // max(1, dim * 4))
 
 
+#: MPSGraph addresses tensor elements with a signed 32-bit index, so a single operand
+#: holding more than 2**31 - 1 of them fails outright:
+#:
+#:     RuntimeError: MPSGraph does not support tensor dims larger than INT_MAX
+#:
+#: It is a framework ceiling rather than memory pressure, which matters: the int8 path's
+#: retry-at-a-smaller-block loop could never have recovered from it, because the operand
+#: size does not depend on how much memory is free. At 768 dimensions the limit is about
+#: 2.79 M rows, which any real corpus is far past -- 29.6 M rows is 22.7 G elements, ten
+#: times over. CUDA and CPU index with 64 bits and have no equivalent ceiling, which is
+#: exactly why this survived: the identical query is fine on every other device.
+_MPS_MAX_ELEMENTS = 2**31 - 1
+
+
+def _exceeds_mps_limit(device: str, rows: int, dim: int) -> bool:
+    """Whether one matmul operand of this shape would overflow MPSGraph's index."""
+    return str(device).split(":", 1)[0] == "mps" and rows * dim > _MPS_MAX_ELEMENTS
+
+
+def _shard_rows(device: str, rows: int, dim: int) -> int:
+    """Rows per allocation: the whole index, unless Metal cannot address that many.
+
+    Slicing is not an escape. A view into an over-sized tensor still fails, because
+    MPSGraph resolves the operand to its base storage and measures *that* -- measured
+    directly: `q @ m[:100_000].T` raises where `q @ m[:100_000].clone().T` succeeds on the
+    same tensor. Cloning per block would copy the entire index on every query, so the
+    split has to happen once, at load, into genuinely separate allocations.
+
+    Half the ceiling rather than all of it, so a block spanning two shards still has room.
+    """
+    if not _exceeds_mps_limit(device, rows, dim):
+        return max(1, rows)
+    return max(1, _MPS_MAX_ELEMENTS // (2 * max(1, dim)))
+
+
 def _normalise(block: np.ndarray) -> np.ndarray:
     """int8 rows -> unit-norm float32. The stored bytes are a quantisation of unit
     vectors, so renormalising after the cast restores a true cosine."""
@@ -308,7 +343,14 @@ class TorchBackend(_Resident):
         self.n, self.dim = n, dim
 
         dtype = torch.float16 if precision == "fp16" else torch.int8
-        self.matrix = torch.empty((n, dim), dtype=dtype, device=self.device)
+        # One allocation everywhere it is legal, which is everywhere but a large index on
+        # Metal. See `_shard_rows`: a *view* into an over-sized tensor is not a way out,
+        # because MPSGraph resolves it to the base storage, so the split has to be real.
+        self._starts, self._shards = [], []
+        for base in range(0, n, _shard_rows(self.device, n, dim)):
+            rows = min(_shard_rows(self.device, n, dim), n - base)
+            self._starts.append(base)
+            self._shards.append(torch.empty((rows, dim), dtype=dtype, device=self.device))
         for start in range(0, n, block):
             stop = min(start + block, n)
             src = (int8_matrix[start:stop] if self.row_ids is None
@@ -317,16 +359,70 @@ class TorchBackend(_Resident):
             # stays read-only, and torch.from_numpy warns that writing through it is UB.
             t = torch.from_numpy(np.array(src, dtype=np.int8, order="C")).to(self.device)
             if precision == "fp16":
-                self.matrix[start:stop] = torch.nn.functional.normalize(t.float(), dim=1).half()
-            else:
-                # Stored bytes are already a quantisation of unit vectors; keeping them
-                # verbatim means the only cost is the per-row norm recovered at search.
-                self.matrix[start:stop] = t
+                t = torch.nn.functional.normalize(t.float(), dim=1).half()
+            # else: stored bytes are already a quantisation of unit vectors; keeping them
+            # verbatim means the only cost is the per-row norm recovered at search.
+            self._write(start, stop, t)
             del t
         dev.empty_cache(self.device)
 
+    @property
+    def matrix(self) -> torch.Tensor:
+        """The whole thing as one tensor. Only valid when it *is* one tensor.
+
+        Kept because it reads better everywhere the index is small enough to hold in a
+        single allocation, which is every device except Metal past the element ceiling.
+        The sharded paths go through :meth:`_rows` and :meth:`_gather` instead.
+        """
+        if len(self._shards) != 1:
+            raise RuntimeError(
+                f"index is stored in {len(self._shards)} shards on {self.device}; use "
+                "_rows()/_gather() rather than .matrix")
+        return self._shards[0]
+
+    @property
+    def sharded(self) -> bool:
+        return len(self._shards) > 1
+
+    def _write(self, start: int, stop: int, block: torch.Tensor) -> None:
+        """Copy `block` into rows [start, stop), across shard boundaries if need be."""
+        for base, sh in zip(self._starts, self._shards, strict=True):
+            lo, hi = max(start, base), min(stop, base + sh.shape[0])
+            if lo < hi:
+                sh[lo - base:hi - base] = block[lo - start:hi - start]
+
+    def _rows(self, start: int, stop: int) -> torch.Tensor:
+        """Rows [start, stop) as one tensor whose storage is within the device's limit."""
+        if len(self._shards) == 1:
+            return self._shards[0][start:stop]
+        parts = []
+        for base, sh in zip(self._starts, self._shards, strict=True):
+            lo, hi = max(start, base), min(stop, base + sh.shape[0])
+            if lo < hi:
+                parts.append(sh[lo - base:hi - base])
+        # One part is the overwhelmingly common case -- callers iterate in blocks far
+        # smaller than a shard -- and returning the slice directly keeps it copy-free.
+        return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+
+    def _gather(self, idx: torch.Tensor) -> torch.Tensor:
+        """Arbitrary rows, **in the order given**.
+
+        Order is load-bearing: `search` maps positions in the returned scores back through
+        the same `idx` to recover global row ids, so gathering shard by shard and
+        concatenating would silently hand back the wrong passages.
+        """
+        if len(self._shards) == 1:
+            return self._shards[0][idx]
+        out = torch.empty((int(idx.numel()), self.dim),
+                          dtype=self._shards[0].dtype, device=self.device)
+        for base, sh in zip(self._starts, self._shards, strict=True):
+            mask = (idx >= base) & (idx < base + sh.shape[0])
+            if bool(mask.any()):
+                out[mask] = sh[idx[mask] - base]
+        return out
+
     def memory_bytes(self) -> int:
-        return self.matrix.element_size() * self.matrix.nelement()
+        return sum(t.element_size() * t.nelement() for t in self._shards)
 
     def describe(self) -> str:
         return f"torch {self.precision} on {self.device} ({self.n:,} vectors)"
@@ -343,8 +439,14 @@ class TorchBackend(_Resident):
     def _scores_for(self, q: torch.Tensor, idx: torch.Tensor | None) -> torch.Tensor:
         """Inner products against all rows, or a subset, dequantising if needed."""
         if self.precision == "fp16":
-            m = self.matrix if idx is None else self.matrix[idx]
-            return q @ m.T
+            n = self.n if idx is None else int(idx.numel())
+            # One matmul is the fastest and simplest thing, and stays the path on every
+            # device that can execute it. Blocking CUDA unconditionally would cost
+            # throughput to solve a problem CUDA does not have.
+            if not self.sharded:
+                m = self.matrix if idx is None else self.matrix[idx]
+                return q @ m.T
+            return self._fp16_blocked(q, idx, n)
 
         # Retry smaller before giving up. The failure is memory pressure, and pressure is
         # transient -- a generator loading 5 GB alongside the index tips it over, and the
@@ -366,13 +468,34 @@ class TorchBackend(_Resident):
             f"stop the generator, scope the corpus smaller, or disable the cross-encoder."
         )
 
+    def _fp16_blocked(self, q: torch.Tensor, idx: torch.Tensor | None,
+                      n: int) -> torch.Tensor:
+        """``q @ matrix.T`` in row blocks, for a device that cannot address it in one.
+
+        Unlike :meth:`_scores_once` there is nothing to dequantise -- fp16 rows are
+        normalised once at load -- so the blocks are a plain partition of the same
+        product and the result is *identical* to the single matmul rather than an
+        approximation of it. Output keeps the matrix dtype so callers cannot tell which
+        path ran.
+        """
+        # search_block is sized for the int8 dequantisation transient, which is a fine
+        # ceiling here too, but it is not itself bounded by the element limit: clamp so a
+        # very wide vector cannot make a single block overflow the thing we are avoiding.
+        block = min(self.search_block, max(1, _MPS_MAX_ELEMENTS // max(1, self.dim)))
+        out = torch.empty((1, n), dtype=self._shards[0].dtype, device=self.device)
+        for s in range(0, n, block):
+            e = min(s + block, n)
+            rows = self._rows(s, e) if idx is None else self._gather(idx[s:e])
+            out[0, s:e] = (q @ rows.T)[0]
+        return out
+
     def _scores_once(self, q: torch.Tensor, idx: torch.Tensor | None,
                      block: int) -> torch.Tensor:
         n = self.n if idx is None else int(idx.numel())
         out = torch.empty((1, n), dtype=torch.float32, device=self.device)
         for s in range(0, n, block):
             e = min(s + block, n)
-            raw = self.matrix[s:e] if idx is None else self.matrix[idx[s:e]]
+            raw = self._rows(s, e) if idx is None else self._gather(idx[s:e])
             blk = torch.nn.functional.normalize(raw.float(), dim=1)
             out[0, s:e] = (q.float() @ blk.T)[0]
             del blk
@@ -445,7 +568,7 @@ class TorchBackend(_Resident):
         rows are stored unnormalised and must be renormalised after the cast, or every
         similarity comes out scaled by an arbitrary row norm.
         """
-        raw = self.matrix[s0:e0]
+        raw = self._rows(s0, e0)
         if self.precision == "fp16":
             return (raw @ q.T).float()
         blk = torch.nn.functional.normalize(raw.float(), dim=1)
