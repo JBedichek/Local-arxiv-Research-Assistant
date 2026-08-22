@@ -16,6 +16,7 @@ and yield between tokens.
 
 from __future__ import annotations
 
+import json
 import os
 
 from fastapi import FastAPI
@@ -26,16 +27,26 @@ from lara.serve.state import AppState
 
 app = FastAPI(title="Local arXiv Research Assistant", docs_url="/api/docs")
 
-# Installed at import time from the environment rather than from config, because uvicorn
-# imports this module in its own process and the CLI's parsed config does not travel with
-# it. `lara serve` exports LARA_TOKEN after deciding whether one is required; anything
-# that imports the app directly — a test, an embedded runner — gets the same protection by
-# setting the same variable, and no protection if it sets nothing and serves loopback.
-_auth_token = os.environ.get("LARA_TOKEN", "").strip()
-if _auth_token:
+# `lara serve` exports LARA_TOKENS as JSON when more than one person has a secret, and
+# LARA_TOKEN for the single-secret case. Read from the environment rather than the parsed
+# config because uvicorn imports this module in its own process, where the CLI's config
+# does not travel. Anything that imports the app directly — a test, an embedded runner —
+# gets the same protection by setting the same variables, and no protection if it sets
+# nothing and serves loopback.
+_auth_tokens: dict[str, str] = {}
+_env_many = os.environ.get("LARA_TOKENS", "").strip()
+if _env_many:
+    try:
+        _auth_tokens = {k: v for k, v in json.loads(_env_many).items() if v}
+    except Exception:
+        _auth_tokens = {}
+_env_one = os.environ.get("LARA_TOKEN", "").strip()
+if _env_one:
+    _auth_tokens.setdefault("env", _env_one)
+if _auth_tokens:
     from lara.serve.auth import TokenAuthMiddleware
 
-    app.add_middleware(TokenAuthMiddleware, token=_auth_token)
+    app.add_middleware(TokenAuthMiddleware, token=_auth_tokens)
 
 
 @app.on_event("startup")

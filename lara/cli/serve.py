@@ -117,7 +117,8 @@ def serve(
     # version of this that survives a hurried evening.
     from lara.serve import auth as AUTH
 
-    token = AUTH.resolve_token(cfg)
+    tokens = AUTH.resolve_tokens(cfg)
+    token = next(iter(tokens.values()), None)
     if AUTH.require_token_for(host, cfg) and not token:
         fresh = AUTH.generate_token()
         console.print(
@@ -137,11 +138,19 @@ def serve(
     # login prompt on plain loopback, where the mode says none is needed. The token is a
     # credential to use when required, not a switch that requires it.
     if token and AUTH.require_token_for(host, cfg):
-        os.environ["LARA_TOKEN"] = token          # the app builds its middleware from this
-        console.print(f"[green]authentication on[/green] — open "
-                      f"http://{host}:{port}/?token=<your token> once per browser")
+        import json as _json
+        # The whole set, so each person can hold their own secret and be revoked alone.
+        os.environ["LARA_TOKENS"] = _json.dumps(tokens)
+        os.environ.pop("LARA_TOKEN", None)
+        console.print(
+            f"[green]authentication on[/green] — {len(tokens)} secret(s): "
+            f"{', '.join(sorted(tokens))}\n"
+            f"each person opens http://{host}:{port}/?token=<their own> once per browser")
     else:
-        os.environ.pop("LARA_TOKEN", None)         # a stale env var must not re-enable it
+        # Stale env vars must not re-enable it, nor leak one person's secret into a run
+        # that is meant to be open.
+        os.environ.pop("LARA_TOKEN", None)
+        os.environ.pop("LARA_TOKENS", None)
         if not AUTH.is_loopback(host):
             console.print("[yellow]serving without authentication[/yellow] (auth.mode: off)")
 
@@ -228,7 +237,7 @@ def serve_llm(
     accel = DV.detect().accelerator
     chosen = GEN.choose(accel, backend or cfg.get_in("serving.generator.backend"))
     serving = cfg.get_in("serving") or {}
-    merged = {**(serving.get("generator") or {}), "vllm": serving.get("vllm") or {}}
+    merged = GEN.generator_cfg(cfg)
     repo = model or GEN.model_for(chosen.name, merged)
 
     if chosen.name == "external":
@@ -264,7 +273,7 @@ def list_backends(config: str = typer.Option(None, help="Path to config.yaml")) 
     cfg = config_mod.load(config)
     dev_info = DV.detect()
     serving = cfg.get_in("serving") or {}
-    merged = {**(serving.get("generator") or {}), "vllm": serving.get("vllm") or {}}
+    merged = GEN.generator_cfg(cfg)
     active = GEN.choose(dev_info.accelerator, cfg.get_in("serving.generator.backend"))
 
     table = Table(show_header=True, header_style="bold")

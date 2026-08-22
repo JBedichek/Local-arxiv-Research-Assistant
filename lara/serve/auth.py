@@ -53,16 +53,42 @@ def generate_token() -> str:
     return secrets.token_urlsafe(32)
 
 
-def resolve_token(cfg) -> str | None:
-    """The configured token. Environment wins, so it need never be written to disk."""
+def resolve_tokens(cfg) -> dict[str, str]:
+    """Every accepted secret, as {label: token}.
+
+    One secret per person rather than one shared secret, because a shared one cannot be
+    taken back from a single reader: revoking it locks everyone out and means telling
+    everybody a new one. With a token each, removing a line removes exactly that person,
+    and the access log says who was using the reader.
+
+    `$LARA_TOKEN` still works and is labelled `env`, so a single-user setup needs no
+    config at all and nothing needs writing to disk.
+    """
+    out: dict[str, str] = {}
     env = os.environ.get("LARA_TOKEN")
     if env and env.strip():
-        return env.strip()
+        out["env"] = env.strip()
     try:
-        tok = cfg.get_in("serving.auth.token")
+        single = cfg.get_in("serving.auth.token")
     except Exception:
-        tok = None
-    return tok.strip() if isinstance(tok, str) and tok.strip() else None
+        single = None
+    if isinstance(single, str) and single.strip():
+        out.setdefault("default", single.strip())
+    try:
+        many = cfg.get_in("serving.auth.tokens")
+    except Exception:
+        many = None
+    if isinstance(many, dict):
+        for label, tok in many.items():
+            if isinstance(tok, str) and tok.strip():
+                out[str(label)] = tok.strip()
+    return out
+
+
+def resolve_token(cfg) -> str | None:
+    """First configured token, for callers that only need to know whether one exists."""
+    toks = resolve_tokens(cfg)
+    return next(iter(toks.values()), None)
 
 
 def require_token_for(host: str, cfg) -> bool:
@@ -95,14 +121,27 @@ def require_token_for(host: str, cfg) -> bool:
 
 
 class TokenAuthMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, token: str) -> None:
+    def __init__(self, app, token: str | dict[str, str]) -> None:
         super().__init__(app)
-        self.token = token
+        self.tokens = {"default": token} if isinstance(token, str) else dict(token)
+
+    def _who(self, presented: str | None) -> str | None:
+        """The label whose token matches, or None.
+
+        Every candidate is compared even after a match, so the time taken does not depend
+        on which token was presented or how many are configured.
+        """
+        if not presented:
+            return None
+        got = presented.encode("utf-8")
+        found = None
+        for label, tok in self.tokens.items():
+            if hmac.compare_digest(got, tok.encode("utf-8")):
+                found = label
+        return found
 
     def _ok(self, presented: str | None) -> bool:
-        # compare_digest rather than ==, and on bytes, so a unicode token cannot raise.
-        return bool(presented) and hmac.compare_digest(
-            presented.encode("utf-8"), self.token.encode("utf-8"))
+        return self._who(presented) is not None
 
     async def dispatch(self, request, call_next):
         if request.url.path in PUBLIC_PATHS:
@@ -116,7 +155,8 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         q = request.query_params.get("token")
-        if self._ok(q):
+        who = self._who(q)
+        if who is not None:
             # Trade the query parameter for a cookie and drop it from the URL, so the
             # token does not survive in history or leak through Referer.
             parts = urlsplit(str(request.url))
@@ -124,7 +164,7 @@ class TokenAuthMiddleware(BaseHTTPMiddleware):
             clean = urlunsplit((parts.scheme, parts.netloc, parts.path,
                                 urlencode(kept), parts.fragment))
             resp = RedirectResponse(clean, status_code=303)
-            resp.set_cookie(COOKIE, self.token, httponly=True, samesite="lax",
+            resp.set_cookie(COOKIE, self.tokens[who], httponly=True, samesite="lax",
                             max_age=60 * 60 * 24 * 365,
                             secure=request.url.scheme == "https")
             return resp
