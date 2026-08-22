@@ -171,10 +171,32 @@ python3 -m venv .venv && source .venv/bin/activate
 ```
 
 > **On macOS write `python3.12 -m venv .venv` instead.** `brew install python@3.12`
-> deliberately does not displace the system 3.9.6, so a bare `python3` can build the venv
-> from an interpreter this project cannot use. The failure lands one command later, at
-> `pip install`, as a requires-python error that reads like a broken package. After
-> activating, `python --version` must say 3.12 or newer.
+> deliberately does not displace the system 3.9.6, so a bare `python3` builds the venv from
+> an interpreter this project cannot use.
+>
+> **The error you get does not mention Python versions at all.** It lands one command later,
+> at `pip install -e`, and blames the *project*:
+>
+> ```
+> ERROR: File "setup.py" or "setup.cfg" not found. Directory cannot be installed in
+> editable mode: /path/to/Local-arxiv-Research-Assistant
+> (A "pyproject.toml" file was found, but editable mode currently requires a
+> setuptools-based build.)
+> ```
+>
+> Nothing is wrong with the project. Python 3.9 ships **pip 21.2.4**, which predates
+> [PEP 660](https://peps.python.org/pep-0660/) — editable installs for non-setuptools
+> backends arrived in pip 21.3. This project builds with hatchling, so that pip cannot
+> install it editable and reaches for `setup.py`, which correctly does not exist. It never
+> gets far enough to check `requires-python`.
+>
+> **The version in the message is the tell**: a `WARNING: You are using pip version 21.2.4`
+> means the venv is 3.9, whatever you thought you ran. Do not fix this by upgrading pip —
+> that patches the symptom onto an interpreter still too old for the project. Rebuild the
+> venv. After activating, `python --version` must say 3.12 or newer.
+>
+> **`deactivate` first if any venv is active.** Inside an activated 3.9 venv, `python3` *is*
+> that venv's 3.9, so a nested `python3 -m venv` inherits it and the mistake propagates.
 
 Pick exactly one platform extra:
 
@@ -413,7 +435,8 @@ returns you to the defaults.
 | `could not read Username` | git has no credential helper — `gh auth setup-git` |
 | `fatal: Too many arguments.` when pasting | zsh does not strip `#` comments — see [`SETUP_TROUBLESHOOTING.md`](SETUP_TROUBLESHOOTING.md) |
 | `zsh: no matches found: .[mac]` | quote the extra: `'.[mac]'` |
-| requires-python error at `pip install` | venv built from system 3.9 — rebuild with `python3.12 -m venv` |
+| `File "setup.py" or "setup.cfg" not found` on `pip install -e` | venv built from system 3.9, whose pip 21.2.4 predates PEP 660 — rebuild with `python3.12 -m venv` |
+| `WARNING: You are using pip version 21.2.4` | same cause; that pip only ships with Python 3.9 |
 | `nvidia-smi` works but everything is slow | torch cannot see the GPU — preflight fails on this explicitly |
 | `Driver/library version mismatch` | reload the kernel module or reboot; preflight prints the command |
 | Out of memory at startup | index does not fit — re-run `lara setup`, or scope the corpus |

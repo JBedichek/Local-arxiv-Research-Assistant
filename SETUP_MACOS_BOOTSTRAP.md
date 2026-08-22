@@ -172,14 +172,25 @@ python3.12 --version
 The first prints `3.9.6`, the second `3.12.x`. Both are correct and both stay on the machine.
 
 > **Use `python3.12` by name when you create the venv, never bare `python3`.** Homebrew
-> deliberately does not make `python@3.12` the default `python3`, so a bare `python3` may
-> still resolve to the system 3.9.6 — and a venv built from it fails at `pip install` with a
-> requires-python error that reads like a broken package rather than the wrong interpreter.
-> `SETUP_INSTRUCTIONS.md` writes `python3 -m venv .venv`; on a fresh Mac, prefer:
+> deliberately does not make `python@3.12` the default `python3`, so bare `python3` stays
+> the system 3.9.6. `SETUP_INSTRUCTIONS.md` writes `python3 -m venv .venv`; on a fresh Mac,
+> prefer:
 >
 > ```zsh
 > python3.12 -m venv .venv
 > ```
+>
+> **The resulting error names neither Python nor its version**, which is what makes this
+> cost an hour. `pip install -e` fails with `File "setup.py" or "setup.cfg" not found …
+> editable mode currently requires a setuptools-based build` — an accusation against the
+> project. The real cause is that Python 3.9 ships pip 21.2.4, which predates PEP 660 and so
+> cannot install a hatchling project in editable mode. Confirm with `python --version` and
+> `cat .venv/pyvenv.cfg` rather than trusting the message, and rebuild rather than upgrading
+> pip inside a 3.9 venv.
+>
+> **`deactivate` before creating it.** Inside an active 3.9 venv, `python3` is that venv's
+> 3.9, so the new venv silently inherits it — `pyvenv.cfg` records which interpreter was
+> actually used, and is the fastest way to catch this.
 
 **3.12 rather than 3.13 or newer** is deliberate: it is the version the ML wheel stack
 (torch, sentence-transformers, mlx-lm) has the most complete coverage for. Newer usually
