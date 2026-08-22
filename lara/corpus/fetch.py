@@ -66,7 +66,11 @@ class Document:
     content_type: str = ""
     bytes_downloaded: int = 0
     sha256: str = ""
-    licence: LIC.Licence | None = None
+    # Never None: a document that failed to download still has a licence question
+    # with an answer, and that answer is "we do not know". Callers that read
+    # `.licence.verdict` on an error path should get a verdict, not an exception.
+    licence: LIC.Licence = field(
+        default_factory=lambda: LIC.Licence(LIC.UNKNOWN, "unknown"))
     error: str = ""
     thin: bool = False                  # HTML that rendered to almost no text
     alternates: list[str] = field(default_factory=list)   # documents the page links to
@@ -112,11 +116,14 @@ def _pdf_to_text(raw: bytes, max_pages: int = 3000) -> tuple[str, str]:
     the reader should be told rather than made to wait.
     """
     try:
-        import fitz                                   # PyMuPDF
-    except ImportError:
-        return "", ""
+        import pymupdf
+    except ImportError:                               # older wheels expose it as fitz
+        try:
+            import fitz as pymupdf
+        except ImportError:
+            return "", ""
     try:
-        with fitz.open(stream=raw, filetype="pdf") as doc:
+        with pymupdf.open(stream=raw, filetype="pdf") as doc:
             title = (doc.metadata or {}).get("title") or ""
             parts = [doc[i].get_text() for i in range(min(doc.page_count, max_pages))]
         return re.sub(r"\n{3,}", "\n\n", "\n".join(parts)).strip(), title.strip()
@@ -206,13 +213,26 @@ def fetch(url: str, *, max_bytes: int = 64 << 20, timeout: float = 40.0,
         doc.error = doc.error or f"gave up after {doc.attempts} attempts"
         return doc
 
+    extract(doc, raw, keep_raw=keep_raw)
+    return doc
+
+
+def extract(doc: Document, raw: bytes, *, keep_raw: bool = True) -> Document:
+    """Fill in text, title, hash and licence from raw bytes. No network.
+
+    Split out of :func:`fetch` so a document already on disk can be re-read without being
+    downloaded again. A corpus build holds candidates while the reader reviews them, which
+    may be minutes; keeping the bytes of every candidate in memory for that whole time is
+    what this separation avoids.
+    """
     doc.bytes_downloaded = len(raw)
     doc.sha256 = hashlib.sha256(raw).hexdigest()
     if keep_raw:
         doc.raw = raw
 
     body_html = ""
-    if "pdf" in doc.content_type or url.lower().endswith(".pdf") or raw[:5] == b"%PDF-":
+    if ("pdf" in doc.content_type or doc.url.lower().endswith(".pdf")
+            or raw[:5] == b"%PDF-"):
         doc.text, doc.title = _pdf_to_text(raw)
         doc.content_type = doc.content_type or "application/pdf"
     elif "html" in doc.content_type or raw[:200].lstrip()[:1] == b"<":
@@ -234,10 +254,25 @@ def fetch(url: str, *, max_bytes: int = 64 << 20, timeout: float = 40.0,
         doc.error = doc.error or "no extractable text"
 
     # Licence last, on the extracted text, so a statement inside a PDF is seen.
-    doc.licence = LIC.detect(url, doc.text, body_html or None)
+    doc.licence = LIC.detect(doc.url, doc.text, body_html or None)
     if not doc.title:
-        doc.title = url.rsplit("/", 1)[-1] or url
+        doc.title = doc.url.rsplit("/", 1)[-1] or doc.url
     return doc
+
+
+def from_path(path: Path, url: str = "", content_type: str = "") -> Document:
+    """Rebuild a Document from bytes already on disk.
+
+    Used for two things: re-reading a stored candidate at build time, and importing files
+    the reader supplies directly instead of searching for.
+    """
+    raw = path.read_bytes()
+    guess = content_type or {
+        ".pdf": "application/pdf", ".html": "text/html", ".htm": "text/html",
+        ".txt": "text/plain", ".md": "text/markdown",
+    }.get(path.suffix.lower(), "")
+    doc = Document(url=url or path.as_uri(), content_type=guess)
+    return extract(doc, raw, keep_raw=True)
 
 
 def save_raw(doc: Document, root: Path) -> Path | None:
