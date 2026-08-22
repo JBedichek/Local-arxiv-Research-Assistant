@@ -167,12 +167,37 @@ Everything below is detail.
 ```bash
 gh repo clone JBedichek/Local-arxiv-Research-Assistant
 cd Local-arxiv-Research-Assistant
-python3 -m venv .venv && source .venv/bin/activate
 ```
 
-> **On macOS write `python3.12 -m venv .venv` instead.** `brew install python@3.12`
-> deliberately does not displace the system 3.9.6, so a bare `python3` builds the venv from
-> an interpreter this project cannot use.
+Then create the venv with the interpreter **named by version**:
+
+| platform | command | why |
+|---|---|---|
+| **macOS** | `python3.12 -m venv .venv` | bare `python3` is the system **3.9.6** — too old, and it fails confusingly |
+| **Linux** | `python3 -m venv .venv` | distro `python3` is normally already 3.12+. Check with `python3 --version`; if it is older, name the version — `python3.12` |
+| **Windows** | `py -3.12 -m venv .venv` | the `py` launcher selects the version explicitly |
+
+Activate it — `source .venv/bin/activate` on macOS and Linux,
+`.\.venv\Scripts\Activate.ps1` on Windows.
+
+Then **verify before installing** — one command, and it saves the whole detour below:
+
+```zsh
+python --version
+```
+
+It must print **3.12 or newer**. If it prints 3.9, delete `.venv` and rebuild it with
+`python3.12` by name:
+
+```zsh
+deactivate
+rm -rf .venv
+python3.12 -m venv .venv && source .venv/bin/activate
+```
+
+> **Why bare `python3` is wrong on macOS.** `brew install python@3.12` deliberately does not
+> displace the system 3.9.6, so `python3` keeps resolving to the old one and builds the venv
+> from an interpreter this project cannot use.
 >
 > **The error you get does not mention Python versions at all.** It lands one command later,
 > at `pip install -e`, and blames the *project*:
