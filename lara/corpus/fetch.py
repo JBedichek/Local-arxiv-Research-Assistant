@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -35,6 +36,27 @@ BINARY_HINTS = ("image/", "video/", "audio/", "application/zip", "application/x-
 #: already been paid for.
 CHUNK = 1 << 16
 
+#: Statuses worth trying again. 429 and 5xx are the server saying "not now" rather than
+#: "no"; a 404 is a fact and retrying it just wastes the reader's time.
+RETRY_STATUS = frozenset({408, 425, 429, 500, 502, 503, 504})
+RETRIES = 3
+RETRY_BACKOFF_SEC = 2.0
+
+#: Below this, an HTML page yielded so little text that it is almost certainly rendered by
+#: JavaScript rather than actually empty. Measured: the OpenStax book page returns 61
+#: characters and links to no PDF at all. Such a page is reported as `thin` rather than
+#: quietly accepted (it would score as noise) or quietly dropped (the reader would never
+#: learn that a good source was skipped for a fixable reason).
+THIN_TEXT_CHARS = 800
+
+#: A browser-shaped header set. Some university and publisher hosts serve a redirect or an
+#: error to clients that send nothing but a User-Agent.
+BROWSE_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+              "application/pdf;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
 
 @dataclass
 class Document:
@@ -46,6 +68,9 @@ class Document:
     sha256: str = ""
     licence: LIC.Licence | None = None
     error: str = ""
+    thin: bool = False                  # HTML that rendered to almost no text
+    alternates: list[str] = field(default_factory=list)   # documents the page links to
+    attempts: int = 1
     raw: bytes | None = field(default=None, repr=False)
 
     @property
@@ -99,38 +124,86 @@ def _pdf_to_text(raw: bytes, max_pages: int = 3000) -> tuple[str, str]:
         return "", ""
 
 
+def _document_links(body: str, base: str) -> list[str]:
+    """Links on a page that look like documents rather than navigation.
+
+    Only useful when a page is thin: many university course pages are a thin index that
+    links the PDF everyone actually wants. It does not rescue a true single-page app —
+    the OpenStax book page links no PDF at all — but it costs one pass over the HTML and
+    turns a whole class of dead ends into live ones.
+    """
+    from urllib.parse import urljoin
+    from lxml import html as LH
+
+    try:
+        doc = LH.fromstring(body)
+    except Exception:                                 # noqa: BLE001
+        return []
+    out, seen = [], set()
+    for href in doc.xpath("//a/@href") + doc.xpath("//link/@href"):
+        if not isinstance(href, str):
+            continue
+        full = urljoin(base, href)
+        if full.lower().split("?")[0].endswith((".pdf", ".epub", ".txt", ".md")):
+            if full not in seen:
+                seen.add(full)
+                out.append(full)
+    return out[:20]
+
+
 def fetch(url: str, *, max_bytes: int = 64 << 20, timeout: float = 40.0,
-          keep_raw: bool = True) -> Document:
+          keep_raw: bool = True, retries: int = RETRIES) -> Document:
     """Download one URL and extract what a corpus needs from it.
 
     Never raises. A candidate that 404s, times out or turns out to be a video is a
-    candidate that gets rejected with a reason, not a build that stops.
+    candidate rejected with a reason, not a build that stops. Transient refusals — 429,
+    5xx, a dropped connection — are retried, because a build fetching fifty documents will
+    meet one of those, and losing a textbook to a momentary 503 is a bad outcome that
+    looks exactly like a bad source.
     """
     doc = Document(url=url)
-    try:
-        with httpx.stream("GET", url, headers={"User-Agent": UA},
-                          timeout=timeout, follow_redirects=True) as resp:
-            resp.raise_for_status()
-            ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
-            doc.content_type = ctype
-            if any(ctype.startswith(b) for b in BINARY_HINTS):
-                doc.error = f"not a document ({ctype})"
-                return doc
-
-            declared = resp.headers.get("content-length")
-            if declared and declared.isdigit() and int(declared) > max_bytes:
-                doc.error = f"too large ({int(declared)/1e6:.0f} MB > {max_bytes/1e6:.0f} MB)"
-                return doc
-
-            buf = bytearray()
-            for part in resp.iter_bytes(CHUNK):
-                buf += part
-                if len(buf) > max_bytes:
-                    doc.error = f"exceeded {max_bytes/1e6:.0f} MB while downloading"
+    raw = None
+    for attempt in range(1, max(1, retries) + 1):
+        doc.attempts = attempt
+        try:
+            with httpx.stream("GET", url, headers={"User-Agent": UA, **BROWSE_HEADERS},
+                              timeout=timeout, follow_redirects=True) as resp:
+                if resp.status_code in RETRY_STATUS and attempt < retries:
+                    time.sleep(RETRY_BACKOFF_SEC * (2 ** (attempt - 1)))
+                    continue
+                resp.raise_for_status()
+                ctype = resp.headers.get("content-type", "").split(";")[0].strip().lower()
+                doc.content_type = ctype
+                if any(ctype.startswith(b) for b in BINARY_HINTS):
+                    doc.error = f"not a document ({ctype})"
                     return doc
-            raw = bytes(buf)
-    except Exception as exc:                          # noqa: BLE001
-        doc.error = f"{type(exc).__name__}: {str(exc)[:120]}"
+
+                declared = resp.headers.get("content-length")
+                if declared and declared.isdigit() and int(declared) > max_bytes:
+                    doc.error = (f"too large ({int(declared)/1e6:.0f} MB > "
+                                 f"{max_bytes/1e6:.0f} MB)")
+                    return doc
+
+                buf = bytearray()
+                for part in resp.iter_bytes(CHUNK):
+                    buf += part
+                    if len(buf) > max_bytes:
+                        doc.error = f"exceeded {max_bytes/1e6:.0f} MB while downloading"
+                        return doc
+                raw = bytes(buf)
+                doc.error = ""
+                break
+        except httpx.HTTPStatusError as exc:
+            doc.error = f"HTTP {exc.response.status_code}"
+            return doc                                # a 404 is a fact, not a hiccup
+        except Exception as exc:                      # noqa: BLE001
+            doc.error = f"{type(exc).__name__}: {str(exc)[:120]}"
+            if attempt < retries:
+                time.sleep(RETRY_BACKOFF_SEC * (2 ** (attempt - 1)))
+                continue
+            return doc
+    if raw is None:
+        doc.error = doc.error or f"gave up after {doc.attempts} attempts"
         return doc
 
     doc.bytes_downloaded = len(raw)
@@ -148,7 +221,16 @@ def fetch(url: str, *, max_bytes: int = 64 << 20, timeout: float = 40.0,
     else:
         doc.text = raw.decode("utf-8", "replace")
 
-    if not doc.text.strip():
+    if body_html and len(doc.text.strip()) < THIN_TEXT_CHARS:
+        # Say what happened rather than reporting an empty document. A reader told "this
+        # page needs JavaScript, and here is what it links to" can act; one told "no
+        # extractable text" concludes the source was bad.
+        doc.thin = True
+        doc.alternates = _document_links(body_html, doc.url)
+        doc.error = (f"page rendered only {len(doc.text.strip())} characters "
+                     f"(JavaScript-rendered?)"
+                     + (f"; links {len(doc.alternates)} document(s)" if doc.alternates else ""))
+    elif not doc.text.strip():
         doc.error = doc.error or "no extractable text"
 
     # Licence last, on the extracted text, so a statement inside a PDF is seen.
