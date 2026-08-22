@@ -77,27 +77,22 @@ def model_resolve(req: ResolveRequest) -> JSONResponse:
     # Warn rather than block: an architecture an allowlist does not know may still be
     # servable, and refusing the download would be a worse failure than letting someone
     # try. Which warning applies depends entirely on the runtime that will load it.
-    from lara.models import FORMAT_HELP, VLLM_ARCHS, wants_format
-    fmt = wants_format(dev.backend)
-    body["backend"] = dev.backend
-    body["wants_format"] = fmt
-    if fmt == "gguf":
-        if not r.n_gguf:
-            body["warning"] = (
-                f"This repo has no GGUF weights, and {dev.backend} cannot load "
-                f"safetensors. {FORMAT_HELP['gguf']}")
-    elif fmt == "mlx":
-        if not r.repo.startswith("mlx-community/"):
-            body["warning"] = (f"This does not look like an MLX conversion. "
-                               f"{FORMAT_HELP['mlx']}")
-    else:
-        if r.arch and r.arch not in VLLM_ARCHS:
-            body["warning"] = (
-                f"{r.arch} is not in the vLLM allowlist this build knows about. It may "
-                "still work; the model picker will list it once downloaded.")
-        if r.n_gguf and not r.n_safetensors:
-            body["warning"] = ("GGUF-only repo, and this machine serves with vLLM, which "
-                               "cannot read GGUF (D4). Use a safetensors build.")
+    #
+    # resolve_backend, not dev.backend. The latter is the advisory description and says
+    # "llama.cpp" on any Mac, while a Mac with mlx-lm installed actually runs MLX -- so
+    # this endpoint warned that an mlx-community repo "has no GGUF weights" and waved
+    # through the GGUF build that would not have loaded. /api/device already draws this
+    # distinction and says why; this one did not.
+    from lara.models import format_warning, wants_format
+    from lara.serve import generator as GEN
+
+    backend = GEN.resolve_backend(s.cfg, dev.accelerator,
+                                  s.cfg.get_path("huggingface.home"))
+    body["backend"] = backend
+    body["wants_format"] = wants_format(backend)
+    warning = format_warning(r, backend)
+    if warning:
+        body["warning"] = warning
     return JSONResponse(body)
 
 

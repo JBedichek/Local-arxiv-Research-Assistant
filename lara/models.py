@@ -51,6 +51,47 @@ FORMAT_HELP = {
 }
 
 
+#: One concrete repo per format, so a prompt can show what a valid answer looks like.
+#: A model name alone is not enough -- "Qwen3-8B" names three different sets of files
+#: depending on who converted it, and only one will load on any given machine. The reader
+#: UI carries the same examples in web/js/models.js (FORMAT_GUIDE).
+FORMAT_EXAMPLE = {
+    "gguf": "unsloth/Qwen3-8B-GGUF",
+    "mlx": "mlx-community/Qwen3-8B-4bit",
+    "safetensors": "Qwen/Qwen3-8B",
+}
+
+
+def format_warning(resolved, backend: str) -> str | None:
+    """Why ``resolved`` may not load under ``backend``, or None if it looks right.
+
+    Takes anything with the fields ``resolve()`` returns, rather than importing
+    ``Resolved``, so :mod:`lara.models` stays free of a dependency on the serving layer.
+
+    Shared by the reader's download dialog and the setup wizard. They asked the same
+    question in two places and would have answered it differently the first time either
+    changed -- and "will this file load at all" is exactly the question you want settled
+    before pulling 8 GB, not after.
+    """
+    fmt = wants_format(backend)
+    if fmt == "gguf":
+        if not resolved.n_gguf:
+            return (f"This repo has no GGUF weights, and {backend} cannot load "
+                    f"safetensors. {FORMAT_HELP['gguf']}")
+    elif fmt == "mlx":
+        if not (resolved.repo or "").startswith("mlx-community/"):
+            return f"This does not look like an MLX conversion. {FORMAT_HELP['mlx']}"
+    else:
+        if resolved.arch and resolved.arch not in VLLM_ARCHS:
+            return (f"{resolved.arch} is not in the vLLM allowlist this build knows "
+                    "about. It may still work; the model picker will list it once "
+                    "downloaded.")
+        if resolved.n_gguf and not resolved.n_safetensors:
+            return ("GGUF-only repo, and this machine serves with vLLM, which cannot "
+                    "read GGUF (D4). Use a safetensors build.")
+    return None
+
+
 def wants_format(backend: str) -> str:
     """The weight format a backend can actually load.
 

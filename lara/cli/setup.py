@@ -58,6 +58,143 @@ def _probe_generators(timeout: float = 0.6) -> list[tuple[str, str]]:
             continue
     return found
 
+#: What counts as "fetch one" at the model prompt. Spelled out rather than a menu
+#: because the same prompt also accepts a repo id, and a numbered menu cannot.
+_DOWNLOAD_WORDS = {"download", "dl", "d"}
+
+
+def _hf_token() -> str | None:
+    """The token `hf auth login` stored, falling back to the environment.
+
+    The serving routes read only ``HF_TOKEN`` because a server is usually started with
+    one. A person at the wizard has almost certainly run ``hf auth login`` instead, which
+    writes to the cache and never sets the variable -- so reading the environment alone
+    made every gated repo look like it did not exist.
+    """
+    import os
+
+    try:
+        from huggingface_hub import get_token
+
+        return get_token() or os.environ.get("HF_TOKEN")
+    except Exception:
+        return os.environ.get("HF_TOKEN")
+
+
+def _download_model(cfg, device, gen_backend) -> str | None:
+    """Find a model on Hugging Face and pull it into the cache. Returns its spec.
+
+    The reader UI has done this since the download dialog landed. The wizard only told
+    you to go there -- which on a new machine is advice that does not work, because the
+    cache is empty precisely when nothing has run yet, and the reader will not start
+    without the config this step is trying to write. That left the one step needing a
+    model as the one step unable to obtain one.
+    """
+    import shutil
+    import time
+
+    from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+
+    from lara.serve import devices as DV
+    from lara.serve import downloads as DL
+
+    fmt = models_mod.wants_format(gen_backend)
+    hf_home = cfg.get_path("huggingface.home")
+    token = _hf_token()
+    mgr = DL.DownloadManager(hf_home)
+
+    console.print(f"  [dim]{gen_backend} loads [bold]{fmt}[/bold] weights. "
+                  f"{models_mod.FORMAT_HELP[fmt]}[/dim]")
+
+    while True:
+        q = (typer.prompt(f"  repo id or URL (e.g. {models_mod.FORMAT_EXAMPLE[fmt]}; "
+                          "blank to cancel)", default="", show_default=False) or "").strip()
+        if not q:
+            return None
+        if not DL.normalise(q):
+            console.print("  [red]not a Hugging Face id[/red] — expected owner/name, "
+                          "or a huggingface.co URL")
+            continue
+
+        console.print("  [dim]resolving…[/dim]")
+        r = DL.resolve(q, token=token)
+        if not r.exists:
+            if r.gated:
+                console.print(f"  [red]{r.repo} is gated[/red] — accept its licence on "
+                              "the model card, then run `hf auth login`")
+            else:
+                console.print(f"  [red]{r.error or 'not found'}[/red]")
+            continue
+
+        # Sizing is per quantisation, not per repo: a GGUF publisher ships every level in
+        # one repo, and llama.cpp loads exactly one of them.
+        files = next((v["files"] for v in r.variants if v["quant"] == r.pick), None)
+        size = r.size_gb
+        t = Table(show_header=False, box=None, padding=(0, 2))
+        t.add_row("repo", r.repo)
+        if r.params:
+            t.add_row("params", f"{r.params / 1e9:.1f}B")
+        if r.pick:
+            t.add_row("quantisation", r.pick)
+        if size:
+            t.add_row("download", f"{size:.1f} GB")
+            f = DV.fits(size, device)
+            t.add_row("fits?", f"[green]yes[/green] ({f['margin_gb']:.0f} GB spare)"
+                      if f["fits"] else
+                      f"[red]no[/red] (needs {f['needed_gb']:.0f} of "
+                      f"{f['budget_gb']:.0f} GB {f['where']})")
+        console.print(t)
+
+        warning = models_mod.format_warning(r, gen_backend)
+        if warning:
+            console.print(f"  [yellow]{warning}[/yellow]")
+
+        if mgr.cache_dir(r.repo).exists():
+            console.print("  [dim]already in the cache[/dim]")
+            return f"{r.repo}:{r.pick}" if r.pick else r.repo
+
+        # Refuse rather than fill the disk and fail 40 minutes in. The 1.1 factor covers
+        # the tokenizer and configs the size estimate does not count.
+        free_gb = shutil.disk_usage(hf_home).free / 1e9
+        if size and size * 1.1 > free_gb:
+            console.print(f"  [red]needs ~{size:.0f} GB, only {free_gb:.0f} GB free[/red]")
+            continue
+
+        if not typer.confirm(f"  download {r.repo}?", default=not warning):
+            continue
+
+        job = mgr.start(r.repo, size, token=token, files=files)
+        with Progress(TextColumn("  [progress.description]{task.description}"),
+                      BarColumn(), TextColumn("{task.percentage:>3.0f}%"),
+                      TimeElapsedColumn(), console=console) as prog:
+            task = prog.add_task(r.repo, total=max(size, 0.01))
+            while job.status in ("starting", "downloading"):
+                time.sleep(1.0)
+                prog.update(task, completed=min(job.downloaded_gb, size or job.downloaded_gb))
+            prog.update(task, completed=max(size, 0.01))
+
+        if job.status == "error":
+            console.print(f"  [red]download failed:[/red] {job.error}")
+            continue
+
+        console.print(f"  [green]downloaded[/green] {job.downloaded_gb:.1f} GB")
+        # Re-scan rather than trust the repo id: `scan` is what decides the quantisation
+        # actually present on disk, and the spec has to name it.
+        found = next((m for m in models_mod.scan(hf_home, backend=gen_backend)
+                      if m.repo == r.repo), None)
+        if found and found.servable:
+            return found.spec
+        # Scanning already worked out exactly why and put it in `reasons`; the old
+        # message spent the user a second command to be told something we were holding.
+        if found and found.reasons:
+            console.print(f"  [yellow]downloaded, but not servable here:[/yellow] "
+                          f"{'; '.join(found.reasons)}")
+        else:
+            console.print("  [yellow]downloaded, but it does not scan as servable here"
+                          "[/yellow] — `lara models` explains why")
+        return f"{r.repo}:{r.pick}" if r.pick else r.repo
+
+
 @app.command()
 def setup(
     config: str = typer.Option(None, help="Path to config.yaml"),
@@ -204,10 +341,9 @@ def setup(
         cached = [m for m in models_mod.scan(cfg.get_path("huggingface.home"),
                                              backend=gen_backend) if m.servable]
         fitting = [m for m in cached if DV.fits(m.size_gb, device)["fits"]]
+        interactive = not non_interactive and not show
         if not cached:
-            console.print("  [yellow]no servable model in the HF cache[/yellow] — "
-                          "download one from the reader UI, or run Ollama / LM Studio "
-                          "and re-run setup.")
+            console.print("  [yellow]no servable model in the HF cache[/yellow]")
         else:
             t = Table(show_header=True, header_style="bold")
             t.add_column("GB", justify="right"); t.add_column("repo")
@@ -219,18 +355,37 @@ def setup(
                           else f"[red]no[/red] (needs {f['needed_gb']:.0f} of "
                                f"{f['budget_gb']:.0f} GB {f['where']})")
             console.print(t)
-            if fitting and not non_interactive and not show:
-                model = typer.prompt("  model (blank to skip)",
-                                     default=fitting[-1].spec, show_default=True) or None
-            elif fitting and (non_interactive or show):
-                # --show previews what --non-interactive would do, as it already does for
-                # an already-running generator. Without `show` here it previewed a config
-                # with no model at all, which is not what running it would produce.
-                model = fitting[-1].spec
-            if model:
-                m = next((x for x in cached if model in (x.repo, x.spec)), None)
-                if m and m.runtime_quant_options():
-                    quant = m.runtime_quant_options()[0]
+
+        if interactive:
+            # Offered whether or not the cache holds something. An empty cache used to be
+            # sent to the reader UI, which cannot be opened until this wizard has written
+            # a config; and a machine whose only cached model does not fit was given no
+            # way forward at all. Both are the ordinary state of a new install.
+            answer = (typer.prompt(
+                "  model (blank to skip, 'download' to fetch one from Hugging Face)",
+                default=fitting[-1].spec if fitting else "download",
+                show_default=True) or "").strip()
+            if answer.lower() in _DOWNLOAD_WORDS:
+                model = _download_model(cfg, device, gen_backend)
+                if model:
+                    # A freshly downloaded model has to be in `cached` for the context
+                    # sizing below, which reads its weight size from that list.
+                    cached = [m for m in models_mod.scan(
+                        cfg.get_path("huggingface.home"), backend=gen_backend)
+                        if m.servable]
+            else:
+                model = answer or None
+        elif fitting:
+            # --show previews what --non-interactive would do, as it already does for an
+            # already-running generator. Without this it previewed a config with no model
+            # at all, which is not what running it would produce. Neither mode downloads:
+            # a flag meaning "accept the recommendations" must not start a 5 GB transfer.
+            model = fitting[-1].spec
+
+        if model:
+            m = next((x for x in cached if model in (x.repo, x.spec)), None)
+            if m and m.runtime_quant_options():
+                quant = m.runtime_quant_options()[0]
 
     # ── 5b. context length ─────────────────────────────────────────────────────
     # The KV cache is per-token and at 32k outweighs the weights it serves, so this is

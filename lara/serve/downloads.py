@@ -175,12 +175,9 @@ def resolve(query: str, token: str | None = None) -> Resolved:
     safet = d.get("safetensors") or {}
 
     params = int(safet.get("total") or 0)
-    dtype_bytes = 1 if (cfg.get("quantization_config") or {}) else 2
     variants: list[dict] = []
     pick: str | None = None
-    if params:
-        size = params * dtype_bytes / 1e9
-    elif gg and not st:
+    if gg and not st:
         # A GGUF repo ships every quantisation of the same model, so usedStorage is the
         # sum of a dozen alternatives — it reported 707 GB for an 8B model. Size is only
         # meaningful once a quantisation is chosen, so resolve them individually and
@@ -190,7 +187,22 @@ def resolve(query: str, token: str | None = None) -> Resolved:
         chosen = next((v for v in variants if v["quant"] == pick), None)
         size = chosen["size_gb"] if chosen else 0.0
     else:
-        size = (d.get("usedStorage") or 0) / 1e9
+        # Weigh the actual files rather than inferring from the parameter count.
+        # `safetensors.total` counts *stored elements*, which is not the parameter count
+        # for a packed checkpoint: MLX stores eight 4-bit weights per uint32, so
+        # mlx-community/Qwen3-8B-4bit reports 1.28B and the old `params * 1 byte` sized it
+        # at 1.3 GB against a real 4.61 GB file. Undersizing is the dangerous direction —
+        # it is what both the "does it fit" verdict and the free-disk guard are computed
+        # from. Summing `*.safetensors` also matches what is actually fetched, since ALLOW
+        # takes all of them.
+        size = sum(f.get("size") or 0 for f in tree(repo, token)
+                   if str(f.get("path", "")).endswith(".safetensors")) / 1e9
+        if not size:
+            # tree() degrades to [] on any failure, and reporting 0 GB reads as "free" to
+            # every caller. Fall back to the old estimate, wrong but not silently zero.
+            dtype_bytes = 1 if (cfg.get("quantization_config") or {}) else 2
+            size = (params * dtype_bytes / 1e9 if params
+                    else (d.get("usedStorage") or 0) / 1e9)
 
     return Resolved(
         repo=repo, exists=True, params=params,
