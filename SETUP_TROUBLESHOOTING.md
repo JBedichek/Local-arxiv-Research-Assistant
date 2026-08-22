@@ -50,10 +50,26 @@ wastes time, because the flag is valid — you copied it from current docs — i
 just doesn't exist in the older git actually being run. `git clone --revision`,
 for example, requires git 2.49+.
 
-macOS ships `/usr/bin/git` = **Apple Git 2.39.5**, which is years behind. That
-was the cause here.
+macOS ships `/usr/bin/git` from the Command Line Tools, and **which version you get
+depends on your macOS release.** That is what makes this trap intermittent — the same
+document is right on one Mac and wrong on the next:
 
-### The fix
+| macOS | Apple Git | has `git clone --revision` (2.49+) |
+|---|---|---|
+| Ventura / Sonoma / early Sequoia | 2.39.5 | no |
+| macOS 26 (Tahoe) | **2.50.1** | yes |
+
+2.39.5 was the cause here. **Check your own version before assuming it is also yours** —
+on a current macOS it is not, and this whole section will be a dead end:
+
+```sh
+git --version
+```
+
+**At 2.49 or newer, stop: this is not your problem.** Installing a second git will not fix
+anything. Go back to cause 1 and look for a typo or a genuinely unknown flag.
+
+### The fix (only when your git is older than 2.49)
 
 Install a current git and make sure it wins on `PATH`:
 
@@ -68,7 +84,7 @@ which git
 git --version
 ```
 
-You want `/opt/homebrew/bin/git` and version 2.5x — **not** `/usr/bin/git` at 2.39.x.
+You want `/opt/homebrew/bin/git` at 2.49 or newer — **not** an older `/usr/bin/git`.
 
 If `which git` still shows `/usr/bin/git`, `/opt/homebrew/bin` is not early
 enough on `PATH`. Fix by prepending it in `~/.zshrc`:

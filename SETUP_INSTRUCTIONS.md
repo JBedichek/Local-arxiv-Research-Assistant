@@ -15,6 +15,12 @@ whether that memory is unified. The wizard asks only for *preferences*: which se
 (it recommends one), which topics matter to you (only if your machine needs the corpus
 trimmed), and which model to generate with.
 
+> **Starting from a brand-new Mac?** It has no Homebrew, no Python 3.12, and no usable
+> `git` — and it hides this well: `/usr/bin/git` and `/usr/bin/python3` both answer `which`
+> while being nothing but installer stubs.
+> [`SETUP_MACOS_BOOTSTRAP.md`](SETUP_MACOS_BOOTSTRAP.md) covers that layer and hands back
+> here at [step 2](#2-install). Everything below assumes it is done.
+
 ---
 
 ## Getting access (do this first)
@@ -46,8 +52,9 @@ do it sooner, `brew install hf` installs it standalone.)
 
 ### GitHub — this repository
 
-This repository is **private**. On a new machine, two commands are all you need — **no SSH
-key, no Personal Access Token to manage by hand**:
+This repository is **public**: `git clone` over HTTPS needs no account, no token and no
+key. You still need credentials to **push**, and on a new machine two commands are all it
+takes — **no SSH key, no Personal Access Token to manage by hand**:
 
 ```bash
 gh auth login --git-protocol https --web
@@ -86,7 +93,7 @@ in the table underneath.
 gh repo clone JBedichek/Local-arxiv-Research-Assistant
 cd Local-arxiv-Research-Assistant
 
-python3 -m venv .venv && source .venv/bin/activate
+python3.12 -m venv .venv && source .venv/bin/activate
 pip install -e '.[mac]'
 
 hf auth login
@@ -187,14 +194,19 @@ The two-command path is at the top of this file. The alternatives, if it does no
 | You already use SSH keys | `git clone git@github.com:JBedichek/Local-arxiv-Research-Assistant.git` |
 | Logged in with `ssh` and want HTTPS too | `gh auth setup-git` |
 | Headless box, no browser | `gh auth login --with-token < token.txt` |
-| No `gh`, no SSH | clone over HTTPS and paste a Personal Access Token at the password prompt |
+| No `gh`, no SSH | `git clone https://github.com/JBedichek/Local-arxiv-Research-Assistant.git` — nothing to authenticate |
 
-A Personal Access Token needs the `repo` scope to reach a private repository.
+**While this repository is public, cloning needs no credentials at all** — the rows above
+matter for *pushing*. A Personal Access Token used to push needs the `repo` scope.
 
 - **A Hugging Face account with access to `google/embeddinggemma-300m`** — gated, granted by
   request, and required for search to work at all. Start this first; see
   [Getting access](#getting-access-do-this-first).
-- **Python 3.12+**
+- **Python 3.12+** — **macOS ships 3.9.6, which is not close enough to limp along on.**
+  `brew install python@3.12`, then create the venv with `python3.12` *by name*: Homebrew
+  does not make it the default, so a bare `python3` can still be the system 3.9 and the
+  install fails with a requires-python error that reads like a broken package. See
+  [`SETUP_MACOS_BOOTSTRAP.md`](SETUP_MACOS_BOOTSTRAP.md).
 - **Disk**: 50 GB for `core`, 95 GB with `full`. Check with `df -h .`, or
   `Get-PSDrive C` in PowerShell, before starting.
 - **RAM**: 8 GB works with a trimmed corpus; 32 GB+ runs everything untouched. Step 4
@@ -211,6 +223,12 @@ gh repo clone JBedichek/Local-arxiv-Research-Assistant
 cd Local-arxiv-Research-Assistant
 python3 -m venv .venv && source .venv/bin/activate
 ```
+
+> **On macOS, write `python3.12 -m venv .venv` instead.** The system `python3` is 3.9.6 and
+> `brew install python@3.12` deliberately does not displace it, so bare `python3` may build
+> the venv from an interpreter this project cannot use. The failure lands one command later,
+> at `pip install`, as a requires-python error. Check with `python --version` after
+> activating — it must say 3.12 or newer.
 
 Pick exactly one platform extra:
 
