@@ -12,7 +12,7 @@ which model generates.
 
 > **Brand-new Mac?** It has no Homebrew, no Python 3.12 and no usable `git`, and it hides
 > this well — `/usr/bin/git` and `/usr/bin/python3` both answer `which` while being installer
-> stubs. [`SETUP_MACOS_BOOTSTRAP.md`](SETUP_MACOS_BOOTSTRAP.md) covers that layer and hands
+> stubs. [`SETUP_MACOS_ENV.md`](SETUP_MACOS_ENV.md) covers that layer and hands
 > back here at [step 2](#2-install). Everything below assumes it is done.
 
 ---
@@ -370,21 +370,57 @@ lara setup
 ```
 
 Writes `config.local.yaml`, which the server reads on **every** start, so this is a one-time
-step. Re-running is safe: it replaces only the settings it manages, preserves everything
+step. It walks six steps: what this machine is, the corpus, retrieval, what to keep, the
+model backend, and the generator. Re-running is safe: it replaces only the settings it manages, preserves everything
 else, and backs up the previous file.
 
 **Nothing about your hardware is asked for.** OS and architecture come from `platform`,
 NVIDIA cards and VRAM from `nvidia-smi`, Metal from `torch.backends.mps`, RAM from
 `sysconf`/`sysctl`, and a running generator from probing `:8000`, `:11434`, `:1234`, `:8080`.
 
-It asks only: **search backend** (recommended row pre-selected), **topics** (only if your
-machine needs trimming), and **model**.
+It asks only: **search backend** (recommended row pre-selected), **model backend**
+(llama.cpp or MLX on a Mac), **topics** (only if your machine needs trimming), and
+**model**.
 
 | variant | effect |
 |---|---|
 | `--show` | print the plan and config it would write; changes nothing, and skips the Hugging Face gate |
 | `--non-interactive` | accept every recommendation |
 | `--prefer speed` | or `memory`, or `balanced` (default) |
+
+### Model backend
+
+Which runtime generates the answers. On Apple Silicon there are two real options and the
+wizard asks rather than deciding for you:
+
+| backend | weights | checkpoints look like | where they live |
+|---|---|---|---|
+| **llama.cpp** *(default)* | GGUF | `unsloth/Qwen3-8B-GGUF` | [all GGUF models](https://huggingface.co/models?library=gguf), or [bartowski](https://huggingface.co/bartowski) / [unsloth](https://huggingface.co/unsloth) |
+| **MLX** | MLX | `mlx-community/Qwen3-8B-4bit` | [mlx-community](https://huggingface.co/mlx-community) — look for a `-4bit` suffix |
+
+**Both are Metal-accelerated and perform similarly**, so this is not the speed decision it
+looks like. llama.cpp is the default because it is the more mature runtime and GGUF is the
+format most local models are actually published in; MLX targets Apple Silicon directly and
+is often a little faster. Either is a reasonable answer.
+
+**What the choice really decides is which checkpoints you download.** The two formats are
+not interchangeable: a GGUF file will not load under MLX, and an `mlx-community` conversion
+will not load under llama.cpp. The same model — "Qwen3-8B" — exists as three unrelated sets
+of files depending on who converted it, and only one of them will open on the backend you
+picked. Choosing here before pulling 5 GB is the point of asking.
+
+Each backend keeps its **own** `model` setting in `config.local.yaml`, so switching later
+means having a checkpoint in the other format too. `lara backends` lists what is installed;
+`lara bench-generate` measures them on your hardware if you want to settle it by numbers
+rather than by default.
+
+> **llama.cpp has to be installed separately** — `brew install llama.cpp`. It is a binary,
+> so `pip install -e '.[mac]'` cannot supply it, and without it the wizard offers only MLX
+> (which ships with that extra). If the table shows one row where you expected two, that is
+> why: check with `which llama-server`.
+
+On NVIDIA the pair is vLLM and llama.cpp instead, and vLLM is the default. vLLM has no
+Metal backend, so it is never offered on a Mac.
 
 ### Search backends
 

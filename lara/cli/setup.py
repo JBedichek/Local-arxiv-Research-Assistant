@@ -195,6 +195,72 @@ def _download_model(cfg, device, gen_backend) -> str | None:
         return f"{r.repo}:{r.pick}" if r.pick else r.repo
 
 
+#: Backends that load a checkpoint you download from Hugging Face, best-supported first
+#: per platform. Ollama is deliberately absent: it names models by its own tag
+#: (``qwen3:8b``) rather than by repo, so "which checkpoint do I fetch" has no answer for
+#: it, and the generator step already adopts one that is running.
+_BACKEND_CHOICES = {
+    "mps": ("llamacpp", "mlx"),
+    "cuda": ("vllm", "llamacpp"),
+    "rocm": ("vllm", "llamacpp"),
+}
+
+
+def _choose_backend(cfg, device, interactive: bool) -> str:
+    """Which runtime generates, asked rather than inferred.
+
+    The wizard used to resolve this silently and print the answer. That is fine until the
+    two candidates are genuinely close -- which on Apple Silicon they are -- because the
+    choice then stops being about speed and becomes about which checkpoints you will spend
+    the next 5 GB downloading. Deciding that for someone, in a line of dim text, is how
+    people end up with a cache full of weights their runtime cannot open.
+    """
+    from lara.serve import generator as GEN
+    from lara.serve.runtimes import BACKENDS
+
+    resolved = GEN.resolve_backend(cfg, device.accelerator,
+                                   cfg.get_path("huggingface.home"))
+    candidates = [n for n in _BACKEND_CHOICES.get(device.accelerator, ("llamacpp",))
+                  if BACKENDS[n].available()]
+
+    if not candidates:
+        # resolve_backend still returns the platform's best answer; the generator step
+        # prints how to install it. An empty menu helps nobody.
+        console.print(f"  [yellow]none installed[/yellow] — [bold]{resolved}[/bold] is the "
+                      f"right one for this machine. `lara backends` says how to get it.")
+        return resolved
+
+    t = Table(show_header=True, header_style="bold")
+    t.add_column(" ")
+    t.add_column("backend")
+    t.add_column("weights")
+    t.add_column("checkpoints look like", overflow="fold")
+    for n in candidates:
+        fmt = models_mod.wants_format(n)
+        t.add_row("[green]>[/green]" if n == resolved else " ", n, fmt,
+                  models_mod.FORMAT_EXAMPLE[fmt])
+    console.print(t)
+
+    if device.accelerator == "mps" and len(candidates) > 1:
+        console.print("  [dim]Both are Metal-accelerated and perform similarly here, so "
+                      "either is a reasonable choice.[/dim]")
+    console.print("  [dim]What differs is the checkpoint. The formats are not "
+                  "interchangeable — a repo built for one will not load in the other, so "
+                  "this decides what you download, not just how fast it runs.[/dim]")
+    for n in candidates:
+        console.print(f"  [dim]{n}: {models_mod.FORMAT_HELP[models_mod.wants_format(n)]}"
+                      "[/dim]")
+
+    if not interactive or len(candidates) == 1:
+        return resolved
+    while True:
+        ans = (typer.prompt("  backend", default=resolved,
+                            show_default=True) or "").strip().lower()
+        if ans in candidates:
+            return ans
+        console.print(f"  [red]pick one of:[/red] {', '.join(candidates)}")
+
+
 @app.command()
 def setup(
     config: str = typer.Option(None, help="Path to config.yaml"),
@@ -312,16 +378,17 @@ def setup(
                               "corpus resident instead.")
                 plan.scope_keep, plan.scope = 1.0, "unnecessary"
 
-    # ── 5. generator ───────────────────────────────────────────────────────────
-    console.print("\n[bold]5. Generator[/bold]")
-    from lara.serve import generator as GEN
+    # ── 5. model backend ───────────────────────────────────────────────────────
+    console.print("\n[bold]5. Model backend[/bold]")
+    interactive = not non_interactive and not show
+    gen_backend = _choose_backend(cfg, device, interactive)
 
-    # Not device.backend: that is advisory prose and says "llama.cpp" on any Mac, while
-    # the runtime actually chosen prefers MLX when mlx-lm is installed. They name
-    # different weight formats, so the list of servable models has to follow the real one.
-    gen_backend = GEN.resolve_backend(cfg, device.accelerator,
-                                      cfg.get_path("huggingface.home"))
-    console.print(f"  [dim]backend [bold]{gen_backend}[/bold], which loads "
+    # ── 6. generator ───────────────────────────────────────────────────────────
+    console.print("\n[bold]6. Generator[/bold]")
+    # Everything below follows the backend chosen above rather than device.backend, which
+    # is advisory prose. They name different weight formats, so the list of servable
+    # models has to follow the real one.
+    console.print(f"  [dim]{gen_backend} loads "
                   f"{models_mod.wants_format(gen_backend)} weights[/dim]")
     running = _probe_generators()
     for label, url, _ in running:
@@ -341,7 +408,6 @@ def setup(
         cached = [m for m in models_mod.scan(cfg.get_path("huggingface.home"),
                                              backend=gen_backend) if m.servable]
         fitting = [m for m in cached if DV.fits(m.size_gb, device)["fits"]]
-        interactive = not non_interactive and not show
         if not cached:
             console.print("  [yellow]no servable model in the HF cache[/yellow]")
         else:
@@ -387,7 +453,7 @@ def setup(
             if m and m.runtime_quant_options():
                 quant = m.runtime_quant_options()[0]
 
-    # ── 5b. context length ─────────────────────────────────────────────────────
+    # ── 6b. context length ─────────────────────────────────────────────────────
     # The KV cache is per-token and at 32k outweighs the weights it serves, so this is
     # the largest generator-side memory decision and nothing used to surface it.
     SLOT_CHOICES = (1, 2, 4)
@@ -491,7 +557,7 @@ def setup(
             raw = typer.prompt("  concurrent slots", default=str(slots))
             slots = int(raw) if raw.strip().isdigit() and int(raw) > 0 else slots
 
-    # ── 6. write ───────────────────────────────────────────────────────────────
+    # ── 7. write ───────────────────────────────────────────────────────────────
     overrides = LC.overrides_for(
         plan, model=model, quantization=quant, base_url=base_url,
         disk_root=str(cfg.get_path("disk.root")),
