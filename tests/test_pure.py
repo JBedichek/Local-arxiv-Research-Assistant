@@ -1006,3 +1006,53 @@ def test_round_ceiling_of_one_still_allows_a_round():
     # An off-by-one here would make the run do no work at all and consolidate nothing.
     assert not _SY.round_limit_reached(0, 1)
     assert _SY.round_limit_reached(1, 1)
+
+
+# ── synthesis: when a run should stop ─────────────────────────────────────────────
+#
+# The old test was `relevant == 0` for two rounds running. Measured over eight ten-round
+# runs on a 29.5M-chunk corpus that happened twice in eighty rounds and never twice
+# in a row, so it could not fire and max_rounds was silently doing all the
+# stopping. These pin the replacement, which asks about marginal yield instead.
+
+from lara.serve.synthesis import Round, round_limit_reached
+
+
+def _rounds(*new_papers):
+    return [Round(n=i + 1, query="q", new_papers=p) for i, p in enumerate(new_papers)]
+
+
+def _saturated(rounds, window=2, min_papers=3):
+    """The rule as run_synthesis applies it."""
+    recent = rounds[-window:]
+    return len(recent) >= window and sum(r.new_papers for r in recent) < min_papers
+
+
+def test_a_run_still_finding_papers_is_not_saturated():
+    # The measured shape: round 9 yielding 7 new papers is not a finished survey.
+    assert not _saturated(_rounds(12, 5, 6, 8, 10, 5, 10, 3, 10))
+
+
+def test_a_run_that_has_stopped_yielding_is_saturated():
+    assert _saturated(_rounds(12, 5, 6, 1, 1))
+
+
+def test_saturation_needs_the_whole_window_not_one_quiet_round():
+    # One lean round in the middle of a productive run is noise, not an ending.
+    assert not _saturated(_rounds(12, 0, 9))
+
+
+def test_saturation_cannot_fire_before_the_window_is_full():
+    assert not _saturated(_rounds(0), window=2)
+
+
+def test_the_window_and_threshold_are_configurable():
+    rounds = _rounds(2, 2, 2)
+    assert not _saturated(rounds, window=2, min_papers=3)      # 4 >= 3
+    assert _saturated(rounds, window=2, min_papers=5)          # 4 < 5
+    assert _saturated(rounds, window=3, min_papers=7)          # 6 < 7
+
+
+def test_the_round_cap_is_still_a_hard_ceiling():
+    assert round_limit_reached(10, 10) and not round_limit_reached(9, 10)
+    assert not round_limit_reached(999, 0), "0 disables the cap"

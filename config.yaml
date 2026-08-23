@@ -142,13 +142,32 @@ retrieval:
     per_round: 12            # excerpts read per round
     over_fetch: 4            # retrieve this many times per_round, then drop seen + diversify
     cap_per_paper: 3         # so one long on-topic paper cannot fill a round
-    dry_rounds: 2            # consecutive rounds with nothing new before stopping
+    dry_rounds: 2            # consecutive rounds with NOTHING relevant before stopping
     min_rounds: 4            # the model's stop vote is ignored below this depth
     stop_votes: 2            # consecutive stop votes needed to end a run
-    max_rounds: 10           # hard ceiling on rounds; 0 disables it. Every other stop
-                             # condition needs the evidence to run out, which a broad
-                             # question ("code LLMs") never does -- it keeps finding new
-                             # relevant claims, so the run continues indefinitely.
+    # Saturation, measured rather than absolute: stop when the last `saturation_window`
+    # rounds together added fewer than `saturation_min_new_papers` papers.
+    #
+    # `dry_rounds` alone could not fire. It wants a round yielding exactly zero relevant
+    # excerpts, and across eight measured ten-round runs that happened twice in eighty
+    # rounds and never twice in a row -- the mean round 9 still produced 8 claims from 6.8
+    # new papers. A rule that cannot fire is not a stopping rule, and max_rounds was
+    # quietly doing all the work.
+    #
+    # These defaults are deliberately not tuned to make those runs stop: they did not
+    # saturate, and a rule that ends them early would be hiding that rather than fixing
+    # it. They fire on narrow questions, where the corpus really does run out.
+    saturation_window: 2
+    saturation_min_new_papers: 3
+    max_rounds: 10           # hard ceiling on rounds; 0 disables it. This is a BUDGET,
+                             # not a saturation test: a broad question ("code LLMs") keeps
+                             # finding new relevant claims indefinitely, so on those this
+                             # is what stops the run, and `stopped_because` now says how
+                             # much it was still finding when the budget ran out.
+    # Retrievals allowed to overlap. Retrieval runs off the event loop so concurrent
+    # syntheses can keep generating during it; this bounds how many hit the single GPU
+    # index and cross-encoder at once.
+    concurrent_retrievals: 2
     max_feedback_vectors: 6
     expand_every: 2          # every Nth round walks the citation graph instead of dense
 

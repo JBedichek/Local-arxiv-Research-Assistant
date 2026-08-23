@@ -30,10 +30,13 @@ when consecutive rounds stop finding anything new regardless of what the model w
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
+from functools import lru_cache
 
 import numpy as np
 
@@ -421,7 +424,8 @@ CREATE INDEX IF NOT EXISTS idx_syn_rounds_run ON synthesis_rounds(run_id);
 def save(db_path, run: Run, rejected: list[tuple[str, int]]) -> None:
     """Persist the run and every judgement it made. Never raises."""
     try:
-        from lara.finetune.judgements import Judgement, record as record_j
+        from lara.finetune.judgements import Judgement
+        from lara.finetune.judgements import record as record_j
         from lara.store import db
 
         conn = db.connect(db_path)
@@ -555,6 +559,10 @@ async def run_synthesis(state, cfg, question: str, *, model=None, stream_answer=
     min_rounds = int(scfg.get("min_rounds", 4))
     stop_votes_needed = int(scfg.get("stop_votes", 2))
     max_rounds = int(scfg.get("max_rounds", 10))
+    # Saturation: fewer than `sat_min_papers` new papers across `sat_window` rounds.
+    # Defaults chosen against measured runs -- see the note at the check itself.
+    sat_window = int(scfg.get("saturation_window", 2))
+    sat_min_papers = int(scfg.get("saturation_min_new_papers", 3))
     # A floor above the ceiling would have min_rounds forcing "continue" on rounds the cap
     # will never allow. The cap still wins -- it is checked before any work -- but the
     # forced-continue votes in between are noise, so fold the floor down to meet it.
@@ -583,9 +591,16 @@ async def run_synthesis(state, cfg, question: str, *, model=None, stream_answer=
 
         # Checked before any work, so the limit is the number of rounds actually run.
         if round_limit_reached(len(run.rounds), max_rounds):
-            run.stopped_because = (f"reached the {max_rounds}-round limit"
-                                   + (f"; last gap: {run.rounds[-1].gap}"
-                                      if run.rounds and run.rounds[-1].gap else ""))
+            # Say what it was still finding when the budget ran out. "Reached the limit"
+            # alone does not distinguish a survey that was done from one that was cut off
+            # mid-yield, and those call for opposite responses from whoever reads it.
+            tail = run.rounds[-sat_window:]
+            still = sum(x.new_papers for x in tail)
+            run.stopped_because = (
+                f"reached the {max_rounds}-round limit; still finding {still} new "
+                f"paper(s) per {len(tail)} rounds"
+                + (f"; last gap: {run.rounds[-1].gap}"
+                   if run.rounds and run.rounds[-1].gap else ""))
             ev("limit", {"rounds": len(run.rounds), "max_rounds": max_rounds})
             break
 
@@ -604,8 +619,14 @@ async def run_synthesis(state, cfg, question: str, *, model=None, stream_answer=
             papers_scope = [p for p in dict.fromkeys(nb) if p not in seen_papers] or None
 
         fb = _feedback(state, run.claims, fb_cap)
-        r = state.retriever.retrieve(query, papers=papers_scope,
-                                     final_k=per_round * over_fetch, feedback=fb)
+        # Off the event loop. This call takes ~500 ms and used to hold the loop for all of
+        # it, so with several syntheses running concurrently nobody streamed a token while
+        # any one of them retrieved -- measured at 10.7% of a six-question batch. Moving it
+        # to a thread lets the others keep generating; the semaphore inside is what stops
+        # the retrievals it now allows to overlap from colliding on one GPU index.
+        r = await asyncio.to_thread(
+            _retrieve, state.retriever, query, papers_scope, per_round * over_fetch, fb,
+            int(scfg.get("concurrent_retrievals", 2)))
         from lara.serve.hierarchy import to_dict
         hits = [to_dict(h) for h in r.hits]
         rnd = Round(n=n, query=query, retrieved=len(hits), via=via)
@@ -644,8 +665,21 @@ async def run_synthesis(state, cfg, question: str, *, model=None, stream_answer=
         ev("claims", {"round": n, "claims": [asdict(c) for c in claims]})
         ev("round_done", asdict(rnd))
 
-        # Saturation overrides the model: a round that surfaced nothing new is evidence
-        # the corpus is exhausted for this query, whatever the model would prefer.
+        # Saturation overrides the model: a corpus that has stopped yielding is evidence,
+        # whatever the model would prefer.
+        #
+        # The test is marginal yield over a window, not a round of exactly zero. Requiring
+        # zero is a bar that a 29-million-chunk corpus essentially never clears -- measured
+        # over eight ten-round runs, the mean round-9 still produced 8 claims from 6.8 new
+        # papers, and not one run ever recorded two consecutive empty rounds. A rule that
+        # cannot fire is not a stopping rule; the round cap was doing all the work while
+        # appearing not to.
+        recent = run.rounds[-sat_window:]
+        new_papers_recent = sum(x.new_papers for x in recent)
+        if len(recent) >= sat_window and new_papers_recent < sat_min_papers:
+            run.stopped_because = (f"saturated: {new_papers_recent} new paper(s) across "
+                                   f"the last {sat_window} rounds")
+            break
         if rnd.relevant == 0:
             dry += 1
             if dry >= dry_limit:
@@ -692,6 +726,24 @@ async def run_synthesis(state, cfg, question: str, *, model=None, stream_answer=
                 "stopped_because": run.stopped_because,
                 "tldr": run.tldr, "thorough": run.thorough})
     return run
+
+
+@lru_cache(maxsize=8)
+def _retrieval_slots(n: int) -> threading.BoundedSemaphore:
+    """One bound per configured width. Process-wide on purpose: it is guarding a single
+    GPU index and a single cross-encoder, which every synthesis in this process shares."""
+    return threading.BoundedSemaphore(max(1, n))
+
+
+def _retrieve(retriever, query: str, papers, final_k: int, feedback, concurrency: int):
+    """Retrieval, run in a worker thread under a concurrency bound.
+
+    Two at a time by default. The work is a dense matmul and a cross-encoder forward on
+    one card; letting an unbounded number in would trade the loop-blocking problem for a
+    VRAM one.
+    """
+    with _retrieval_slots(concurrency):
+        return retriever.retrieve(query, papers=papers, final_k=final_k, feedback=feedback)
 
 
 def _feedback(state, claims: list[Claim], cap: int) -> list[np.ndarray]:
