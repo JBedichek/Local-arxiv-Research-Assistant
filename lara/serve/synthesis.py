@@ -571,6 +571,30 @@ def round_limit_reached(rounds_done: int, max_rounds: int) -> bool:
     return max_rounds > 0 and rounds_done >= max_rounds
 
 
+def saturated(rounds: list, total_papers: int, *, window: int, min_papers: int,
+              min_rounds: int) -> bool:
+    """Whether the corpus has stopped yielding for this question.
+
+    The test is marginal yield over a window, not a round of exactly zero. Requiring zero
+    is a bar a 29-million-chunk corpus essentially never clears -- measured over eight
+    ten-round runs, the mean round-9 still produced 8 claims from 6.8 new papers, and not
+    one run ever recorded two consecutive empty rounds. A rule that cannot fire is not a
+    stopping rule; the round cap was doing all the work while appearing not to.
+
+    **Two guards, and both are load-bearing.** A run that has not reached ``min_rounds``,
+    or that has found no papers at all, is not saturated -- it has not started. Without
+    them the rule fires on rounds 1 and 2 of a slow question and reports "saturated: 0 new
+    papers", which reads as "the corpus has nothing" and is indistinguishable from a
+    genuine negative result. That is the worst failure available here: research that
+    quietly returns nothing, in a second, and calls it an answer.
+    """
+    if len(rounds) < max(window, min_rounds):
+        return False
+    if not total_papers:
+        return False
+    return sum(r.new_papers for r in rounds[-window:]) < min_papers
+
+
 async def run_synthesis(state, cfg, question: str, *, model=None, stream_answer=None,
                         emit=None, should_stop=None) -> Run:
     """Iterate retrieval until saturated, then consolidate.
@@ -697,16 +721,10 @@ async def run_synthesis(state, cfg, question: str, *, model=None, stream_answer=
         # Saturation overrides the model: a corpus that has stopped yielding is evidence,
         # whatever the model would prefer.
         #
-        # The test is marginal yield over a window, not a round of exactly zero. Requiring
-        # zero is a bar that a 29-million-chunk corpus essentially never clears -- measured
-        # over eight ten-round runs, the mean round-9 still produced 8 claims from 6.8 new
-        # papers, and not one run ever recorded two consecutive empty rounds. A rule that
-        # cannot fire is not a stopping rule; the round cap was doing all the work while
-        # appearing not to.
-        recent = run.rounds[-sat_window:]
-        new_papers_recent = sum(x.new_papers for x in recent)
-        if len(recent) >= sat_window and new_papers_recent < sat_min_papers:
-            run.stopped_because = (f"saturated: {new_papers_recent} new paper(s) across "
+        if saturated(run.rounds, len(run.papers), window=sat_window,
+                     min_papers=sat_min_papers, min_rounds=min_rounds):
+            found = sum(x.new_papers for x in run.rounds[-sat_window:])
+            run.stopped_because = (f"saturated: {found} new paper(s) across "
                                    f"the last {sat_window} rounds")
             break
         if rnd.relevant == 0:

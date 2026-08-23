@@ -1022,10 +1022,18 @@ def _rounds(*new_papers):
     return [Round(n=i + 1, query="q", new_papers=p) for i, p in enumerate(new_papers)]
 
 
-def _saturated(rounds, window=2, min_papers=3):
-    """The rule as run_synthesis applies it."""
-    recent = rounds[-window:]
-    return len(recent) >= window and sum(r.new_papers for r in recent) < min_papers
+def _saturated(rounds, window=2, min_papers=3, min_rounds=1, papers=None):
+    """The rule itself, not a copy of it.
+
+    This used to restate the check inline, and the copy silently lost the guards the real
+    one needed: runs were ending on round 2 with "saturated: 0 new papers" while the tests
+    stayed green. A test that reimplements the code under test cannot fail with it.
+    """
+    from lara.serve.synthesis import saturated
+
+    total = len(rounds) * 5 if papers is None else papers
+    return saturated(rounds, total, window=window, min_papers=min_papers,
+                     min_rounds=min_rounds)
 
 
 def test_a_run_still_finding_papers_is_not_saturated():
@@ -1044,6 +1052,22 @@ def test_saturation_needs_the_whole_window_not_one_quiet_round():
 
 def test_saturation_cannot_fire_before_the_window_is_full():
     assert not _saturated(_rounds(0), window=2)
+
+
+def test_a_run_that_has_found_nothing_yet_is_not_saturated():
+    """The regression: rounds 1-2 of a slow question found no papers.
+
+    Reported as saturation this reads as "the corpus has nothing on this", which is
+    indistinguishable from a genuine negative result — research that returns nothing in a
+    second and calls it an answer.
+    """
+    assert not _saturated(_rounds(0, 0), papers=0)
+
+
+def test_saturation_waits_for_the_minimum_round_count():
+    # yield has genuinely stopped, but the run has not done its minimum rounds yet
+    assert not _saturated(_rounds(0, 0), min_rounds=4, papers=20)
+    assert _saturated(_rounds(9, 8, 0, 0), min_rounds=4, papers=20)
 
 
 def test_the_window_and_threshold_are_configurable():
