@@ -74,6 +74,7 @@ def search(
         tier2_candidates=int(icfg["rerank"]["tier2_candidates"]),
         rerank_candidates=int(ccfg.get("candidates", 50)),
         final_k=k, rrf_k=int(icfg["lexical"]["rrf_k"]),
+        kind_bias=icfg.get("kind_bias"),
         lexical=bool(icfg["lexical"]["enabled"]) and not no_bm25,
         cross_encoder=ce,
     )

@@ -147,6 +147,7 @@ class AppState:
             rerank_candidates=int(ccfg.get("candidates", 24)),
             final_k=int(icfg["rerank"].get("final_k", 8)),
             rrf_k=int(lex["rrf_k"]), lexical=bool(lex["enabled"]),
+            kind_bias=icfg.get("kind_bias"),
             max_terms=int(lex.get("max_terms", 3)),
             df_ceiling_frac=float(lex.get("df_ceiling_frac", 0.005)),
             cross_encoder=cross,

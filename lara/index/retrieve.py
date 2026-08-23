@@ -15,6 +15,7 @@ import numpy as np
 
 from lara import device as dev
 from lara.index import backends as BK
+from lara.index import bias as BIAS
 from lara.index import search as S
 from lara.index.embed import embed_queries
 from lara.index.vectors import VectorStore
@@ -40,6 +41,7 @@ class Retriever:
         rerank_candidates: int = 50,
         final_k: int = 8,
         rrf_k: int = 60,
+        kind_bias: dict | None = None,
         lexical: bool = True,
         max_terms: int = 3,
         df_ceiling_frac: float = 0.005,
@@ -68,6 +70,8 @@ class Retriever:
         self.rerank_candidates = rerank_candidates
         self.final_k = final_k
         self.rrf_k = rrf_k
+        # None means lara's default preference; {} switches the bias off entirely.
+        self.kind_bias = BIAS.DEFAULT if kind_bias is None else dict(kind_bias)
         self.lexical = lexical
         self.max_terms = max_terms
         self.df_ceiling_frac = df_ceiling_frac
@@ -357,9 +361,12 @@ class Retriever:
             hits_by_id[cid].provenance["exact"] = float(score)
         t["tier2"] = (clock() - t0) * 1000
 
-        ranked = sorted(
-            (h for h in hits_by_id.values()), key=lambda h: -h.score
-        )[: self.rerank_candidates]
+        # Prefer pre-compressed evidence *before* the cut, not after: a claim is short
+        # and scores lower on cosine than the passage it compresses, so biasing only the
+        # final order would let it die here, unread by the reranker.
+        candidates = list(hits_by_id.values())
+        BIAS.apply(candidates, self.kind_bias)
+        ranked = sorted(candidates, key=lambda h: -h.score)[: self.rerank_candidates]
 
         t0 = clock()
         if self.cross_encoder is not None and ranked:
@@ -370,6 +377,9 @@ class Retriever:
             for hit, score in zip(ranked, scores):
                 hit.provenance["cross_encoder"] = float(score)
                 hit.score = float(score)
+            # The reranker overwrites score outright, discarding the bonus applied above
+            # — so it is applied again, now as a fraction of the logit spread.
+            BIAS.apply(ranked, self.kind_bias)
             ranked.sort(key=lambda h: -h.score)
         t["rerank"] = (clock() - t0) * 1000
         t["total"] = sum(v for k, v in t.items() if k != "total")

@@ -117,6 +117,23 @@ embedding:
   # another retrieves nothing, and two copies of the text drifted apart exactly that way.
 
 retrieval:
+  # ── PREFERRING PRE-COMPRESSED EVIDENCE ───────────────────────────────────────
+  # Chunks that a model wrote rather than a paper: `claim` is one extracted finding with
+  # its metric and conditions, `synthesis` is an answer written across many papers. Both
+  # are cheaper to read than the passages behind them and have been judged relevant once
+  # already, so retrieval leans toward them.
+  #
+  # The number is a fraction of the score spread of the candidates being ranked, NOT an
+  # absolute score — that is what lets one value mean the same thing to the tier-2 inner
+  # products and to the cross-encoder's logits. Set to {} to switch the preference off.
+  #
+  # Raise these and answers get shorter and more confident; raise them too far and the
+  # corpus starts citing its own summaries in preference to the papers, which is how a
+  # research assistant ends up believing its own earlier mistakes.
+  kind_bias:
+    claim: 0.15
+    synthesis: 0.10
+
   # Hierarchical scope: answer from the open paper before searching 29.5M chunks.
   # A reader asking "why does this need a warmup?" almost always means *this paper*.
   #
