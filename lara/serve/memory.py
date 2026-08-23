@@ -24,6 +24,7 @@ read-modify-write over each other.
 
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import threading
@@ -152,6 +153,108 @@ def record_visit(root: Path, *, arxiv_id: str, version: int = 1, title: str = ""
         data["entries"].append(entry)
         save(root, data)
         return entry
+
+
+def record_report(root: Path, *, run_id: str, question: str, tldr: str = "",
+                  n_rounds: int = 0, n_claims: int = 0, n_papers: int = 0) -> dict:
+    """File a completed deep-research run in the library.
+
+    The entry holds a ``run_id`` and a summary line, never the report itself. The run --
+    its rounds, its claims, every judgement it made -- already lives in the synthesis
+    tables, and copying that into a JSON file that is read whole on every page load would
+    make the library slower in proportion to how much research had been done with it.
+
+    Keyed on ``run_id``, so re-recording a run it already has updates that entry. A run
+    saves once, but a backfill sweep may meet it again and must not duplicate it.
+    """
+    with _LOCK:
+        data = load(root)
+        existing = next((e for e in data["entries"]
+                         if e.get("kind") == "report" and e.get("run_id") == run_id), None)
+        fields = {
+            "question": question,
+            "title": (question or "research")[:120],
+            "tldr": (tldr or "")[:600],
+            "n_rounds": int(n_rounds), "n_claims": int(n_claims),
+            "n_papers": int(n_papers), "updated_utc": _now(),
+        }
+        if existing is not None:
+            existing.update(fields)
+            save(root, data)
+            return existing
+        entry = {
+            "id": uuid.uuid4().hex[:12],
+            "kind": "report",
+            "folder": None,
+            "run_id": run_id,
+            **fields,
+            "created_utc": _now(),
+            "_ts": time.time(),
+        }
+        data["entries"].append(entry)
+        save(root, data)
+        return entry
+
+
+def sync_reports(root: Path, runs: list[dict]) -> int:
+    """Give every saved run a library entry. Returns how many were added.
+
+    This is what makes the feature retroactive: research done before the library existed
+    is still research the reader did, and it should be there the first time they look.
+
+    Only ever adds. Deleting a report deletes the run itself, so a run that is gone stays
+    gone -- if deletion merely removed the library entry, the next sweep would resurrect it
+    and the delete button would appear not to work.
+    """
+    with _LOCK:
+        data = load(root)
+        known = {e.get("run_id") for e in data["entries"] if e.get("kind") == "report"}
+        added = 0
+        for r in runs:
+            rid = r.get("run_id")
+            if not rid or rid in known:
+                continue
+            data["entries"].append({
+                "id": uuid.uuid4().hex[:12], "kind": "report", "folder": None,
+                "run_id": rid, "question": r.get("question", ""),
+                "title": (r.get("question") or "research")[:120],
+                "tldr": (r.get("tldr") or "")[:600],
+                "n_rounds": int(r.get("n_rounds") or 0),
+                "n_claims": int(r.get("n_claims") or 0),
+                "n_papers": int(r.get("n_papers") or 0),
+                # Normalised to this store's format, not SQLite's. The library is sorted
+                # by comparing these as STRINGS, and `2026-08-23 03:42` vs
+                # `2026-08-23T03:31Z` compares 'T' (0x54) against ' ' (0x20) -- so every
+                # ISO entry outranks every SQLite one whatever the clock says, and the
+                # newest report files below yesterday's questions.
+                "created_utc": _iso(_ts_of(r.get("created_utc"))),
+                "updated_utc": _iso(_ts_of(r.get("created_utc"))),
+                # A backfilled run carries the time it actually ran; stamping "now" would
+                # file weeks of research as today's.
+                "_ts": _ts_of(r.get("created_utc")),
+            })
+            known.add(rid)
+            added += 1
+        if added:
+            save(root, data)
+        return added
+
+
+def _iso(ts: float) -> str:
+    """Epoch seconds in the one timestamp format this store sorts by."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
+
+def _ts_of(created_utc: str | None) -> float:
+    """`2026-08-23 03:42:12` -> epoch seconds, falling back to now."""
+    if not created_utc:
+        return time.time()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return calendar.timegm(time.strptime(created_utc, fmt))
+        except ValueError:
+            continue
+    return time.time()
 
 
 def record_question(

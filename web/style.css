@@ -166,6 +166,9 @@ main > section { min-width: 0; min-height: 0; display: flex; flex-direction: col
 .lib-folder > .lib-label { font-weight: 600; }
 .lib-entry.question > .lib-label { color: var(--text); }
 .lib-entry.paper > .lib-label { color: var(--dim); }
+/* A report cost minutes of retrieval; it reads as the heaviest thing in the tree. */
+.lib-entry.report > .lib-label { color: var(--text); font-weight: 600; }
+.lib-entry.report > .twist { color: var(--accent); }
 .lib-children { margin-left: 11px; border-left: 1px solid var(--line); padding-left: 4px; }
 #lib-tree.drop-root { outline: 1px dashed var(--accent); outline-offset: -3px; }
 .lib-rename {

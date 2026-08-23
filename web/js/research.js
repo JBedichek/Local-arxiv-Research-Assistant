@@ -119,10 +119,11 @@ import { renderMath } from "./tex.js";
     } catch { /* history is a convenience; its absence must not block a new run */ }
   }
 
-  history?.addEventListener("change", async () => {
-    if (!history.value) return;
-    const r = await fetch(`/api/synthesis/run/${history.value}`);
-    if (!r.ok) return;
+  /* Render a stored run into the pane exactly as a live one leaves it, so a report
+   * reopened a month later reads the same as it did the moment it finished. */
+  async function openRun(runId) {
+    const r = await fetch(`/api/synthesis/run/${runId}`);
+    if (!r.ok) return false;
     const run = await r.json();
     q.value = run.question;
     graph.innerHTML = "";
@@ -149,6 +150,23 @@ import { renderMath } from "./tex.js";
     tldrEl.innerHTML = render(run.tldr);
     thoroughEl.innerHTML = render(run.thorough);
     setStatusDeep(`saved run · ${Math.round((run.ms || 0) / 1000)}s`);
+    return true;
+  }
+
+  history?.addEventListener("change", () => {
+    if (history.value) openRun(history.value);
+  });
+
+  /* The library pane opens reports through an event rather than an import: this module is
+   * an IIFE closed over its own DOM, and a custom event crosses that boundary without
+   * unpicking it. A library that could not reach the renderer would have to grow a second
+   * copy of it, and the two would drift. */
+  document.addEventListener("lara:open-run", async (e) => {
+    const runId = e.detail && e.detail.runId;
+    if (!runId) return;
+    show(true);
+    loadHistory();
+    if (await openRun(runId) && history) history.value = runId;
   });
 
   form?.addEventListener("submit", async (e) => {

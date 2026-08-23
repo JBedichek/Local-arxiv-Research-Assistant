@@ -30,7 +30,23 @@ const libOpen = {
 
 function libEntryLabel(e) {
   if (e.kind === "question") return e.question || "(question)";
+  if (e.kind === "report") return e.question || e.title || "(research)";
   return e.title || e.arxiv_id || "(paper)";
+}
+
+/* Three kinds share one tree, so each needs a mark that survives being scanned rather than
+ * read. A report earns its own because it is the expensive artefact here -- minutes of
+ * retrieval and dozens of papers -- and losing it among the click history would defeat the
+ * point of keeping it. */
+const LIB_MARK = { question: "?", report: "\u25c8", paper: "\u2022" };
+
+function libEntryNote(e) {
+  if (e.kind === "report") {
+    const n = Number(e.n_papers || 0);
+    return n ? `${n} paper${n === 1 ? "" : "s"}` : "research";
+  }
+  if (e.kind === "question") return (e.title || "").slice(0, 14);
+  return "";
 }
 
 function renderLibrary() {
@@ -38,7 +54,7 @@ function renderLibrary() {
   if (!tree) return;
   if (!library.folders.length && !library.entries.length) {
     tree.innerHTML =
-      `<p class="lib-empty">Papers you open and questions you ask show up here.</p>`;
+      `<p class="lib-empty">Papers you open, questions you ask and research you run show up here.</p>`;
     return;
   }
   const byParent = new Map();
@@ -86,10 +102,10 @@ function renderLibrary() {
     return node(
       `<div class="lib-row lib-entry ${e.kind}" draggable="true" data-entry="${e.id}"
             title="${escapeHtml(libEntryLabel(e))}">
-         <span class="twist">${e.kind === "question" ? "?" : "•"}</span>
+         <span class="twist">${LIB_MARK[e.kind] || "\u2022"}</span>
          <span class="lib-label">${escapeHtml(libEntryLabel(e))}</span>
-         <span class="lib-kind">${e.kind === "question" ? escapeHtml((e.title || "").slice(0, 14)) : ""}</span>
-         <button class="lib-del" title="Remove from library">×</button>
+         <span class="lib-kind">${escapeHtml(libEntryNote(e))}</span>
+         <button class="lib-del" title="${e.kind === 'report' ? 'Delete this research run' : 'Remove from library'}">×</button>
        </div>`);
   }
 
@@ -108,6 +124,15 @@ function renderLibrary() {
  * isolation would show the reader less context than the model has, which makes the next
  * answer look like it came from nowhere. */
 export async function restoreEntry(e) {
+  /* A report is not tied to a paper, and opening one means reopening the research pane on
+   * the run it names. research.js owns that rendering; this asks for it by event. */
+  if (e.kind === "report") {
+    if (e.run_id) {
+      document.dispatchEvent(
+        new CustomEvent("lara:open-run", { detail: { runId: e.run_id } }));
+    }
+    return;
+  }
   if (e.arxiv_id) await openPaper(e.arxiv_id);
   if (e.kind !== "question") return;
 

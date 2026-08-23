@@ -511,6 +511,35 @@ def load_run(conn, run_id: str) -> dict | None:
     return d
 
 
+def delete_run(db_path, run_id: str) -> bool:
+    """Remove a run and everything it recorded. Returns whether a row went away.
+
+    Deleting for real, rather than hiding the run from the library, is what keeps the two
+    views honest: the research pane's history list reads the same tables, so a run that is
+    only unlisted would still be offered there and would come back on the next backfill.
+
+    Takes a path rather than the reader's connection, exactly as :func:`save` does. The
+    server holds the corpus open ``mode=ro`` so that serving pages can never corrupt 42 GB
+    of index; writes open their own connection, and passing the shared one here fails with
+    "attempt to write a readonly database".
+    """
+    from lara.store import db
+
+    conn = db.connect(db_path)
+    try:
+        with conn:
+            cur = conn.execute("DELETE FROM synthesis_runs WHERE run_id=?", (run_id,))
+            conn.execute("DELETE FROM synthesis_rounds WHERE run_id=?", (run_id,))
+            conn.execute("DELETE FROM synthesis_claims WHERE run_id=?", (run_id,))
+        return cur.rowcount > 0
+    except sqlite3.OperationalError as exc:
+        if not _no_table(exc):
+            raise
+        return False
+    finally:
+        conn.close()
+
+
 def list_runs(conn, limit: int = 50) -> list[dict]:
     """Recent runs, newest first. Read-only; empty before the first run is saved."""
     try:

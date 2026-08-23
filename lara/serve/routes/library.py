@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from lara.serve.deps import memory_root
+from lara.serve.deps import memory_root, require_state
 
 router = APIRouter()
 
@@ -54,7 +54,21 @@ def memory_list() -> JSONResponse:
     """The whole library. Small enough to send at once; the client builds the tree."""
     from lara.serve import memory as MEM
 
-    data = MEM.load(memory_root())
+    root = memory_root()
+    # Deep-research runs are filed here rather than recorded at completion, so that the
+    # library is derived from the synthesis tables instead of racing them. A run that
+    # finished while the reader was elsewhere -- or before this feature existed -- is
+    # still their research, and shows up the first time they open the library.
+    try:
+        from lara.serve import synthesis as SY
+
+        MEM.sync_reports(root, SY.list_runs(require_state().conn(), limit=10_000))
+    except Exception:                                  # noqa: BLE001
+        # The library is the reader's own history; failing to enrich it with reports must
+        # never stop it from rendering the papers and questions it already has.
+        pass
+
+    data = MEM.load(root)
     # `_ts` is an internal coalescing clock, not something the UI should depend on.
     entries = [{k: v for k, v in e.items() if k != "_ts"} for e in data["entries"]]
     entries.sort(key=lambda e: e.get("updated_utc", ""), reverse=True)
@@ -103,7 +117,17 @@ def memory_entry_patch(entry_id: str, req: EntryPatch) -> JSONResponse:
 def memory_entry_delete(entry_id: str) -> JSONResponse:
     from lara.serve import memory as MEM
 
-    if not MEM.delete_entry(memory_root(), entry_id):
+    root = memory_root()
+    # A report entry is a pointer, so deleting only the pointer would leave the run in the
+    # synthesis tables -- still listed in the research pane's history, and restored by the
+    # next sync. Deleting a report means deleting the run.
+    entry = next((e for e in MEM.load(root)["entries"] if e.get("id") == entry_id), None)
+    if entry is not None and entry.get("kind") == "report" and entry.get("run_id"):
+        from lara.serve import synthesis as SY
+
+        SY.delete_run(require_state().db_path, entry["run_id"])
+
+    if not MEM.delete_entry(root, entry_id):
         raise HTTPException(404, f"no entry {entry_id}")
     return JSONResponse({"deleted": entry_id})
 
