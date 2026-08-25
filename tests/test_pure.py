@@ -1056,3 +1056,55 @@ def test_the_window_and_threshold_are_configurable():
 def test_the_round_cap_is_still_a_hard_ceiling():
     assert round_limit_reached(10, 10) and not round_limit_reached(9, 10)
     assert not round_limit_reached(999, 0), "0 disables the cap"
+
+
+# ── GGUF quantisation parsing ─────────────────────────────────────────────────────
+#
+# A GGUF repo ships one file per quantisation, so a download must name files rather than
+# the repo -- unnamed, it fetches every alternative to obtain the one wanted. Which file
+# to name is parsed out of the *filename*, and an unrecognised quant tag meant no 4-bit
+# build was found, the dialog offered nothing to pick, and the download took all of them.
+
+from lara.serve.downloads import gguf_variants, pick_4bit, quant_of
+
+
+def test_mxfp4_is_recognised():
+    # ggml-org/gpt-oss-20b-GGUF ships MXFP4 and nothing else 4-bit. Unrecognised, the
+    # model itself grouped as "unlabelled" and the repo appeared to have no 4-bit build.
+    assert quant_of("gpt-oss-20b-MXFP4.gguf") == "MXFP4"
+    assert pick_4bit([{"quant": q} for q in ("Q8_0", "BF16", "MXFP4")]) == "MXFP4"
+
+
+def test_k_quants_still_win_over_mxfp4():
+    # MXFP4 ranks last deliberately: where a repo ships both, Q4_K_M is the default
+    # everyone means by "4-bit".
+    assert pick_4bit([{"quant": q} for q in ("MXFP4", "Q4_K_M")]) == "Q4_K_M"
+
+
+def test_quant_tag_is_read_from_the_end_of_the_name():
+    # Model names carry digits and underscores of their own; the tag is the last one.
+    assert quant_of("Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf") == "Q4_K_M"
+    assert quant_of("x-UD-Q4_K_XL.gguf") == "UD-Q4_K_XL"
+    assert quant_of("model-BF16.gguf") == "BF16"
+    assert quant_of("no-tag-here.gguf") is None
+
+
+def test_sharded_quantisations_group_into_one_variant():
+    # A multi-part quantisation is one choice, and its size is the sum -- listing the
+    # shards separately would offer half a model as if it were a smaller option.
+    files = [{"path": "m-Q4_K_M-00001-of-00002.gguf", "lfs": {"size": 2_000_000_000}},
+             {"path": "m-Q4_K_M-00002-of-00002.gguf", "lfs": {"size": 2_000_000_000}}]
+    variants = gguf_variants(files)
+    assert [v["quant"] for v in variants] == ["Q4_K_M"]
+    assert variants[0]["size_gb"] == 4.0
+    assert len(variants[0]["files"]) == 2
+
+
+def test_a_repo_with_no_four_bit_build_still_lists_its_variants():
+    # `pick` is None here, and that is correct -- but the variants must still come back,
+    # or the dialog has nothing to offer and says "pick a quantisation" pointing at air.
+    files = [{"path": "m-Q8_0.gguf", "lfs": {"size": 1_000_000_000}},
+             {"path": "m-BF16.gguf", "lfs": {"size": 2_000_000_000}}]
+    variants = gguf_variants(files)
+    assert [v["quant"] for v in variants] == ["Q8_0", "BF16"]
+    assert pick_4bit(variants) is None

@@ -70,6 +70,11 @@ def model_resolve(req: ResolveRequest) -> JSONResponse:
         # downloading without naming files fetches all of them.
         "pipeline": r.pipeline, "pick": r.pick,
         "pick_files": next((v["files"] for v in r.variants if v["quant"] == r.pick), None),
+        # Every quantisation the repo ships, so the dialog can offer a choice when there
+        # is no 4-bit build to default to. Without this the UI had `pick` or nothing, and
+        # a repo whose only builds are Q8_0/BF16/MXFP4 rendered "pick a quantisation
+        # above" with nothing above it to pick.
+        "variants": r.variants,
         "already_cached": _dl(s).cache_dir(r.repo).exists() if r.repo else False,
     }
     if r.exists and r.size_gb:
@@ -121,6 +126,21 @@ def model_download(req: DownloadRequest) -> JSONResponse:
     repo = DL.normalise(req.repo)
     if not repo:
         raise HTTPException(400, "not a Hugging Face id")
+    # A GGUF repo ships one file per quantisation -- 25 of them, 133 GB, for an 8B -- and
+    # `start` falls back to allow_patterns=["*.gguf"] when no files are named, so an
+    # unnamed download of such a repo fetches every alternative to obtain the one wanted.
+    # The UI names files, but it stopped doing so whenever the server found no 4-bit build
+    # to default to, and the result was a silent 100 GB+ transfer. Refuse it here as well:
+    # this is never what anyone means, and the client is the wrong place to be the only
+    # guard against it.
+    if not req.files:
+        variants = DL.gguf_variants(DL.tree(repo, token=os.environ.get("HF_TOKEN")))
+        if len(variants) > 1:
+            raise HTTPException(400, (
+                f"{repo} ships {len(variants)} GGUF quantisations "
+                f"({', '.join(v['quant'] for v in variants)}); name the files of the one "
+                "you want rather than downloading all of them"))
+
     free_gb = __import__("shutil").disk_usage(s.cfg.get_path("huggingface.home")).free / 1e9
     if req.size_gb and req.size_gb * 1.1 > free_gb:
         raise HTTPException(

@@ -10,6 +10,10 @@ let dlPoll = null;
 /* /api/device, cached so the dialog can report what fits without refetching. */
 let dlDevice = null;
 
+/* The quantisation currently selected, which is the server's `pick` until the user
+ * changes it. Held outside renderResolved so a re-render keeps the selection. */
+let dlQuant = null;
+
 /* Where to actually find each format. A model name alone is not enough: "Qwen3-8B" names
  * three different sets of files depending on who converted it, and only one of them will
  * load here. Keyed by /api/device's wants_format. */
@@ -98,14 +102,34 @@ function renderResolved(r) {
   if (r.arch) html += row("architecture", escapeHtml(r.arch));
   if (r.quantization) html += row("quantization", escapeHtml(r.quantization));
 
-  /* The quantisation is a property of the repo, not a choice: the server picks the
-   * 4-bit build and this reports it. The repo still physically contains every other
-   * quantisation, which is why the download names its files rather than the repo. */
-  if (r.pick) html += row("quantisation", escapeHtml(r.pick));
+  /* A GGUF repo physically contains every quantisation, so a download has to name files
+   * rather than the repo. The server defaults to the 4-bit build, and that used to be the
+   * whole story: `pick` or nothing. But a repo can ship no 4-bit build at all, and then
+   * the dialog reported "pick a quantisation above" with nothing above it to pick, and
+   * downloaded all of them. Every variant is listed now, so the instruction is one the
+   * dialog can actually carry out. */
+  const variants = r.variants || [];
+  const chosen = variants.find((v) => v.quant === dlQuant) || null;
+  if (variants.length > 1) {
+    const opts = variants.map((v) =>
+      `<option value="${escapeHtml(v.quant)}"${v.quant === dlQuant ? " selected" : ""}>`
+      + `${escapeHtml(v.quant)} — ${v.size_gb.toFixed(1)} GB</option>`).join("");
+    html += `<div class="row"><span class="k">quantisation</span><span class="v">`
+          + `<select id="dl-quant">`
+          + (dlQuant ? "" : `<option value="" selected>choose one…</option>`)
+          + `${opts}</select></span></div>`;
+  } else if (dlQuant) {
+    html += row("quantisation", escapeHtml(dlQuant));
+  }
 
-  const size = r.size_gb;
+  /* The selected variant's size, not the repo default's, or the numbers below describe a
+   * download that is not the one about to start. */
+  const size = chosen ? chosen.size_gb : r.size_gb;
   html += row("download size",
-    size ? `~${size.toFixed(1)} GB` : (r.n_gguf ? "pick a quantisation above" : "unknown"));
+    size ? `~${size.toFixed(1)} GB`
+         : (variants.length > 1 ? "choose a quantisation above"
+                                : (r.n_gguf ? "unknown — this repo labels no quantisation"
+                                            : "unknown")));
 
   /* Recomputed here rather than reusing r.fit, which the server calculated for the
    * default quantisation and which goes stale the moment the selection changes. */
@@ -131,9 +155,19 @@ function renderResolved(r) {
           + `<span class="v warn">${escapeHtml(r.warning)}</span></div>`;
   }
   $("#dl-info").innerHTML = html;
+
+  const sel = $("#dl-quant");
+  if (sel) {
+    sel.addEventListener("change", () => {
+      dlQuant = sel.value || null;
+      renderResolved(dlResolved);          /* size and fit follow the selection */
+    });
+  }
+
   // Offered even when it does not fit: the estimate is conservative and the machine is
-  // the user's to judge.
-  $("#dl-start").hidden = !!r.already_cached;
+  // the user's to judge. Withheld only when there is nothing to download *to* -- an
+  // unchosen quantisation would fetch the whole repo, which is never what was meant.
+  $("#dl-start").hidden = !!r.already_cached || (variants.length > 1 && !chosen);
 }
 
 $("#dl-form").addEventListener("submit", async (ev) => {
@@ -145,6 +179,7 @@ $("#dl-form").addEventListener("submit", async (ev) => {
   try {
     const r = await send("POST", "/api/model/resolve", { query: q });
     dlResolved = r;
+    dlQuant = r.pick || null;              /* 4-bit where there is one, else unchosen */
     if (!r.exists || r.error) {
       $("#dl-info").innerHTML = `<span class="bad">${escapeHtml(r.error || "not found")}</span>`;
       return;
@@ -160,13 +195,14 @@ $("#dl-start").addEventListener("click", async () => {
   $("#dl-start").hidden = true;
   $("#dl-progress").hidden = false;
   try {
+    const picked = (dlResolved.variants || []).find((v) => v.quant === dlQuant);
     await send("POST", "/api/model/download", {
         repo: dlResolved.repo,
-        size_gb: dlResolved.size_gb,
-        // Only the picked quantisation's files. Null for safetensors repos, where the
+        size_gb: picked ? picked.size_gb : dlResolved.size_gb,
+        // Only the selected quantisation's files. Null for safetensors repos, where the
         // whole snapshot is the model. Without this a GGUF repo fetches every
-        // quantisation it ships.
-        files: dlResolved.pick_files || null,
+        // quantisation it ships; the server refuses that too, rather than trusting this.
+        files: picked ? picked.files : (dlResolved.pick_files || null),
       });
   } catch (err) {
     $("#dl-progress-text").innerHTML = `<span class="bad">${escapeHtml(String(err.message || err))}</span>`;

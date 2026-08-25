@@ -37,7 +37,7 @@ ALLOW_METADATA = ["*.json", "*.model", "*.txt", "*.jinja"]
 #: the one you wanted. Quantisation is part of the *filename*, not repo metadata, so it
 #: has to be parsed out of the file listing.
 QUANT_RE = re.compile(
-    r"(?:^|[-_.])((?:UD-)?(?:IQ|Q)\d+(?:_[A-Z0-9]+)*|BF16|FP16|F16|F32)(?=[-.]|$)",
+    r"(?:^|[-_.])((?:UD-)?(?:IQ|Q)\d+(?:_[A-Z0-9]+)*|MXFP4|BF16|FP16|F16|F32)(?=[-.]|$)",
     re.IGNORECASE,
 )
 
@@ -48,7 +48,14 @@ SHARD_RE = re.compile(r"-\d{5}-of-\d{5}$")
 #: the quality/size knee, and what "4-bit" means in practice for llama.cpp. K_S trades a
 #: little quality for size; the IQ (importance-matrix) forms are smaller again but slower
 #: on some hardware, so they rank below the plain K-quants.
-GGUF_4BIT_PREFERENCE = ["Q4_K_M", "Q4_K_S", "Q4_1", "Q4_0", "IQ4_NL", "IQ4_XS"]
+GGUF_4BIT_PREFERENCE = ["Q4_K_M", "Q4_K_S", "Q4_1", "Q4_0", "IQ4_NL", "IQ4_XS", "MXFP4"]
+#: MXFP4 sits last because it is not a choice a publisher makes alongside the K-quants:
+#: repos that ship it usually ship *only* it (gpt-oss), so it never competes with Q4_K_M
+#: in practice, and where it somehow does the K-quant is the better-understood default.
+#: Leaving it out entirely was the bug -- `ggml-org/gpt-oss-20b-GGUF` reports three GGUF
+#: files, of which the real 20B model is `gpt-oss-20b-MXFP4.gguf` and the other two are an
+#: `eagle3` draft model. Unrecognised, the model itself grouped as "unlabelled", no 4-bit
+#: build was found, and the dialog offered nothing while telling the user to pick.
 
 
 def quant_of(path: str) -> str | None:
