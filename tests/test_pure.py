@@ -1108,3 +1108,47 @@ def test_a_repo_with_no_four_bit_build_still_lists_its_variants():
     variants = gguf_variants(files)
     assert [v["quant"] for v in variants] == ["Q8_0", "BF16"]
     assert pick_4bit(variants) is None
+
+
+def test_unsloth_dynamic_builds_count_as_four_bit():
+    # unsloth/Qwen3.6-35B-A3B-GGUF ships 26 quantisations and every 4-bit one is UD-
+    # prefixed, so matching plain names alone left the dialog with no default at all on
+    # the publisher SETUP_INSTRUCTIONS.md recommends.
+    mk = lambda *qs: [{"quant": q} for q in qs]                       # noqa: E731
+    assert pick_4bit(mk("UD-Q5_K_M", "UD-Q4_K_M", "Q8_0")) == "UD-Q4_K_M"
+    # A plain build still wins where the repo ships both.
+    assert pick_4bit(mk("UD-Q4_K_M", "Q4_K_M")) == "Q4_K_M"
+    # And a dynamic build with no plain equivalent is still better than no default.
+    assert pick_4bit(mk("UD-Q4_K_XL", "Q8_0", "BF16")) == "UD-Q4_K_XL"
+    # Without inventing one where the repo genuinely has none.
+    assert pick_4bit(mk("Q8_0", "BF16", "Q5_K_M")) is None
+
+
+def test_cached_means_the_named_files_are_linked_into_a_snapshot(tmp_path):
+    # "the repo directory exists" was the old test, and it is true the moment a download
+    # starts, survives one that was abandoned, and says nothing about *which*
+    # quantisation is present -- which is what hid the download button.
+    from lara.serve.downloads import DownloadManager
+
+    mgr = DownloadManager(tmp_path)
+    repo = "org/repo-GGUF"
+    snap = mgr.cache_dir(repo) / "snapshots" / "abc123"
+    snap.mkdir(parents=True)
+    (snap / "m-Q4_K_M.gguf").write_bytes(b"weights")
+    # An in-flight download writes to blobs/ and links only on completion, so a partial
+    # one has no snapshot entry to find.
+    (mgr.cache_dir(repo) / "blobs").mkdir()
+    (mgr.cache_dir(repo) / "blobs" / "deadbeef.incomplete").write_bytes(b"partial")
+
+    assert mgr.cache_dir(repo).exists()                    # the old, useless answer
+    assert mgr.has_files(repo, ["m-Q4_K_M.gguf"])
+    assert not mgr.has_files(repo, ["m-Q8_0.gguf"])        # having one is not having all
+    assert not mgr.has_files(repo, ["m-Q4_K_M.gguf", "m-Q8_0.gguf"])
+
+
+def test_nothing_cached_when_the_repo_was_never_fetched(tmp_path):
+    from lara.serve.downloads import DownloadManager
+
+    mgr = DownloadManager(tmp_path)
+    assert not mgr.has_files("org/absent", ["a.gguf"])
+    assert not mgr.has_files("org/absent", None)

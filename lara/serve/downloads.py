@@ -93,13 +93,38 @@ def gguf_variants(files: list[dict]) -> list[dict]:
     return out
 
 
+#: Unsloth publishes "Unsloth Dynamic" builds as ``UD-Q4_K_XL`` and the like: the same
+#: quantisations with a per-tensor recipe on top. For many of its repos they are the *only*
+#: 4-bit builds -- unsloth/Qwen3.6-35B-A3B-GGUF ships twenty-six quantisations, every 4-bit
+#: one of them ``UD-`` prefixed -- so matching the plain names alone found nothing and left
+#: the download dialog with no default on the publisher SETUP_INSTRUCTIONS.md recommends.
+_UD_PREFIX = "UD-"
+
+
+def _is_four_bit(quant: str) -> bool:
+    """Whether a label names some 4-bit build, dynamic prefix or not."""
+    base = quant.upper().removeprefix(_UD_PREFIX)
+    return base.startswith(("Q4", "IQ4")) or base == "MXFP4"
+
+
 def pick_4bit(variants: list[dict]) -> str | None:
-    """The 4-bit quantisation to default to, or None if the repo ships no 4-bit build."""
-    have = {v["quant"] for v in variants}
+    """The 4-bit quantisation to default to, or None if the repo ships no 4-bit build.
+
+    Three passes, narrowing from "the exact thing everyone means by 4-bit" to "any 4-bit
+    build at all", because a repo that ships one is always better served by defaulting to
+    it than by presenting no default and downloading everything.
+    """
+    have = [v["quant"] for v in variants]
+    by_upper = {q.upper(): q for q in have}
     for want in GGUF_4BIT_PREFERENCE:
-        if want in have:
-            return want
-    return None
+        if want in by_upper:
+            return by_upper[want]
+    for want in GGUF_4BIT_PREFERENCE:
+        if f"{_UD_PREFIX}{want}" in by_upper:
+            return by_upper[f"{_UD_PREFIX}{want}"]
+    # Only a dynamic build with no plain equivalent, e.g. UD-Q4_K_XL. `gguf_variants`
+    # sorted these smallest first, so this takes the least demanding one.
+    return next((q for q in have if _is_four_bit(q)), None)
 
 
 def tree(repo: str, token: str | None = None) -> list[dict]:
@@ -248,6 +273,32 @@ class DownloadManager:
 
     def cache_dir(self, repo: str) -> Path:
         return self.hf_home / "hub" / ("models--" + repo.replace("/", "--"))
+
+    def has_files(self, repo: str, files: list[str] | None) -> bool:
+        """Whether what we would download is already present *and complete*.
+
+        ``cache_dir().exists()`` is not that question, and answering it with that was
+        wrong in three ways at once. The directory appears the moment a download starts,
+        it survives one that was abandoned, and -- now that a GGUF download fetches one
+        quantisation rather than the whole repo -- it says nothing about whether *this*
+        quantisation is there. A repo holding Q4_1 reported every other quantisation as
+        already cached, which hid the download button for a model that was not
+        downloaded.
+
+        Completeness comes free from the cache layout: huggingface_hub writes to
+        ``blobs/<sha>.incomplete`` and only links the file into ``snapshots/<rev>/`` once
+        it has all of it, so a partial download has no snapshot entry to find.
+        """
+        snaps = self.cache_dir(repo) / "snapshots"
+        if not snaps.is_dir():
+            return False
+        revs = [p for p in snaps.iterdir() if p.is_dir()]
+        if not files:
+            # Safetensors: the whole snapshot is the model, so the question is whether any
+            # revision has weights in it rather than which files were named.
+            return any(any(rev.rglob(pat)) for rev in revs
+                       for pat in ("*.safetensors", "*.gguf"))
+        return all(any((rev / f).is_file() for rev in revs) for f in files)
 
     def _dir_gb(self, path: Path) -> float:
         if not path.exists():

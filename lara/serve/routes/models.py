@@ -73,9 +73,15 @@ def model_resolve(req: ResolveRequest) -> JSONResponse:
         # Every quantisation the repo ships, so the dialog can offer a choice when there
         # is no 4-bit build to default to. Without this the UI had `pick` or nothing, and
         # a repo whose only builds are Q8_0/BF16/MXFP4 rendered "pick a quantisation
-        # above" with nothing above it to pick.
-        "variants": r.variants,
-        "already_cached": _dl(s).cache_dir(r.repo).exists() if r.repo else False,
+        # above" with nothing above it to pick. `cached` is per variant because that is
+        # how they are downloaded -- having one is no reason to refuse to fetch another.
+        "variants": [{**v, "cached": _dl(s).has_files(r.repo, v["files"])}
+                     for v in r.variants],
+        # Of the build we would actually fetch, not of the repo directory: see
+        # DownloadManager.has_files.
+        "already_cached": _dl(s).has_files(
+            r.repo, next((v["files"] for v in r.variants if v["quant"] == r.pick), None)
+        ) if r.repo else False,
     }
     if r.exists and r.size_gb:
         body["fit"] = DV.fits(r.size_gb, dev)

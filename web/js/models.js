@@ -113,7 +113,8 @@ function renderResolved(r) {
   if (variants.length > 1) {
     const opts = variants.map((v) =>
       `<option value="${escapeHtml(v.quant)}"${v.quant === dlQuant ? " selected" : ""}>`
-      + `${escapeHtml(v.quant)} — ${v.size_gb.toFixed(1)} GB</option>`).join("");
+      + `${escapeHtml(v.quant)} — ${v.size_gb.toFixed(1)} GB`
+      + `${v.cached ? " (cached)" : ""}</option>`).join("");
     html += `<div class="row"><span class="k">quantisation</span><span class="v">`
           + `<select id="dl-quant">`
           + (dlQuant ? "" : `<option value="" selected>choose one…</option>`)
@@ -149,7 +150,10 @@ function renderResolved(r) {
       r.fit.fits ? "ok" : "bad");
   }
 
-  if (r.already_cached) html += row("status", "already in your cache", "ok");
+  /* Of the selected build, not of the repo. A repo holding one quantisation is not a
+   * reason to refuse to fetch another, and treating it as one hid the download button. */
+  const cachedNow = chosen ? !!chosen.cached : !!r.already_cached;
+  if (cachedNow) html += row("status", "already in your cache", "ok");
   if (r.warning) {
     html += `<div class="row"><span class="k"></span>`
           + `<span class="v warn">${escapeHtml(r.warning)}</span></div>`;
@@ -167,7 +171,7 @@ function renderResolved(r) {
   // Offered even when it does not fit: the estimate is conservative and the machine is
   // the user's to judge. Withheld only when there is nothing to download *to* -- an
   // unchosen quantisation would fetch the whole repo, which is never what was meant.
-  $("#dl-start").hidden = !!r.already_cached || (variants.length > 1 && !chosen);
+  $("#dl-start").hidden = cachedNow || (variants.length > 1 && !chosen);
 }
 
 $("#dl-form").addEventListener("submit", async (ev) => {
