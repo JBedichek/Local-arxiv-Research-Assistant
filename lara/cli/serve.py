@@ -89,6 +89,63 @@ def _announce_when_ready(host: str, port: int, token: str | None,
     threading.Thread(target=watch, daemon=True, name="ready-announcer").start()
 
 @app.command()
+def _reader_log_path(cfg):
+    """Where the reader's own log goes, or None if the logs directory is unusable.
+
+    Never fatal: a reader that refuses to start because it could not open a log file
+    would be a worse failure than the missing log this exists to fix.
+    """
+    try:
+        from pathlib import Path
+
+        logs = Path(cfg.get_path("paths.logs"))
+        logs.mkdir(parents=True, exist_ok=True)
+        return logs / "reader.log"
+    except Exception:
+        return None
+
+
+def _log_config(path):
+    """uvicorn's logging config, with a file handler alongside the console one.
+
+    uvicorn installs its own config and would otherwise discard a handler added to the
+    root logger, which is why this replaces the config rather than appending a handler.
+
+    Which loggers get the file handler is not uniform, and cannot be. uvicorn sets
+    `propagate: False` on `uvicorn` and `uvicorn.access` but *not* on `uvicorn.error`,
+    which therefore reaches the file through its parent. Adding the handler to all three
+    wrote every error twice.
+    """
+    import copy
+
+    from uvicorn.config import LOGGING_CONFIG
+
+    cfg = copy.deepcopy(LOGGING_CONFIG)
+    if path is None:
+        return cfg
+    cfg["formatters"]["file"] = {
+        "()": "logging.Formatter",
+        "fmt": "%(asctime)s %(levelname)s %(name)s %(message)s",
+    }
+    cfg["handlers"]["file"] = {
+        "class": "logging.handlers.RotatingFileHandler",
+        "formatter": "file",
+        "filename": str(path),
+        # A long research run is chatty and this is a file nobody prunes by hand.
+        "maxBytes": 10_000_000,
+        "backupCount": 3,
+    }
+    for name in ("uvicorn", "uvicorn.access"):
+        if name in cfg["loggers"]:
+            cfg["loggers"][name]["handlers"] = [
+                *cfg["loggers"][name].get("handlers", []), "file",
+            ]
+    # Anything the application logs -- and any traceback uvicorn re-raises -- reaches the
+    # file too, which is the point: the interesting failures are not uvicorn's own.
+    cfg["root"] = {"handlers": ["file"], "level": "INFO"}
+    return cfg
+
+
 def serve(
     config: str = typer.Option(None, help="Path to config.yaml"),
     host: str = typer.Option(None),
@@ -207,10 +264,18 @@ def serve(
     # from a watcher that waits for the server to report itself ready.
     _announce_when_ready(host, port, token)
     console.print("[dim]starting — loading models, the first start is the slow one[/dim]")
+    # The generator has had a log file since it was first spawned; the reader never did,
+    # so its warnings and tracebacks existed only in whichever terminal happened to run it.
+    # "Check the server log" was answerable for half the system, and the half that reports
+    # a failed research run was the missing half.
+    reader_log = _reader_log_path(cfg)
+    if reader_log:
+        console.print(f"[dim]logging to {reader_log}[/dim]")
     try:
         # One worker: the GPU index, embedder and reranker are process-local and would be
         # duplicated per worker, tripling VRAM for no throughput gain on a single-user tool.
-        uvicorn.run("lara.serve.app:app", host=host, port=port, workers=1, log_level="info")
+        uvicorn.run("lara.serve.app:app", host=host, port=port, workers=1,
+                    log_level="info", log_config=_log_config(reader_log))
     finally:
         # Only stops what we started. A server that was already running is left alone --
         # it may be shared with something else, and killing it is not this process's call.

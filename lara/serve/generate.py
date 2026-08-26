@@ -312,7 +312,11 @@ async def stream_answer(
             async with client.stream("POST", f"{base_url}/chat/completions", json=payload) as resp:
                 if resp.status_code != 200:
                     body = (await resp.aread()).decode()[:200]
-                    raise RuntimeError(f"vLLM returned {resp.status_code}: {body}")
+                    # Named by URL rather than "vLLM": this speaks to whatever is serving
+                    # -- llama.cpp, MLX, Ollama, LM Studio -- and reporting the wrong one
+                    # sends anyone reading the error to the wrong logs.
+                    raise RuntimeError(
+                        f"generator at {base_url} returned {resp.status_code}: {body}")
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
                         continue

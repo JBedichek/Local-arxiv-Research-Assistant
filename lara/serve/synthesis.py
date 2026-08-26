@@ -742,8 +742,27 @@ async def run_synthesis(state, cfg, question: str, *, model=None, stream_answer=
 
     ev("consolidating", {"claims": len(run.claims), "papers": len(run.papers)})
     if run.claims and stream_answer is not None:
-        await consolidate(cfg, run, model, stream_answer,
-                          on_token=lambda k, t: ev("token", {"target": k, "text": t}))
+        try:
+            await consolidate(cfg, run, model, stream_answer,
+                              on_token=lambda k, t: ev("token", {"target": k, "text": t}))
+        except Exception as exc:
+            # The rounds are the expensive part -- ten to twenty minutes of retrieval and
+            # model judgements -- and consolidation is one call at the very end. Letting
+            # it take the run down with it discarded all of that and saved nothing, so the
+            # work could not even be reopened from the library. The same reasoning the
+            # cancellation path already applies: keep what was gathered.
+            #
+            # `consolidate` is also the only model call here that is not already
+            # exception-swallowing: `complete` returns "" on failure, so a bad round
+            # degrades quietly. That asymmetry is why this was the step that lost runs.
+            run.thorough = (
+                f"{len(run.claims)} claims from {len(run.papers)} papers were gathered "
+                f"over {len(run.rounds)} rounds, but writing the answer failed: {exc}\n\n"
+                "The evidence is saved and the run can be reopened.")
+            run.tldr = f"Consolidation failed: {exc}"
+            run.stopped_because = ((run.stopped_because or "") +
+                                   f"; consolidation failed: {type(exc).__name__}").lstrip("; ")
+            ev("error", f"consolidation failed, evidence kept: {exc}")
     elif not run.claims:
         run.thorough = "No relevant evidence was found in the corpus for this question."
         run.tldr = run.thorough
