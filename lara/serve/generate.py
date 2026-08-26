@@ -161,8 +161,55 @@ _JSON_OBJECT = re.compile(r"\{.*\}", re.S)
 _JSON_ARRAY = re.compile(r"\[.*\]", re.S)
 
 
+def _balanced(text: str, opener: str, closer: str) -> str:
+    """The first *complete* bracketed value in `text`, or "".
+
+    The greedy patterns above run from the first opener to the last closer, which is right
+    when the reply is one value with prose around it and wrong the moment there are two.
+    A model answering in its native tool-call format emits
+
+        <tool_call>
+        {"tool": "outline", "path": "a.py"}
+        <tool_call>
+        {"tool": "outline", "path": "b.py"}
+
+    and the greedy match spans both objects plus the tag between them, so it does not
+    parse and the caller is told nothing came back. Measured on this machine: 34 of 39
+    explorations that "read nothing" had a perfectly good object in the reply, and 47% of
+    one day's explorations failed this way. Taking the first balanced value keeps the
+    first answer instead of discarding both.
+
+    Quote-aware, because a brace inside a string is not a bracket — `{"re": "\\}"}` would
+    otherwise close early and produce a truncated object that happens to parse.
+    """
+    start = text.find(opener)
+    if start < 0:
+        return ""
+    depth, in_string, escaped = 0, False, False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == opener:
+            depth += 1
+        elif ch == closer:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return ""
+
+
 async def complete(cfg, prompt: str, *, system: str, model: str | None = None,
-                   temperature: float = 0.0, max_tokens: int = 400) -> str:
+                   temperature: float = 0.0, max_tokens: int = 400,
+                   sampling: dict | None = None, error_out: dict | None = None) -> str:
     """One non-streamed controller turn, accumulated to a string.
 
     The twelve lines this replaces were written out at nine call sites, and had already
@@ -170,6 +217,14 @@ async def complete(cfg, prompt: str, *, system: str, model: str | None = None,
     those turns while degrading silently everywhere else — for no stated reason. Failure
     is a value here, not an exception, because every caller already has a considered
     fallback and none of them wants a controller hiccup to fail a user's question.
+
+    `error_out`, when given, is filled with what actually went wrong. Failure stays a
+    value; what changes is that the reason survives it. Without this every cause collapsed
+    into the same empty string, and the best a caller could say was "either it was cut off
+    or the request was refused — this side cannot tell which". It could not, and the
+    answer was sitting in the exception: `404 the model does not exist`, because the pool
+    had substituted another card's endpoint while the caller went on naming the model it
+    wanted. That took a vLLM log to find and should have taken reading the error.
     """
     buf = ""
     try:
@@ -177,14 +232,22 @@ async def complete(cfg, prompt: str, *, system: str, model: str | None = None,
                                        temperature=temperature, max_tokens=max_tokens,
                                        raw_user=True):
             buf += tok
-    except Exception:
+    except Exception as exc:
+        if error_out is not None:
+            error_out["type"] = type(exc).__name__
+            # `str(exc)` on an httpx status error is the URL and the code; the body is
+            # where the server says *why*, and that is the half worth having.
+            body = getattr(getattr(exc, "response", None), "text", "")
+            error_out["error"] = f"{exc}{' — ' + body[:300] if body else ''}"
         return ""
     return buf
 
 
 async def complete_json(cfg, prompt: str, *, system: str, shape: str = "object",
                         model: str | None = None, temperature: float = 0.0,
-                        max_tokens: int = 400, default=None):
+                        max_tokens: int = 400, default=None,
+                        sampling: dict | None = None, raw_out: dict | None = None,
+                        error_out: dict | None = None):
     """A controller turn parsed as JSON, or ``default`` if it cannot be.
 
     Only the transport and the extraction are shared. Schema validation and what to do
@@ -194,14 +257,29 @@ async def complete_json(cfg, prompt: str, *, system: str, shape: str = "object",
     Collapsing those into one policy would be the opposite of a simplification.
     """
     raw = await complete(cfg, prompt, system=system, model=model,
-                         temperature=temperature, max_tokens=max_tokens)
-    m = (_JSON_ARRAY if shape == "array" else _JSON_OBJECT).search(raw or "")
-    if not m:
-        return default
-    try:
-        return json.loads(m.group(0))
-    except json.JSONDecodeError:
-        return default
+                         temperature=temperature, max_tokens=max_tokens,
+                         sampling=sampling, error_out=error_out)
+    # So a caller can tell *why* it got the default. `complete` turns every failure into
+    # an empty string — a refused request, a dropped connection, a replica that was
+    # evicted mid-call — and an empty reply is a different fact from a reply that could
+    # not be parsed. Callers that report one as the other send people looking for a
+    # prompt bug when the generator was simply not there.
+    if raw_out is not None:
+        raw_out["raw"] = raw or ""
+    raw = raw or ""
+    opener, closer = ("[", "]") if shape == "array" else ("{", "}")
+    # Greedy first: it is what every existing caller has been parsed with, and for a reply
+    # that is one value with prose around it the two agree. The balanced fallback only
+    # matters when the greedy span covers more than one value.
+    m = (_JSON_ARRAY if shape == "array" else _JSON_OBJECT).search(raw)
+    for candidate in (m.group(0) if m else "", _balanced(raw, opener, closer)):
+        if not candidate:
+            continue
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    return default
 
 
 async def count_tokens(base_url: str, model: str, texts: list[str]) -> list[int] | None:
@@ -263,6 +341,10 @@ async def stream_answer(
     history: str = "",
     prompt_parts: list | None = None,
     usage_out: dict | None = None,
+    # Sampling beyond temperature, forwarded verbatim when given. Absent by default so
+    # every existing caller sends exactly what it sent before, and the server's own
+    # defaults — which vLLM takes from the checkpoint's generation_config.json — apply.
+    sampling: dict | None = None,
 ) -> AsyncIterator[str]:
     """Stream a completion.
 
@@ -306,6 +388,10 @@ async def stream_answer(
         "stream_options": {"include_usage": True},
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    # Merged rather than assigned: a caller naming `top_p` must not silently drop the
+    # temperature it also asked for, and an unknown key is the caller's business — vLLM
+    # rejects what it does not accept, which is a better failure than this guessing.
+    payload.update({k: v for k, v in (sampling or {}).items() if v is not None})
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0)) as client:
         try:

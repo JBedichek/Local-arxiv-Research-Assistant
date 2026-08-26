@@ -162,6 +162,47 @@ def training_pairs(conn: sqlite3.Connection, min_per_query: int = 1,
     return out
 
 
+#: The one source in this table whose positives were decided before any retrieval ran: a
+#: question generated *from* a chunk, so the chunk is relevant by construction. Everything
+#: else was labelled by the retriever's own reranker.
+RECOVERY_SOURCE = "explore_missed"
+
+
+def recovery_set(conn: sqlite3.Connection, limit: int = 500) -> list[tuple[str, str]]:
+    """(query, chunk that answers it) pairs the current stack is known to have missed.
+
+    **The only honest way to score retrieval against this table.** 131,874 of its 143,139
+    rows carry ``teacher = 'cross_encoder'`` — the reranker that is the last stage of the
+    retriever itself — so scoring the retriever against them measures how far it agrees
+    with itself. The give-away is in the data: in ``source = 'search'``, 26 of 39 queries
+    have exactly 8 positives, because 8 is how many results the search returned. The gold
+    set is the old top-8, and a stack that surfaced good chunks the old one missed would
+    score *worse*.
+
+    These pairs are built the other way round and were recorded only when retrieval failed
+    to find the chunk. So:
+
+    - absolute recall on this set is ≈ 0 by construction — never report it as a score;
+    - a change that recovers more of them reaches something the current stack cannot,
+      which no amount of agreeing with the old ranking can fake;
+    - **it can show a gain and cannot show the matching loss.** A change that recovers
+      eight of these while losing fifty chunks the baseline found scores +8, because
+      nothing labelled the fifty. Pair it with a measurement that can see the loss.
+
+    Measured on this machine over the first 120 pairs, so a real signal and a real null
+    are distinguishable: baseline 1/120, ``rrf_k=10`` 1/120, ``rrf_k=120`` 2/120,
+    ``kind_bias={}`` 1/120, ``lexical=False`` **9/120**.
+
+    A function rather than a paragraph of guidance because the guidance already existed —
+    ninety lines of it — and a run scored itself against the whole table anyway. The
+    honest measurement has to be cheaper to reach than the dishonest one.
+    """
+    rows = conn.execute(
+        "SELECT query, chunk_id FROM judgements WHERE source = ? AND label > 0 "
+        "ORDER BY id LIMIT ?", (RECOVERY_SOURCE, int(limit))).fetchall()
+    return [(r[0], r[1]) for r in rows]
+
+
 def stats(conn: sqlite3.Connection) -> dict:
     row = conn.execute(
         """SELECT COUNT(*) n, COUNT(DISTINCT query_hash) q,
