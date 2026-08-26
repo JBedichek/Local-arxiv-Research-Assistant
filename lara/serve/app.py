@@ -16,33 +16,46 @@ and yield between tokens.
 
 from __future__ import annotations
 
-import json
 import os
 
 from fastapi import FastAPI
 
 from lara.serve import deps
+from lara.serve.auth import tokens_for_app
 from lara.serve.routes import ROUTERS
 from lara.serve.state import AppState
 
 app = FastAPI(title="Local arXiv Research Assistant", docs_url="/api/docs")
 
-# `lara serve` exports LARA_TOKENS as JSON when more than one person has a secret, and
-# LARA_TOKEN for the single-secret case. Read from the environment rather than the parsed
-# config because uvicorn imports this module in its own process, where the CLI's config
-# does not travel. Anything that imports the app directly — a test, an embedded runner —
-# gets the same protection by setting the same variables, and no protection if it sets
-# nothing and serves loopback.
-_auth_tokens: dict[str, str] = {}
-_env_many = os.environ.get("LARA_TOKENS", "").strip()
-if _env_many:
+
+def _config_or_none():
+    """The configuration this process was started against, or None if there is none.
+
+    Never fatal at import: a reader that cannot be imported because a config file is
+    missing or malformed is a worse failure than the one this exists to fix, and the
+    startup hook below builds `AppState` from the same path and will say so properly.
+    """
     try:
-        _auth_tokens = {k: v for k, v in json.loads(_env_many).items() if v}
-    except Exception:
-        _auth_tokens = {}
-_env_one = os.environ.get("LARA_TOKEN", "").strip()
-if _env_one:
-    _auth_tokens.setdefault("env", _env_one)
+        from lara import config as config_mod
+
+        return config_mod.load(os.environ.get("LARA_CONFIG"))
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
+# `lara serve` exports LARA_TOKENS as JSON when more than one person has a secret, and
+# LARA_TOKEN for the single-secret case — and those still win, because by the time it
+# exports them the policy has been applied and a caller who sets them by hand means them.
+#
+# The config is read underneath, and that half is new. This used to read the environment
+# and nothing else, on the reasoning that uvicorn imports the module in its own process
+# where the CLI's config does not travel. True, and it made the reader's protection
+# depend on `lara serve` having been the thing that started it — which for a while it
+# could not be, because `serve` had lost its `@app.command()` decorator. A reader started
+# with plain uvicorn against a config saying `auth.mode: always` installed no middleware
+# at all. `tokens_for_app` applies the same `require_token_for` rule the CLI does, so
+# loopback under the default `auto` mode is unchanged.
+_auth_tokens: dict[str, str] = tokens_for_app(dict(os.environ), _config_or_none())
 if _auth_tokens:
     from lara.serve.auth import TokenAuthMiddleware
 

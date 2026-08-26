@@ -88,7 +88,6 @@ def _announce_when_ready(host: str, port: int, token: str | None,
 
     threading.Thread(target=watch, daemon=True, name="ready-announcer").start()
 
-@app.command()
 def _reader_log_path(cfg):
     """Where the reader's own log goes, or None if the logs directory is unusable.
 
@@ -146,6 +145,7 @@ def _log_config(path):
     return cfg
 
 
+@app.command()
 def serve(
     config: str = typer.Option(None, help="Path to config.yaml"),
     host: str = typer.Option(None),

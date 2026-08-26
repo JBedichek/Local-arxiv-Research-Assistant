@@ -1296,3 +1296,98 @@ def test_nothing_cached_when_the_repo_was_never_fetched(tmp_path):
     mgr = DownloadManager(tmp_path)
     assert not mgr.has_files("org/absent", ["a.gguf"])
     assert not mgr.has_files("org/absent", None)
+
+
+# ── the CLI has the command its own documentation is written around ───────────────
+
+def _command_names():
+    """Every subcommand `lara` actually registers, as Typer sees them."""
+    from lara import cli                                   # noqa: F401 — registers them
+    from lara.cli._base import app as cli_app
+
+    return {c.name or c.callback.__name__ for c in cli_app.registered_commands}
+
+
+def test_lara_serve_is_a_command():
+    """`@app.command()` had landed on the private helper below `serve`, not on `serve`.
+
+    The decorator sat two lines above `def _reader_log_path(cfg)`, so `lara` grew a
+    `_reader-log-path` subcommand taking a `cfg` argument, and `lara serve` — the command
+    the README, the auth module's docstring and every install instruction are written
+    around — did not exist.
+    """
+    names = _command_names()
+    assert "serve" in names
+    assert not any(n.startswith("_") for n in names), \
+        f"a private helper is exposed as a subcommand: {sorted(n for n in names if n.startswith('_'))}"
+
+
+# ── a reader started without the CLI is still a reader ────────────────────────────
+
+class _AuthCfg:
+    def __init__(self, **vals): self.vals = vals
+    def get_in(self, dotted, default=None): return self.vals.get(dotted, default)
+
+
+def test_a_hand_started_reader_reads_the_config_tokens():
+    """The consequence of `lara serve` not existing, and the worse half of it.
+
+    `lara.serve.app` installs `TokenAuthMiddleware` only when `LARA_TOKEN`/`LARA_TOKENS`
+    is in the environment, and `lara serve` was the only thing that put a config-declared
+    token there. With the command missing, the sole remaining way to start the reader is
+    `uvicorn lara.serve.app:app`, which exported nothing — so a config saying
+    `serving.auth.mode: always` with a token under `serving.auth.tokens` served every
+    endpoint unauthenticated: model downloads on the operator's HF_TOKEN, free inference,
+    the arXiv crawler, and the endpoints that delete the library.
+    """
+    from lara.serve import auth as A
+
+    cfg = _AuthCfg(**{"serving.auth.mode": "always",
+                      "serving.auth.tokens": {"ana": "s3cret"},
+                      "serving.host": "127.0.0.1"})
+    assert A.tokens_for_app({}, cfg) == {"ana": "s3cret"}
+
+
+def test_a_config_bound_off_loopback_is_protected_without_the_cli():
+    from lara.serve import auth as A
+
+    cfg = _AuthCfg(**{"serving.auth.token": "t", "serving.host": "0.0.0.0"})
+    assert A.tokens_for_app({}, cfg) == {"default": "t"}
+
+
+def test_plain_loopback_still_asks_for_nothing():
+    """Unchanged on purpose. `require_token_for` says loopback needs no token under the
+    default `auto` mode, and `lara serve` exports none there; a token left in
+    config.local.yaml by `lara setup` must not start demanding a login on 127.0.0.1."""
+    from lara.serve import auth as A
+
+    cfg = _AuthCfg(**{"serving.auth.token": "t", "serving.host": "127.0.0.1"})
+    assert A.tokens_for_app({}, cfg) == {}
+
+
+def test_mode_off_means_off_even_with_a_token_configured():
+    from lara.serve import auth as A
+
+    cfg = _AuthCfg(**{"serving.auth.mode": "off", "serving.auth.token": "t",
+                      "serving.host": "0.0.0.0"})
+    assert A.tokens_for_app({}, cfg) == {}
+
+
+def test_the_environment_still_wins():
+    """`lara serve` has already applied the policy by the time it exports these, and a
+    caller that sets them by hand means them. Reading the config underneath would either
+    duplicate the decision or contradict it."""
+    import json as _json
+
+    from lara.serve import auth as A
+
+    cfg = _AuthCfg(**{"serving.auth.token": "from-config", "serving.host": "0.0.0.0"})
+    assert A.tokens_for_app({"LARA_TOKEN": "from-env"}, cfg) == {"env": "from-env"}
+    env = {"LARA_TOKENS": _json.dumps({"ana": "a", "bo": "b"})}
+    assert A.tokens_for_app(env, cfg) == {"ana": "a", "bo": "b"}
+
+
+def test_a_reader_with_no_config_at_all_is_exactly_as_it_was():
+    from lara.serve import auth as A
+
+    assert A.tokens_for_app({}, None) == {}

@@ -120,6 +120,51 @@ def require_token_for(host: str, cfg) -> bool:
     return not is_loopback(host)
 
 
+def tokens_for_app(env: dict | None = None, cfg=None) -> dict[str, str]:
+    """Every secret the served app should accept, from the environment or the config.
+
+    **The app must not depend on the CLI having run.** `lara.serve.app` read `LARA_TOKEN`
+    and `LARA_TOKENS` and nothing else, and `lara serve` was the only thing that put a
+    config-declared token into either. For the whole time `serve` was missing its
+    `@app.command()` decorator the sole way to start the reader was
+    `uvicorn lara.serve.app:app`, which exported nothing — so a config that said
+    `serving.auth.mode: always` with a token under `serving.auth.tokens` served every
+    endpoint unauthenticated. Not "asked for a token it did not have": no middleware was
+    installed at all, and the reader looked entirely normal.
+
+    The environment wins when it says anything, because `lara serve` has already applied
+    the policy by the time it exports these, and a caller that sets them by hand means
+    them. Reading the config underneath would either duplicate that decision or
+    contradict it.
+
+    Falling back to the config applies the same rule `lara serve` does — `serving.host`
+    is the bind this configuration describes, and `require_token_for` decides — so plain
+    loopback under the default `auto` mode is unchanged and a token left in
+    `config.local.yaml` by `lara setup` still does not start demanding a login on
+    127.0.0.1.
+    """
+    env = os.environ if env is None else env
+    out: dict[str, str] = {}
+    many = (env.get("LARA_TOKENS") or "").strip()
+    if many:
+        try:
+            import json
+
+            out = {str(k): v for k, v in json.loads(many).items()
+                   if isinstance(v, str) and v.strip()}
+        except Exception:                                  # noqa: BLE001
+            out = {}
+    one = (env.get("LARA_TOKEN") or "").strip()
+    if one:
+        out.setdefault("env", one)
+    if out or cfg is None:
+        return out
+    host = cfg.get_in("serving.host", "127.0.0.1") or "127.0.0.1"
+    if not require_token_for(str(host), cfg):
+        return {}
+    return resolve_tokens(cfg)
+
+
 class TokenAuthMiddleware(BaseHTTPMiddleware):
     def __init__(self, app, token: str | dict[str, str]) -> None:
         super().__init__(app)
