@@ -230,6 +230,14 @@ async def complete(cfg, prompt: str, *, system: str, model: str | None = None,
     try:
         async for tok in stream_answer(cfg, prompt, [], system=system, model=model,
                                        temperature=temperature, max_tokens=max_tokens,
+                                       # Forwarded, which it was not from the day the
+                                       # parameter was added. `complete_json` passed it
+                                       # on and this did not, so whether a caller's
+                                       # `top_k` reached the server depended on which of
+                                       # two adjacent functions it happened to call —
+                                       # and the nineteen sites that name one all go
+                                       # through here. Only `temperature` ever arrived.
+                                       sampling=sampling,
                                        raw_user=True):
             buf += tok
     except Exception as exc:

@@ -397,6 +397,126 @@ def test_complete_returns_empty_string_on_error(monkeypatch):
     assert asyncio.run(GEN.complete(None, "p", system="s")) == ""
 
 
+# ── sampling reaches the server, or the caller hears why not ──────────────────────
+
+def _capturing_stream(seen):
+    async def gen(cfg, prompt, hits, **kw):
+        seen.update(kw)
+        yield "ok"
+    return gen
+
+
+def test_complete_forwards_sampling_to_the_transport(monkeypatch):
+    """`complete` declared `sampling` and never passed it on.
+
+    Nineteen call sites across this repository and autoresearch name `top_p`, `top_k`,
+    `min_p` or `repetition_penalty`; every one of them went into a parameter that was
+    read nowhere, and only `temperature` ever reached the generator. `complete_json`
+    forwards it faithfully, which is what made the omission hard to see — the same dict
+    arrives at the server or not depending on which of two adjacent functions you call.
+    """
+    seen = {}
+    monkeypatch.setattr(GEN, "stream_answer", _capturing_stream(seen))
+    asyncio.run(GEN.complete(None, "p", system="s", sampling={"top_k": 20}))
+    assert seen["sampling"] == {"top_k": 20}
+
+
+def test_complete_json_and_complete_send_the_same_sampling(monkeypatch):
+    """The two entry points must not disagree about it. They did, for their whole life."""
+    seen = {}
+    monkeypatch.setattr(GEN, "stream_answer", _capturing_stream(seen))
+    asyncio.run(GEN.complete(None, "p", system="s", sampling={"top_p": 0.8}))
+    direct = seen.pop("sampling")
+    seen.clear()
+    monkeypatch.setattr(GEN, "stream_answer", _capturing_stream(seen))
+    asyncio.run(GEN.complete_json(None, "p", system="s", sampling={"top_p": 0.8}))
+    assert direct == seen["sampling"] == {"top_p": 0.8}
+
+
+class _Cfg:
+    def get_in(self, dotted, default=None):
+        assert dotted == "serving.vllm"
+        return {"base_url": "http://x/v1", "default_model": "m"}
+
+
+def _fake_httpx(sent, *, status=200, body=b"", frames=()):
+    """Just enough of httpx to see the request body `stream_answer` builds."""
+    class _Resp:
+        status_code = status
+        async def aread(self): return body
+        async def aiter_lines(self):
+            for line in frames:
+                yield line
+    class _Stream:
+        async def __aenter__(self): return _Resp()
+        async def __aexit__(self, *a): return False
+    class _Client:
+        def __init__(self, **kw): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        def stream(self, method, url, json=None):
+            sent.update(json or {})
+            return _Stream()
+
+    import types
+
+    import httpx as real
+    # Everything else — the exception classes `stream_answer` names in its except
+    # clauses among them — comes from the real module. A stub that answers only the two
+    # attributes the happy path touches turns any error into an AttributeError, which is
+    # how this fake first reported a 400 as the wrong exception type.
+    shim = types.SimpleNamespace(**{k: getattr(real, k) for k in dir(real)
+                                    if not k.startswith("_")})
+    shim.AsyncClient, shim.Timeout = _Client, lambda *a, **k: None
+    return shim
+
+
+def test_sampling_reaches_the_request_body(monkeypatch):
+    """The end of the chain, not the middle.
+
+    Asserting `complete` hands the dict to `stream_answer` would have passed just as well
+    if `stream_answer` dropped it in turn, and the bug being fixed here is exactly one
+    layer forwarding what the next layer never reads. This drives the real
+    `stream_answer` and reads the JSON it would have POSTed.
+    """
+    sent = {}
+    frames = ['data: {"choices": [{"delta": {"content": "hi"}}]}', "data: [DONE]"]
+    monkeypatch.setattr(GEN, "httpx", _fake_httpx(sent, frames=frames))
+
+    async def go():
+        return "".join([t async for t in GEN.stream_answer(
+            _Cfg(), "q", [], system="s", temperature=0.3,
+            sampling={"top_k": 20, "min_p": 0.0, "repetition_penalty": None})])
+
+    assert asyncio.run(go()) == "hi"
+    assert sent["top_k"] == 20
+    # 0.0 is a value a caller may mean; None is "not asked for" and is dropped.
+    assert sent["min_p"] == 0.0 and "repetition_penalty" not in sent
+    assert sent["temperature"] == 0.3          # merged, not replaced
+
+
+def test_a_sampling_value_the_server_refuses_is_reported_not_dropped(monkeypatch):
+    """A rejected request must not look like a model with nothing to say.
+
+    vLLM validates sampling parameters and answers 400 for one it does not accept — a
+    `top_k` on a build without it, a `min_p` out of range. `stream_answer` turns that into
+    a RuntimeError carrying the server's own body, `complete` turns every exception into
+    "", and without `error_out` the caller cannot tell a refused request from an empty
+    completion. That distinction is the whole reason `error_out` exists, and it was
+    unreachable for sampling faults because sampling never left `complete`.
+    """
+    sent = {}
+    monkeypatch.setattr(GEN, "httpx", _fake_httpx(
+        sent, status=400, body=b'{"message": "top_k is not supported by this build"}'))
+    err = {}
+    out = asyncio.run(GEN.complete(_Cfg(), "p", system="s", sampling={"top_k": 20},
+                                   error_out=err))
+    assert out == ""
+    assert sent["top_k"] == 20                 # it was asked for
+    assert err["type"] == "RuntimeError"
+    assert "400" in err["error"] and "top_k is not supported" in err["error"]
+
+
 # ── the SSE driver ────────────────────────────────────────────────────────────────
 #
 # Both streaming endpoints share one queue-and-drain helper, so the framing and the
