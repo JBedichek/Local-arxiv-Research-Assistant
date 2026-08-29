@@ -156,10 +156,14 @@ def port_of(base_url: str) -> int:
 
 def probe(base_url: str, timeout: float = 1.0) -> list[str] | None:
     """Model ids served at ``base_url``, or None if nothing answers."""
+    import os
+
     import httpx
 
     try:
-        r = httpx.get(f"{base_url.rstrip('/')}/models", timeout=timeout)
+        r = httpx.get(f"{base_url.rstrip('/')}/models", timeout=timeout,
+                      headers={"Authorization":
+                               f"Bearer {os.environ.get('VLLM_API_KEY', 'vllm-local')}"})
         if r.status_code == 200:
             return [m.get("id", "?") for m in (r.json().get("data") or [])]
     except Exception:

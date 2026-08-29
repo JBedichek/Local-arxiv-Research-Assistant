@@ -21,12 +21,24 @@ the cached prefix, so after the first request they cost nothing.
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import AsyncIterator
 
 import httpx
 
 OPEN, CLOSE = "<think>", "</think>"
+
+
+def _auth_headers() -> dict:
+    """The bearer token vLLM servers in this fleet require, when they require one.
+
+    Some replicas are launched outside lara (by hand, or a systemd unit) with
+    `VLLM_API_KEY` exported, which makes vLLM reject any request lacking it. Matches the
+    default `autoresearch/pool.py` and `autoresearch/agent.py` already use for the same
+    variable, so a replica started either way is reachable from every caller.
+    """
+    return {"Authorization": f"Bearer {os.environ.get('VLLM_API_KEY', 'vllm-local')}"}
 
 SYSTEM = """You answer questions about arXiv machine-learning papers using only the \
 excerpts provided.
@@ -302,7 +314,8 @@ async def count_tokens(base_url: str, model: str, texts: list[str]) -> list[int]
     root = root[:-3] if root.endswith("/v1") else root
     out: list[int] = []
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=3.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=3.0),
+                                     headers=_auth_headers()) as client:
             for t in texts:
                 if not t:
                     out.append(0)
@@ -319,7 +332,8 @@ async def count_tokens(base_url: str, model: str, texts: list[str]) -> list[int]
 async def context_limit(base_url: str, model: str) -> int | None:
     """The model's real context window, as the server reports it."""
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0),
+                                     headers=_auth_headers()) as client:
             r = await client.get(f"{base_url.rstrip('/')}/models")
             if r.status_code != 200:
                 return None
@@ -401,7 +415,8 @@ async def stream_answer(
     # rejects what it does not accept, which is a better failure than this guessing.
     payload.update({k: v for k, v in (sampling or {}).items() if v is not None})
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0),
+                                 headers=_auth_headers()) as client:
         try:
             async with client.stream("POST", f"{base_url}/chat/completions", json=payload) as resp:
                 if resp.status_code != 200:
