@@ -202,6 +202,13 @@ def validation_loss(model, triples: list[Triple], device: str, rec: Recipe,
 
     if not triples:
         return float("nan")
+    if rec.val_max_triples and len(triples) > rec.val_max_triples:
+        # C9: honor the cap exactly as mnrl.mnrl_val_loss does (mnrl.py) — a
+        # deterministic fixed-seed subsample, so the loss stays comparable
+        # between evaluations. Without it this path re-introduces the cost bug
+        # documented on Recipe.val_max_triples (46.5x a training step per eval;
+        # 82% of compute at 161k triples).
+        triples = random.Random(12345).sample(list(triples), rec.val_max_triples)
     model.eval()
     total, n = 0.0, 0
     with torch.no_grad():
@@ -245,7 +252,9 @@ def train_on(triples: list[Triple], model_name: str, device: str, rec: Recipe,
     if hasattr(inner, "gradient_checkpointing_enable"):
         inner.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
-    inner.config.use_cache = False
+        # L17: use_cache lives on the same `.config` the guard above protects; an
+        # unguarded access here defeats the guard entirely on wrappers without one.
+        inner.config.use_cache = False
     if rec.compile_mode:
         model[0].auto_model = torch.compile(inner, mode=rec.compile_mode, dynamic=True)
 
@@ -304,7 +313,12 @@ def train_on(triples: list[Triple], model_name: str, device: str, rec: Recipe,
             vl = None
             if val_triples and step % rec.eval_every == 0:
                 vl = validation_loss(model, val_triples, device, rec)
-                if vl < best_loss - rec.min_delta:
+                # L16: a non-finite validation loss (the empty-triple path returns
+                # NaN) is a failed measurement, not a regression. Skip it: do not
+                # burn patience and do not let it poison best_val_loss.
+                if not math.isfinite(vl):
+                    vl = None
+                elif vl < best_loss - rec.min_delta:
                     best_loss, best_state, since_best = vl, snapshot(), 0
                 else:
                     since_best += 1

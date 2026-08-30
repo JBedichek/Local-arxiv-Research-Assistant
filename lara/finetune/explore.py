@@ -270,10 +270,16 @@ async def run_cycles(cfg, conn, retriever, cross_encoder, *, n: int = 50,
     rows = (sample_chunks_by_topic(conn, retriever, topics, n * 2, seed)
             if topics else sample_chunks(conn, n * 2, seed))
 
+    # M19: count LLM failures across the run. If every call in a wave raised, the
+    # generator is down and an empty explore run must not masquerade as
+    # "nothing new found".
+    gen_stats = {"attempts": 0, "failed": 0}
+
     async def ask_one(row, i: int):
         """One question from one passage. Independent of every other, so they can overlap."""
         style, instruction = QUESTION_STYLES[i % len(QUESTION_STYLES)]
         buf = ""
+        gen_stats["attempts"] += 1
         try:
             async for tok in stream_answer(
                 cfg, f"{instruction}\n\nPassage:\n{row['text'][:1500]}\n\nQuestion:",
@@ -282,6 +288,7 @@ async def run_cycles(cfg, conn, retriever, cross_encoder, *, n: int = 50,
             ):
                 buf += tok
         except Exception:
+            gen_stats["failed"] += 1
             return row, style, None
         return row, style, clean_question(buf)
 
@@ -317,7 +324,18 @@ async def run_cycles(cfg, conn, retriever, cross_encoder, *, n: int = 50,
         if stats["questions"] >= n:
             break
         wave = rows[wave_start:wave_start + gen_concurrency]
+        before_failed = gen_stats["failed"]
         pending = await generate_batch(wave, wave_start)
+        if pending and gen_stats["failed"] - before_failed == len(pending):
+            raise RuntimeError(
+                f"generator unreachable? all {len(pending)} question-generation LLM "
+                f"calls in this wave failed — refusing to report an empty explore "
+                f"run as 'nothing found'")
+        if gen_stats["failed"] and gen_stats["failed"] > before_failed:
+            print(f"[explore] warning: {gen_stats['failed'] - before_failed}/"
+                  f"{len(pending)} question-generation LLM calls failed in this wave "
+                  f"(partial generator trouble; total "
+                  f"{gen_stats['failed']}/{gen_stats['attempts']})", flush=True)
 
         for row, style, q in pending:
             if stats["questions"] >= n:

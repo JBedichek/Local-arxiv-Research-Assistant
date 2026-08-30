@@ -316,7 +316,10 @@ def embed_papers(
     devices = ldev.resolve_all(device if device else ecfg.get("devices"))
     model = emb.load_model(
         ecfg["model"], device=devices[0], max_seq_length=int(ecfg["max_seq_len"]),
-        compile_mode=ecfg.get("compile"), compile_dynamic=True,
+        compile_mode=ecfg.get("compile"),
+        # L20: honor embedding.compile_dynamic like the other load site (line ~216)
+        # does, instead of hardcoding True.
+        compile_dynamic=bool(ecfg.get("compile_dynamic", True)),
     )
     encoder = model
     if len(devices) > 1:

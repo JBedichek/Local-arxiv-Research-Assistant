@@ -275,6 +275,8 @@ hardware:
 hot_tier:
   # Tier 0: pin the open paper + its 1-hop citation neighbourhood at full fp16.
   #
+  # NOT IMPLEMENTED — read by nothing; see agent_reference/bug_reference_8-30-26.md M21.
+  #
   # NOT IMPLEMENTED. These keys are read by nothing that serves — grep finds max_bytes in
   # the setup planner and nowhere else, and /api/meminfo reports hot_tier_allocated:
   # false. Tier 0 is currently a filtered case of tier 1 (see lara/index/search.py), which

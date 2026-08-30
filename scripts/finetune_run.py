@@ -5,7 +5,6 @@ independent interventions and the interesting question is whether they compose. 
 number is on the held-out fold, split by query.
 """
 import json, sys, time
-sys.path.insert(0, '/home/user/Desktop/Local-arxiv-Research-Assistant')
 import numpy as np
 from lara.finetune import kfold as KF
 from lara.finetune import whiten as WH

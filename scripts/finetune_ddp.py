@@ -10,7 +10,6 @@ Rank 0 owns everything that is not training: the independent eval, the checkpoin
 guard. The others only contribute gradients.
 """
 import argparse, os, sys, time
-sys.path.insert(0, '/home/user/Desktop/Local-arxiv-Research-Assistant')
 import torch
 import torch.distributed as dist
 

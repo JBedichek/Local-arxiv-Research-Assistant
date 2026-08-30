@@ -74,7 +74,9 @@ def check_config(cfg: Config) -> list[Check]:
 def check_disks(cfg: Config) -> list[Check]:
     checks: list[Check] = []
     required = cfg.get_in("disk.required_device")
-    min_free = float(cfg.get_in("disk.min_free_gb", 0))
+    # L21: default to the shipped config.yaml value (20 GB), not 0 — a missing key
+    # must not silently disable the free-space floor.
+    min_free = float(cfg.get_in("disk.min_free_gb", 20))
     forbidden = [Path(os.path.realpath(p)) for p in (cfg.get_in("disk.forbid_paths") or [])]
 
     for address, resolved in cfg.all_paths().items():

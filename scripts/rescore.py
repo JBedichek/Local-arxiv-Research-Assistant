@@ -1,9 +1,18 @@
 """Rescore baseline and both checkpoints in the format the corpus is actually embedded in."""
-import sys, json; sys.path.insert(0,'/home/user/Desktop/Local-arxiv-Research-Assistant')
+import argparse, json, os
+# M18: no hardcoded sys.path.insert of an older checkout — lara-core is installed
+# editable; shadowing it silently no-ops fixes. GPU comes from --device or
+# $LARA_RESCORE_DEVICE, defaulting to the previous hardcoded value.
 from lara.finetune import evaluate as EV
 from lara.index.embed import load_model
 from lara.store import db; from lara import config as C
 from lara import device as dev
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--device", default=os.environ.get("LARA_RESCORE_DEVICE", "2"),
+                help="GPU for scoring (was hardcoded to '2')")
+a = ap.parse_args()
+DEVICE = a.device
 
 cfg=C.load(); conn=db.connect(cfg.get_path('paths.metadata_db'))
 ROOT = cfg.get_path('disk.root')/'models'
@@ -12,7 +21,7 @@ MODELS = [("baseline (stock)", cfg.get_in('embedding.model')),
           ("tuned bare (ablation)", str(ROOT/'embeddinggemma-pairs-ablation'))]
 out={}
 for label, path in MODELS:
-    m = load_model(path, device="2", max_seq_length=512)
+    m = load_model(path, device=DEVICE, max_seq_length=512)
     row={}
     for fmt, ctx in (("corpus", True), ("bare(old)", False)):
         r = EV.run(m, conn, n=800, contextual=ctx)
@@ -21,7 +30,7 @@ for label, path in MODELS:
               f"r@10 {r['citation']['r@10']:.4f} | paraphrase mrr {r['paraphrase']['mrr']:.4f} "
               f"r@10 {r['paraphrase']['r@10']:.4f}", flush=True)
     out[label]=row
-    del m; dev.empty_cache("2")
+    del m; dev.empty_cache(DEVICE)
 json.dump(out, open('data/logs/rescore.json','w'), indent=1)
 
 print("\n=== corpus format (what search actually uses) ===")

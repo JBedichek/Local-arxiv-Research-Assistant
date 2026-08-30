@@ -56,6 +56,11 @@ SAMPLE_CHARS = 1400
 #: HTTP 200. Judging it wastes a model call to reach the obvious answer.
 MIN_USEFUL_CHARS = 800
 
+# M19: consecutive-failure watchdog for judge_uncertain. One failure is a
+# degraded decision (documented, by design); a wall of failures is an outage.
+_LLM_CONSECUTIVE_FAILURES = 0
+_LLM_FAILURE_THRESHOLD = 10
+
 
 @dataclass
 class Verdict:
@@ -121,6 +126,7 @@ async def judge_uncertain(cfg, goal: str, doc_title: str, text: str,
     from lara.serve.generate import stream_answer
 
     excerpt = "\n\n---\n\n".join(samples(text, n=3, width=1200))
+
     prompt = (
         f"A reader wants to build a study corpus for this goal:\n\n  {goal}\n\n"
         f"Candidate document: {doc_title}\n\nExcerpts:\n{excerpt}\n\n"
@@ -137,7 +143,18 @@ async def judge_uncertain(cfg, goal: str, doc_title: str, text: str,
         ):
             buf += tok
     except Exception:                                  # noqa: BLE001
+        # M19: a single failure degrades to the reranker's score (documented
+        # above), but a generator that fails every call is an outage, not a
+        # judgement signal — count consecutive failures and raise rather than
+        # let a whole build silently run on reranker-only verdicts.
+        global _LLM_CONSECUTIVE_FAILURES
+        _LLM_CONSECUTIVE_FAILURES += 1
+        if _LLM_CONSECUTIVE_FAILURES >= _LLM_FAILURE_THRESHOLD:
+            raise RuntimeError(
+                f"generator unreachable? {_LLM_CONSECUTIVE_FAILURES} consecutive "
+                f"judge_uncertain LLM calls failed") from None
         return None
+    _LLM_CONSECUTIVE_FAILURES = 0
 
     m = re.search(r"\{.*\}", buf, re.S)
     if not m:

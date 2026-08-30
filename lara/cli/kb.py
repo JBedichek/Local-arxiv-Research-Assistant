@@ -217,7 +217,9 @@ def _build(cfg, c, r, *, prune: bool = True) -> None:
 
         stats = B.build(c, r, embedder,
                         dim_full=ecfg.get("dim_full", 768),
-                        dim_trunc=ecfg.get("dim_truncated", 256), on_event=on_event)
+                        dim_trunc=ecfg.get("dim_truncated", 256), on_event=on_event,
+                        # M20: the config's chunking.* must reach add_document.
+                        chunking=cfg.get_in("chunking") or {})
 
     freed = B.prune_raw(c, r) if prune else 0
     console.print(f"\n[bold green]Built {c.root.name}[/bold green] — "

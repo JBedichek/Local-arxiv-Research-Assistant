@@ -186,7 +186,10 @@ def dataset_fetch(
             console.print(f"  {f['name']} — {(f['size']-have)/1e9:.1f} GB to go"
                           + (f" (resuming at {have/1e9:.1f} GB)" if have else ""))
             with httpx.stream("GET", f"{base}/api/dataset/file/{f['name']}",
-                              headers=headers, timeout=None) as r:
+                              headers=headers,
+                              # L19: timeout=None had no read-inactivity watchdog — a
+                              # stalled mirror hung the resume loop forever mid-file.
+                              timeout=httpx.Timeout(connect=30, read=120)) as r:
                 r.raise_for_status()
                 got = have
                 last = 0.0

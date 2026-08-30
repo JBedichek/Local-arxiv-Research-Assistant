@@ -196,7 +196,15 @@ def train(conn: sqlite3.Connection, cfg: TrainConfig, progress=None):
                              per_paper=max(8, cfg.chunks_per_paper * 3),
                              limit_edges=cfg.max_edges)
     # Hold out by CITING PAPER, matching the eval split, so a paper never appears in both.
-    train_bags = [b for b in all_bags if b.src not in held and b.dst not in held]
+    # M17: eval (_held_out_srcs / build_citation_task) holds out by SRC only — its
+    # queries come from citation_contexts whose src is held. Filtering on dst too
+    # contradicted that split and silently deleted the incoming edges of every
+    # heavily-cited paper from the training distribution. Bags whose dst is held
+    # still train: dst papers are corpus documents the eval legitimately ranks.
+    train_bags = [b for b in all_bags if b.src not in held]
+    dropped = len(all_bags) - len(train_bags)
+    print(f"[train] held-out filter: dropped {dropped:,} of {len(all_bags):,} bags "
+          f"(src in held-out citing papers)", flush=True)
     if len(train_bags) < cfg.batch_size * 4:
         raise RuntimeError(f"only {len(train_bags)} usable bags; crawl more papers first")
 
@@ -229,6 +237,13 @@ def train(conn: sqlite3.Connection, cfg: TrainConfig, progress=None):
 
     for epoch in range(cfg.epochs):
         rng.shuffle(train_bags)
+        # L22: the ragged tail (< batch_size bags at the end of each epoch) is
+        # dropped; log it once per run so small fit-check runs do not silently
+        # lose a large fraction of their bags.
+        tail = len(train_bags) % cfg.batch_size
+        if epoch == 0 and tail:
+            print(f"[train] ragged tail: {tail} bag(s) per epoch dropped by the "
+                  f"full-batch stride (batch_size={cfg.batch_size})", flush=True)
         for i in range(0, len(train_bags) - cfg.batch_size + 1, cfg.batch_size):
             batch = train_bags[i : i + cfg.batch_size]
             set_lr(step)

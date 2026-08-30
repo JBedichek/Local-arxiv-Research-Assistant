@@ -300,14 +300,27 @@ def prune_raw(corpus: Corpus, recipe: Recipe) -> int:
 
 
 def build(corpus: Corpus, recipe: Recipe, embedder, *,
-          dim_full: int = 768, dim_trunc: int = 256, on_event=None) -> BUILD.BuildStats:
+          dim_full: int = 768, dim_trunc: int = 256, on_event=None,
+          chunking: dict | None = None) -> BUILD.BuildStats:
     """Chunk, embed and index every accepted source. Safe to re-run.
 
     Re-running is the normal case, not a recovery path: a study corpus grows a document at
     a time, and documents are keyed by content hash while vectors are appended, so a second
     build embeds only what the first one did not.
+
+    `chunking` carries the config.yaml `chunking.*` dict (target_chars /
+    overlap_frac / never_cross_sections — the same keys lara/ingest/fulltext.py:74-76
+    filters for the crawl path). M20: until now the only add_document call site passed
+    no chunking kwargs, so builds ran on parse.py's hardcoded defaults and editing
+    config.yaml changed nothing.
     """
     from lara.index.vectors import VectorStore
+
+    chunk_kwargs = {k: v for k, v in (chunking or {}).items()
+                    if k in ("target_chars", "overlap_frac")}
+    # add_document's chunk_blocks call hardcodes never_cross_sections=True, so that
+    # key is deliberately not forwarded here (unlike the crawl path, where
+    # fulltext.py filters all three for parse_html).
 
     def emit(kind: str, **payload):
         if on_event is not None:
@@ -331,7 +344,7 @@ def build(corpus: Corpus, recipe: Recipe, embedder, *,
             # over anything re-extraction infers a second time.
             doc.licence = LIC.Licence(src.licence, src.licence_label)
             doc.title = src.title or doc.title
-            added = BUILD.add_document(conn, doc, doc.raw)
+            added = BUILD.add_document(conn, doc, doc.raw, **chunk_kwargs)
             if added:
                 stats.documents += 1
                 stats.chunks += added

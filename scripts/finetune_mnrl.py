@@ -9,7 +9,6 @@ Same folds, same LR and same metrics as the MarginMSE run, so the only differenc
 the four fixes.
 """
 import json, sys, time
-sys.path.insert(0, '/home/user/Desktop/Local-arxiv-Research-Assistant')
 import numpy as np
 from lara.finetune import kfold as KF
 from lara.finetune import whiten as WH

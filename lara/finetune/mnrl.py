@@ -140,7 +140,9 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
     if hasattr(inner, "gradient_checkpointing_enable"):
         inner.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False})
-    inner.config.use_cache = False
+        # L17: use_cache lives on the same `.config` the guard above protects; an
+        # unguarded access here defeats the guard entirely on wrappers without one.
+        inner.config.use_cache = False
     if rec.compile_mode:
         # dynamic=True for the same reason as the corpus embedder: length-sorted batches
         # still present many shapes, and static compilation re-autotunes on each one and
@@ -174,6 +176,35 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
 
     rng = random.Random(rec.seed)
     epoch_batches = query_disjoint_batches(triples, rec.batch_size, rng)
+
+    # C7 guard: the disjoint sampler returns [] when it cannot fill even one batch
+    # of `batch_size` DISTINCT queries. Without this guard the epoch loop would
+    # simply never run, `steps=max(1,...)` would mask it, and the untrained
+    # baseline would be evaluated and saved as a tuned model — silently.
+    if not epoch_batches:
+        n_queries = len({t.query_hash for t in triples})
+        raise ValueError(
+            f"mnrl: zero trainable batches — the shard has {n_queries} distinct "
+            f"queries but batch_size={rec.batch_size} requires at least that many "
+            f"(triples here: {len(triples)}; world_size={world}, this rank's shard). "
+            f"Reduce --batch-size or the number of DDP ranks so each shard holds "
+            f">= batch_size distinct queries.")
+
+    # C8: uneven per-rank batch counts deadlock NCCL. Shards of `triples[rank::world]`
+    # and the disjoint sampler can leave ranks with different numbers of full batches;
+    # the short rank would fall through to load_state_dict/return while the others
+    # block forever in the gradient all-reduce or the eval broadcast. Agree on the
+    # MINIMUM batch count across ranks before training and truncate to it, so every
+    # rank executes the same number of collective calls. (The existing early-stop
+    # broadcast keeps the stop *decision* symmetric; this keeps the step *count*
+    # symmetric, which is what the collectives actually require.)
+    if ddp:
+        counts = torch.tensor([len(epoch_batches)], dtype=torch.int64,
+                              device=next(model.parameters()).device)
+        torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.MIN)
+        trunc = int(counts.item())
+        if trunc < len(epoch_batches):
+            epoch_batches = epoch_batches[:trunc]
     steps = max(1, len(epoch_batches) * rec.epochs)
     warmup = max(1, int(steps * rec.warmup_frac))
     base = [g["lr"] for g in opt.param_groups]
@@ -192,12 +223,18 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
     def snapshot():
         return {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
 
+    # C8: iterate the agreed-upon fixed list (already truncated to the cross-rank
+    # minimum) rather than re-sampling per epoch; re-sampling could hand a rank a
+    # different batch count than another rank and reintroduce the deadlock.
     steps_per_epoch = max(1, len(epoch_batches))
     for epoch_idx in range(rec.epochs):
         if stopped:
             break
         epoch_step = 0
-        for part in query_disjoint_batches(triples, rec.batch_size, rng):
+        order = epoch_batches[:]
+        rng.shuffle(order)   # vary batch order per epoch; the COUNT is what must stay
+                             # identical across ranks (C8), not the sequence
+        for part in order:
             epoch_step += 1
             scale = (step / warmup) if step < warmup else 0.5 * (
                 1 + math.cos(math.pi * min(1.0, (step - warmup) / max(1, steps - warmup))))
@@ -304,7 +341,15 @@ def train_on_mnrl(triples: list[Triple], model_name: str, device: str, rec: "Rec
                                        dtype=torch.float64, device=device)
                     torch.distributed.broadcast(buf, src=0)
                     vl = float(buf.item())
-                if vl < best_loss - rec.min_delta:
+                # L16: a non-finite validation loss (the empty-batch path returns
+                # inf, NaN can slip through a transient encode) is a failed
+                # measurement, not evidence of a worse model. Skip it: do not burn
+                # patience and do not let it poison best_val_loss.
+                if vl is not None and not math.isfinite(vl):
+                    vl = None
+                if vl is None:
+                    pass
+                elif vl < best_loss - rec.min_delta:
                     best_loss, since_best = vl, 0
                     if rank == 0:
                         best_state = snapshot()

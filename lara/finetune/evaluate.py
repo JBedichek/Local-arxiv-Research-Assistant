@@ -262,9 +262,13 @@ async def generate_questions(cfg, conn, n: int = 200, model: str | None = None,
     pick = rng.permutation(len(rows))[:n]
 
     out = []
+    # M19: count LLM failures. If *every* call raised, the generator is down —
+    # returning [] would be indistinguishable from "nothing new found".
+    attempts, failed = 0, 0
     for i in pick:
         r = rows[int(i)]
         buf = ""
+        attempts += 1
         try:
             async for tok in stream_answer(
                 cfg, f"Passage:\n{r['text'][:1400]}\n\nQuestion:", [],
@@ -273,11 +277,19 @@ async def generate_questions(cfg, conn, n: int = 200, model: str | None = None,
             ):
                 buf += tok
         except Exception:
+            failed += 1
             continue
         q = buf.strip().split("\n")[0].strip().strip('"')
         if len(q) > 25 and q.endswith("?"):
             out.append({"question": q, "chunk_id": r["chunk_id"],
                         "arxiv_id": r["arxiv_id"], "text": r["text"]})
+    if attempts and failed == attempts:
+        raise RuntimeError(
+            f"generator unreachable? all {failed} question-generation LLM calls "
+            f"failed — refusing to report an empty eval set as 'nothing found'")
+    if failed:
+        print(f"[generate_questions] warning: {failed}/{attempts} LLM calls failed "
+              f"(partial generator trouble)", flush=True)
     return out
 
 
