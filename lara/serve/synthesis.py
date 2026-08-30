@@ -416,6 +416,19 @@ CREATE TABLE IF NOT EXISTS synthesis_claims (
     run_id TEXT NOT NULL, chunk_id INTEGER, arxiv_id TEXT, paper_title TEXT,
     section TEXT, name TEXT, claim TEXT, method TEXT, metric TEXT, value TEXT,
     condition TEXT, round_n INTEGER, score REAL, text_len INTEGER);
+-- Temporal relationships table (Zep-style knowledge graph)
+CREATE TABLE IF NOT EXISTS synthesis_temporal (
+    subject TEXT NOT NULL,           -- Entity ID (claim_id, run_id, deliverable_id)
+    relation TEXT NOT NULL,          -- Type of relationship (before, after, during, causes, depends_on, etc.)
+    object TEXT NOT NULL,            -- Target entity ID
+    valid_from REAL,                 -- Unix timestamp when this relationship became valid
+    valid_to REAL,                   -- Unix timestamp when this relationship ceased to be valid
+    run_id TEXT,                     -- Which run recorded this relationship
+    PRIMARY KEY (subject, relation, object, valid_from)
+);
+CREATE INDEX IF NOT EXISTS idx_syn_temporal_subject ON synthesis_temporal(subject);
+CREATE INDEX IF NOT EXISTS idx_syn_temporal_object ON synthesis_temporal(object);
+CREATE INDEX IF NOT EXISTS idx_syn_temporal_run ON synthesis_temporal(run_id);
 CREATE INDEX IF NOT EXISTS idx_syn_claims_run ON synthesis_claims(run_id);
 CREATE INDEX IF NOT EXISTS idx_syn_rounds_run ON synthesis_rounds(run_id);
 """
@@ -449,6 +462,9 @@ def save(db_path, run: Run, rejected: list[tuple[str, int]]) -> None:
                   c.claim, c.method, c.metric, c.value, c.condition, c.round_n, c.score,
                   c.text_len) for c in run.claims])
 
+            # Record temporal relationships between claims within this run
+            _record_temporal_relationships(conn, run)
+
             # Same teacher as hierarchical scope: these are model relevance verdicts on
             # retrieved passages, and the rejects are the hard negatives.
             items = [Judgement(query=run.question, chunk_id=c.chunk_id, score=1.0, label=1,
@@ -464,6 +480,110 @@ def save(db_path, run: Run, rejected: list[tuple[str, int]]) -> None:
             conn.close()
     except Exception:
         pass
+
+
+def _record_temporal_relationships(conn: sqlite3.Connection, run: Run) -> None:
+    """Record temporal relationships between claims and other entities.
+    
+    Creates temporal edges in a knowledge graph that enables "what did we believe about
+    X at the time of run Y" queries. Relationships include:
+    - claim → claim: chronological order within a run
+    - claim → paper: which paper the claim came from
+    - claim → run: which run produced the claim
+    - run → run: successor relationships (for replans)
+    
+    Args:
+        conn: Database connection
+        run: Completed synthesis run with claims
+    """
+    if not run.claims:
+        return
+    
+    # Get the run's timestamp (created_utc is a datetime string, convert to Unix time)
+    run_timestamp = _parse_utc_to_timestamp(run.created_utc)
+    
+    # Record temporal edges for claims in this run
+    for i, claim in enumerate(run.claims):
+        claim_id = f"claim:{claim.chunk_id}"
+        run_id = run.run_id
+        
+        # Claim → Run: This claim was produced by this run
+        conn.execute(
+            "INSERT OR REPLACE INTO synthesis_temporal "
+            "(subject, relation, object, valid_from, valid_to, run_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (claim_id, "produced_by", run_id, run_timestamp, None, run_id)
+        )
+        
+        # Claim → Paper: This claim came from this paper
+        paper_id = f"paper:{claim.arxiv_id}"
+        conn.execute(
+            "INSERT OR REPLACE INTO synthesis_temporal "
+            "(subject, relation, object, valid_from, valid_to, run_id) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (claim_id, "from_paper", paper_id, run_timestamp, None, run_id)
+        )
+        
+        # Claim → Claim: chronological order (claim i → claim i+1)
+        if i > 0:
+            prev_claim_id = f"claim:{run.claims[i-1].chunk_id}"
+            conn.execute(
+                "INSERT OR REPLACE INTO synthesis_temporal "
+                "(subject, relation, object, valid_from, valid_to, run_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (prev_claim_id, "before", claim_id, run_timestamp, None, run_id)
+            )
+    
+    # Run → Run: successor relationship (for replanned runs)
+    # This requires tracking parent run IDs which we don't have here yet
+    # For now, just record run → run (current run)
+    conn.execute(
+        "INSERT OR REPLACE INTO synthesis_temporal "
+        "(subject, relation, object, valid_from, valid_to, run_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (run_id, "continues", run_id, run_timestamp, None, run_id)
+    )
+
+
+def _parse_utc_to_timestamp(utc_str: str) -> float:
+    """Parse UTC datetime string to Unix timestamp.
+    
+    Args:
+        utc_str: ISO format UTC datetime string (e.g., "2026-08-25T14:30:00Z")
+                or SQLite datetime string (e.g., "2026-08-25")
+                or a numeric timestamp already
+        
+    Returns:
+        Unix timestamp as float
+    """
+    import time
+    import datetime
+    
+    if not utc_str:
+        return time.time()
+    
+    # Already a numeric timestamp
+    try:
+        return float(utc_str)
+    except (ValueError, TypeError):
+        pass
+    
+    # Try ISO format with Z suffix
+    try:
+        dt = datetime.datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+        return dt.timestamp()
+    except ValueError:
+        pass
+    
+    # Try SQLite datetime format (YYYY-MM-DD)
+    try:
+        dt = datetime.datetime.strptime(utc_str, "%Y-%m-%d")
+        return dt.timestamp()
+    except ValueError:
+        pass
+    
+    # Fallback to current time
+    return time.time()
 
 
 def _no_table(exc: sqlite3.OperationalError) -> bool:
