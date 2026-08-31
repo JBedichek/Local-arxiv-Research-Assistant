@@ -221,7 +221,8 @@ def _balanced(text: str, opener: str, closer: str) -> str:
 
 async def complete(cfg, prompt: str, *, system: str, model: str | None = None,
                    temperature: float = 0.0, max_tokens: int = 400,
-                   sampling: dict | None = None, error_out: dict | None = None) -> str:
+                   sampling: dict | None = None, error_out: dict | None = None,
+                   finish_out: dict | None = None) -> str:
     """One non-streamed controller turn, accumulated to a string.
 
     The twelve lines this replaces were written out at nine call sites, and had already
@@ -241,6 +242,7 @@ async def complete(cfg, prompt: str, *, system: str, model: str | None = None,
     buf = ""
     try:
         async for tok in stream_answer(cfg, prompt, [], system=system, model=model,
+                                       finish_out=finish_out,
                                        temperature=temperature, max_tokens=max_tokens,
                                        # Forwarded, which it was not from the day the
                                        # parameter was added. `complete_json` passed it
@@ -267,7 +269,8 @@ async def complete_json(cfg, prompt: str, *, system: str, shape: str = "object",
                         model: str | None = None, temperature: float = 0.0,
                         max_tokens: int = 400, default=None,
                         sampling: dict | None = None, raw_out: dict | None = None,
-                        error_out: dict | None = None):
+                        error_out: dict | None = None,
+                        finish_out: dict | None = None):
     """A controller turn parsed as JSON, or ``default`` if it cannot be.
 
     Only the transport and the extraction are shared. Schema validation and what to do
@@ -278,7 +281,8 @@ async def complete_json(cfg, prompt: str, *, system: str, shape: str = "object",
     """
     raw = await complete(cfg, prompt, system=system, model=model,
                          temperature=temperature, max_tokens=max_tokens,
-                         sampling=sampling, error_out=error_out)
+                         sampling=sampling, error_out=error_out,
+                         finish_out=finish_out)
     # So a caller can tell *why* it got the default. `complete` turns every failure into
     # an empty string — a refused request, a dropped connection, a replica that was
     # evicted mid-call — and an empty reply is a different fact from a reply that could
@@ -363,6 +367,11 @@ async def stream_answer(
     history: str = "",
     prompt_parts: list | None = None,
     usage_out: dict | None = None,
+    # What the server said it stopped for — `stop`, `length`, `abort`, `tool_calls`.
+    # A reply that streamed zero content is a different fact depending on this: cut at
+    # the budget, dropped by the engine, or parsed away below. Without it every empty
+    # reply reported as one indistinguishable event.
+    finish_out: dict | None = None,
     # Sampling beyond temperature, forwarded verbatim when given. Absent by default so
     # every existing caller sends exactly what it sent before, and the server's own
     # defaults — which vLLM takes from the checkpoint's generation_config.json — apply.
@@ -376,6 +385,18 @@ async def stream_answer(
     """
     # Reasoning-block stripping runs over the accumulated stream, not per chunk.
     acc, sent, state = "", 0, "unknown"
+    #: A native tool call the server's tool-call parser extracted out of the reply.
+    #: The `:8003` replica serves with `--enable-auto-tool-choice --tool-call-parser
+    #: qwen3_xml`: when the browse prompt's tool menu draws a native call out of the
+    #: model, the parser moves the whole reply into `delta.tool_calls` fragments and
+    #: `delta.content` never fires — the answer is generated and then shredded (measured
+    #: 2026-08-31: `finish_reason=tool_calls`, 39–49 completion tokens, zero content,
+    #: and the caller was told "nothing came back"). Accumulate the fragments so the
+    #: call can be rebuilt below; `emitted` gates the rebuild so a reply with real
+    #: content is never decorated with a reconstructed call.
+    tool_names: dict[int, str] = {}
+    tool_args: dict[int, str] = {}
+    emitted = False
     vcfg = cfg.get_in("serving.vllm")
     base_url = vcfg["base_url"].rstrip("/")
     model_name = model or vcfg.get("default_model")
@@ -442,6 +463,22 @@ async def stream_answer(
                         usage_out.update(chunk["usage"])
                     choice = (chunk.get("choices") or [{}])[0]
                     delta = choice.get("delta", {})
+                    if choice.get("finish_reason") and finish_out is not None:
+                        finish_out["finish"] = choice["finish_reason"]
+                    for tc in delta.get("tool_calls") or []:
+                        idx = tc.get("index", 0)
+                        fn = tc.get("function") or {}
+                        # The name arrives as one fragment per call, but this parser
+                        # merges a multi-call reply into index 0 and concatenates the
+                        # names (`symboloutline`, measured) — so the FIRST fragment is
+                        # the first call's name, and later ones are later calls.
+                        # Arguments fragment like content and concatenate correctly
+                        # until a second call's JSON is glued on; the balanced extraction
+                        # below takes the first object.
+                        if fn.get("name") and idx not in tool_names:
+                            tool_names[idx] = str(fn["name"])
+                        if fn.get("arguments"):
+                            tool_args[idx] = tool_args.get(idx, "") + str(fn["arguments"])
                     # Some builds stream reasoning in its own field; that is easy, we
                     # simply never read it.
                     text = delta.get("content") or choice.get("text") or ""
@@ -470,7 +507,33 @@ async def stream_answer(
                     out = acc[sent:]
                     if out:
                         sent = len(acc)
+                        emitted = True
                         yield out
+
+                # The stream is done and no content was ever emitted. If the parser
+                # moved the whole reply into a tool call, hand back the call as the text
+                # the model would have written as JSON: `{"tool": <name>, ...arguments}`
+                # is what every controller prompt in this system asks the model to write
+                # by hand, so the rebuild arrives in the shape the caller already parses.
+                if not emitted and tool_args:
+                    idx = min(tool_args)
+                    raw_args = tool_args[idx]
+                    # A glued second call makes the whole string unparseable; the first
+                    # balanced object is the first call, which is the one to run.
+                    for candidate in (raw_args, _balanced(raw_args, "{", "}")):
+                        try:
+                            args = json.loads(candidate)
+                            break
+                        except (json.JSONDecodeError, TypeError):
+                            continue
+                    else:
+                        args = {}
+                    if not isinstance(args, dict):
+                        args = {}
+                    if not isinstance(args, dict):
+                        args = {"arguments": args}
+                    yield json.dumps({"tool": tool_names.get(idx, ""),
+                                      **{k: v for k, v in args.items() if k != "tool"}})
         except httpx.ConnectError as exc:
             # Naming vLLM here was wrong on every machine that does not run vLLM, which
             # is every Mac. Report the backend that would actually serve, and the reason
