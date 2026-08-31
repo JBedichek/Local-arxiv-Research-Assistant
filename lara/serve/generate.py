@@ -30,15 +30,20 @@ import httpx
 OPEN, CLOSE = "<think>", "</think>"
 
 
-def _auth_headers() -> dict:
+def _auth_headers(key: str | None = None) -> dict:
     """The bearer token vLLM servers in this fleet require, when they require one.
 
     Some replicas are launched outside lara (by hand, or a systemd unit) with
     `VLLM_API_KEY` exported, which makes vLLM reject any request lacking it. Matches the
     default `autoresearch/pool.py` and `autoresearch/agent.py` already use for the same
     variable, so a replica started either way is reachable from every caller.
+
+    `key`, when given, overrides the environment for this one call — a replica on another
+    machine (an `autoresearch worker`) was not necessarily started with this process's own
+    `VLLM_API_KEY`, so the pool passes its own key along explicitly via
+    `serving.vllm.api_key` rather than relying on the two happening to match.
     """
-    return {"Authorization": f"Bearer {os.environ.get('VLLM_API_KEY', 'vllm-local')}"}
+    return {"Authorization": f"Bearer {key or os.environ.get('VLLM_API_KEY', 'vllm-local')}"}
 
 SYSTEM = """You answer questions about arXiv machine-learning papers using only the \
 excerpts provided.
@@ -306,7 +311,8 @@ async def complete_json(cfg, prompt: str, *, system: str, shape: str = "object",
     return default
 
 
-async def count_tokens(base_url: str, model: str, texts: list[str]) -> list[int] | None:
+async def count_tokens(base_url: str, model: str, texts: list[str],
+                        *, api_key: str | None = None) -> list[int] | None:
     """Exact token counts from the generator's tokenizer, or None if it cannot say.
 
     Asking the server beats tokenizing locally: it is the tokenizer that will actually be
@@ -319,7 +325,7 @@ async def count_tokens(base_url: str, model: str, texts: list[str]) -> list[int]
     out: list[int] = []
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(20.0, connect=3.0),
-                                     headers=_auth_headers()) as client:
+                                     headers=_auth_headers(api_key)) as client:
             for t in texts:
                 if not t:
                     out.append(0)
@@ -333,11 +339,11 @@ async def count_tokens(base_url: str, model: str, texts: list[str]) -> list[int]
     return out
 
 
-async def context_limit(base_url: str, model: str) -> int | None:
+async def context_limit(base_url: str, model: str, *, api_key: str | None = None) -> int | None:
     """The model's real context window, as the server reports it."""
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(10.0, connect=3.0),
-                                     headers=_auth_headers()) as client:
+                                     headers=_auth_headers(api_key)) as client:
             r = await client.get(f"{base_url.rstrip('/')}/models")
             if r.status_code != 200:
                 return None
@@ -399,6 +405,7 @@ async def stream_answer(
     emitted = False
     vcfg = cfg.get_in("serving.vllm")
     base_url = vcfg["base_url"].rstrip("/")
+    api_key = vcfg.get("api_key")
     model_name = model or vcfg.get("default_model")
     prefix, tail, parts = build_prompt(query, hits, selection, history)
     if prompt_parts is not None:
@@ -437,7 +444,7 @@ async def stream_answer(
     payload.update({k: v for k, v in (sampling or {}).items() if v is not None})
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=5.0),
-                                 headers=_auth_headers()) as client:
+                                 headers=_auth_headers(api_key)) as client:
         try:
             async with client.stream("POST", f"{base_url}/chat/completions", json=payload) as resp:
                 if resp.status_code != 200:

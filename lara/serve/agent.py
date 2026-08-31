@@ -724,11 +724,13 @@ async def run_ask(s, cfg, req: AskRequest, *, emit) -> None:
             vcfg = cfg.get_in("serving.vllm") or {}
             base_url = vcfg.get("base_url", "http://127.0.0.1:8000/v1")
             model_name = req.model or vcfg.get("default_model") or ""
+            api_key = vcfg.get("api_key")
             parts = list(prompt_parts)
 
-            counts = await GEN.count_tokens(base_url, model_name,
-                                            [t for _, t in parts]) if parts else None
-            limit = await GEN.context_limit(base_url, model_name) or int(
+            counts = await GEN.count_tokens(
+                base_url, model_name, [t for _, t in parts],
+                api_key=api_key) if parts else None
+            limit = await GEN.context_limit(base_url, model_name, api_key=api_key) or int(
                 vcfg.get("max_model_len", 32768))
             emit("context", {
                 "limit": limit,
