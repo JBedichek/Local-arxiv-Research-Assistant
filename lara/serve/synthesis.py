@@ -369,6 +369,48 @@ def evidence_table(claims: list[Claim]) -> str:
     return "\n\n".join(lines) if lines else "(no evidence gathered)"
 
 
+# Used only when the generator can't be reached right now to ask its real context window
+# (context_limit/count_tokens returned None -- see their docstrings in generate.py for
+# why they refuse to guess). This deployment's vLLM config sets max_model_len: 32768
+# (lara-core/config.yaml); reserving room for a sizeable evidence-table prompt still
+# leaves several times the old 2600-token ceiling, so a fallback answer stays the rare
+# exception this was supposed to be rather than routine.
+_FALLBACK_THOROUGH_TOKENS = 8000
+
+# Chat-template role markers and special tokens add a bit on top of what a plain
+# /tokenize call on raw text reports, and generation should stop short of the wire
+# rather than exactly on it.
+_CONTEXT_SAFETY_MARGIN = 512
+
+# However tight the real context is, leave enough room that the answer is not just
+# stopped before it started.
+_MIN_THOROUGH_TOKENS = 256
+
+
+async def _thorough_budget(cfg, model, system: str, prompt: str) -> int:
+    """Completion tokens actually free for the thorough answer.
+
+    The synthesizer's goals are deliberately dense and need much more room than a
+    hardcoded ceiling sized for a simple question -- so this asks the server what the
+    model's context window really is and what the prompt actually costs, and uses
+    whatever is left. Falls back to a generous fixed budget rather than a small one when
+    the server can't answer right now, since a small fallback silently reintroduces the
+    bug this replaces.
+    """
+    from lara.serve import generate as GEN
+
+    vcfg = cfg.get_in("serving.vllm") or {}
+    base_url = vcfg.get("base_url", "http://127.0.0.1:8000/v1")
+    model_name = model or vcfg.get("default_model") or ""
+    api_key = vcfg.get("api_key")
+
+    limit = await GEN.context_limit(base_url, model_name, api_key=api_key)
+    counts = await GEN.count_tokens(base_url, model_name, [system, prompt], api_key=api_key)
+    if limit is None or counts is None:
+        return _FALLBACK_THOROUGH_TOKENS
+    return max(limit - sum(counts) - _CONTEXT_SAFETY_MARGIN, _MIN_THOROUGH_TOKENS)
+
+
 async def consolidate(cfg, run: Run, model, stream_answer, on_token=None) -> None:
     """Thorough first, then TLDR derived from it.
 
@@ -380,9 +422,13 @@ async def consolidate(cfg, run: Run, model, stream_answer, on_token=None) -> Non
               f"Evidence table ({len(run.claims)} claims from {len(run.papers)} papers, "
               f"gathered over {len(run.rounds)} rounds):\n\n{evidence_table(run.claims)}\n\n"
               "Write the full answer.")
+    # Bounded by the model's real remaining context, not a fixed ceiling -- see
+    # _thorough_budget. Truncation should only happen if the model still doesn't finish
+    # within the room that's actually there.
+    thorough_budget = await _thorough_budget(cfg, model, THOROUGH_SYSTEM, prompt)
     buf = ""
     async for tok in stream_answer(cfg, prompt, [], system=THOROUGH_SYSTEM, model=model,
-                                   temperature=0.2, max_tokens=2600, raw_user=True):
+                                   temperature=0.2, max_tokens=thorough_budget, raw_user=True):
         buf += tok
         if on_token:
             on_token("thorough", tok)

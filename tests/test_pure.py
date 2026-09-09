@@ -1202,6 +1202,75 @@ def test_the_round_cap_is_still_a_hard_ceiling():
     assert not round_limit_reached(999, 0), "0 disables the cap"
 
 
+# ── the thorough-answer token budget ───────────────────────────────────────────────
+#
+# `consolidate()` used to pass stream_answer a hardcoded max_tokens=2600 for the
+# thorough answer regardless of how much room the model's context actually had left. On
+# a real synthesizer run (chain-synth-test01, run 12c5cf0e4572, 49 logical goals) 47 of
+# 49 answers hit that ceiling and cut off mid-sentence -- and the synthesizer's own
+# follow-up goals asking for the missing rest hit the exact same ceiling, chasing their
+# own tail forever. The fix: ask the server what's actually left and use that instead.
+
+
+class _VllmCfg:
+    """A minimal `cfg.get_in("serving.vllm")` stand-in, like `_Cfg` above."""
+    def get_in(self, dotted, default=None):
+        assert dotted == "serving.vllm"
+        return {"base_url": "http://x/v1", "default_model": "m"}
+
+
+def _fake_context(monkeypatch, *, limit, counts):
+    async def _limit(base_url, model, *, api_key=None):
+        return limit
+
+    async def _counts(base_url, model, texts, *, api_key=None):
+        return counts
+
+    monkeypatch.setattr(GEN, "context_limit", _limit)
+    monkeypatch.setattr(GEN, "count_tokens", _counts)
+
+
+def test_a_small_prompt_against_a_large_context_gets_a_large_budget(monkeypatch):
+    _fake_context(monkeypatch, limit=131072, counts=[50, 200])
+    budget = asyncio.run(_SY._thorough_budget(_VllmCfg(), "m", "system", "prompt"))
+    assert budget > 100_000
+    assert budget != 2600
+
+
+def test_a_large_prompt_against_a_small_context_still_gets_a_positive_budget(monkeypatch):
+    # 4096 tokens of context, ~4090 of it spoken for by the prompt -- nowhere near
+    # enough room, but the answer must still get *some* tokens rather than none.
+    _fake_context(monkeypatch, limit=4096, counts=[10, 4080])
+    budget = asyncio.run(_SY._thorough_budget(_VllmCfg(), "m", "system", "prompt"))
+    assert budget == _SY._MIN_THOROUGH_TOKENS
+    assert budget > 0
+
+
+def test_an_unreachable_generator_falls_back_to_the_generous_default_not_2600(monkeypatch):
+    _fake_context(monkeypatch, limit=None, counts=None)
+    budget = asyncio.run(_SY._thorough_budget(_VllmCfg(), "m", "system", "prompt"))
+    assert budget == _SY._FALLBACK_THOROUGH_TOKENS
+    assert budget > 2600
+
+
+def test_consolidate_passes_the_computed_budget_to_the_thorough_call_only(monkeypatch):
+    """The fix is scoped to the thorough answer -- TLDR stays max_tokens=400."""
+    _fake_context(monkeypatch, limit=131072, counts=[50, 200])
+    seen_max_tokens = []
+
+    async def _fake_stream_answer(cfg, prompt, hits, **kw):
+        seen_max_tokens.append(kw.get("max_tokens"))
+        for piece in "an answer.":
+            yield piece
+
+    run = _SY.Run(run_id="r1", question="q?")
+    asyncio.run(_SY.consolidate(_VllmCfg(), run, "m", _fake_stream_answer))
+
+    assert len(seen_max_tokens) == 2
+    assert seen_max_tokens[0] > 2600      # thorough: computed budget, not the old ceiling
+    assert seen_max_tokens[1] == 400      # TLDR: untouched
+
+
 # ── GGUF quantisation parsing ─────────────────────────────────────────────────────
 #
 # A GGUF repo ships one file per quantisation, so a download must name files rather than
