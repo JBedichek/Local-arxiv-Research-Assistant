@@ -42,7 +42,20 @@ import numpy as np
 
 # ── prompts ───────────────────────────────────────────────────────────────────────
 
-EXTRACT_SYSTEM = """You are surveying the literature to answer a research question.
+#: Full-paper reads are capped per run (not per round or per batch): a run answering a
+#: broad question could otherwise spend its whole budget reading one paper cover to
+#: cover instead of surveying the literature, which is the opposite of what deep
+#: research is for. Tracked on `Run.full_papers_read` -- see `resolve_full_paper`.
+MAX_FULL_PAPERS_PER_RUN = 5
+
+#: The reconstructed paper is read only inside its own isolated sub-call (see
+#: `_answer_from_paper`) and never enters the round-judging context, so this can afford
+#: to be generous without growing the prompt every other excerpt sits in.
+FULL_PAPER_MAX_CHARS = 45_000
+
+FULL_PAPER_TOOL = "get_full_paper"
+
+EXTRACT_SYSTEM = f"""You are surveying the literature to answer a research question.
 
 For each numbered excerpt decide whether it carries information that helps answer the \
 question, and if so extract it in structured form.
@@ -68,9 +81,35 @@ SHORTER than the excerpt. Compress; do not paraphrase at length.
   "condition" the setting the result holds in (dataset, scale, budget), or ""
 
 Reply with a JSON array only, one object per excerpt you judge relevant:
-[{"n": 1, "name": "...", "claim": "...", "method": "...", "metric": "...", \
-"value": "...", "condition": "..."}]
-Return [] if none are relevant."""
+[{{"n": 1, "name": "...", "claim": "...", "method": "...", "metric": "...", \
+"value": "...", "condition": "..."}}]
+Return [] if none are relevant.
+
+If a specific excerpt looks central to the question but is too thin to judge -- a table \
+or configuration you'd expect is in the paper but isn't in this excerpt, or the excerpt \
+implies a number it doesn't give -- you may ask that paper a targeted question instead of \
+judging the excerpt from this alone. Do this rarely: reaching for the full paper on every \
+excerpt defeats the point of retrieving excerpts and is slow.
+
+To ask, put one item like this in the array instead of judgements for those excerpts:
+{{"tool": "{FULL_PAPER_TOOL}", "requests": [{{"n": <excerpt number>, "query": "<a \
+specific question about that paper, phrased against the research question -- not \
+\\"summarize this paper\\">"}}, ...]}}
+You can ask about several papers, or ask one paper more than one question, in the same \
+"requests" list. Each question is answered by reading that paper alone -- you do not see \
+the paper itself, only the answer, labeled by which paper and question it addresses -- \
+and then you judge every excerpt in one more reply. At most {MAX_FULL_PAPERS_PER_RUN} \
+distinct papers can be read in full across the whole run, so use this when it matters."""
+
+
+PAPER_QA_SYSTEM = """Answer the question using only the paper text given below.
+
+Cite where in the paper the answer comes from when it helps (a section name, a table, \
+the nearby text) so the reader can tell the answer was actually found there.
+
+If the paper does not address the question, say so plainly rather than forcing an answer \
+from somewhere else in it. A clear "this paper doesn't cover that" is a correct and \
+useful answer; an invented one is not."""
 
 
 CONTINUE_SYSTEM = """You are deciding whether a literature survey is complete.
@@ -192,6 +231,14 @@ class Run:
     stopped_because: str = ""
     started: float = field(default_factory=time.time)
     ms: float = 0.0
+    #: arxiv_id -> full reassembled text, for papers `get_full_paper` has read this run.
+    #: Doubles as the cap tracker (its length is how many distinct papers have been read
+    #: in full, capped at MAX_FULL_PAPERS_PER_RUN) and as a cache, so a repeat request
+    #: for a paper already read is served for free rather than counted twice.
+    full_papers_read: dict[str, str] = field(default_factory=dict)
+    #: (arxiv_id, query) -> the sub-call's answer, so an identical question about a
+    #: paper asked twice in the same run is answered from cache rather than re-run.
+    paper_qa_answers: dict[tuple[str, str], str] = field(default_factory=dict)
 
     @property
     def papers(self) -> list[str]:
@@ -275,26 +322,174 @@ def vectors_for(state, chunk_ids: list[int]) -> dict[int, np.ndarray]:
     return out
 
 
+# ── full-paper tool ──────────────────────────────────────────────────────────────
+#
+# The extractor sees chunk-sized excerpts, and a chunk is sometimes too thin to judge:
+# the table with the actual number is two sections away, or an abstract-level claim
+# needs the method section to check. `get_full_paper` lets the model ask a targeted
+# question of the whole paper -- not read the whole paper itself, which would blow up
+# the small per-round judging context with however many thousand tokens the paper
+# happens to be. The paper is read once, in an isolated sub-call (`_answer_from_paper`)
+# whose only output that reaches the round is the answer text.
+#
+# Reassembled natively rather than via `autoresearch.citeindex.get_paper`: that module
+# lives one repository over, and `lara-core` cannot import `autoresearch` at all --
+# `autoresearch/synthesizer.py`'s docstring is explicit that the leaf primitive crossing
+# that boundary is `Lara.aresearch`, a plain injected callable, specifically so this
+# package never imports `autoresearch` or `session`. The corpus itself is reachable
+# directly, the same way `vectors_for` above already reads it via `state.conn()`.
+
+
+def _read_full_paper(conn, arxiv_id: str, max_chars: int) -> str:
+    """Every chunk of one paper, in reading order. Mirrors autoresearch.methods.whole_paper."""
+    row = conn.execute("SELECT latest_version FROM papers WHERE arxiv_id=?",
+                       (arxiv_id,)).fetchone()
+    version = int(row[0]) if row and row[0] else None
+    q = "SELECT text FROM chunks WHERE arxiv_id=?"
+    params: list = [arxiv_id]
+    if version is not None:
+        q += " AND version=?"
+        params.append(version)
+    parts = [r[0] for r in conn.execute(q + " ORDER BY ordinal", params)]
+    text = "\n\n".join(p for p in parts if p)
+    if len(text) > max_chars:
+        text = text[:max_chars] + f"\n\n[truncated at {max_chars:,} of {len(text):,} characters]"
+    return text
+
+
+def resolve_full_paper(state, run: Run, arxiv_id: str) -> tuple[str, bool]:
+    """Full text for `arxiv_id`, honouring the per-run cap. Returns (text, capped).
+
+    A paper already read this run is served from `run.full_papers_read` and never
+    counts against the cap twice. `capped` tells the caller the request was refused so
+    it can say so honestly -- back to the model, in this case -- instead of failing
+    silently or raising.
+    """
+    if arxiv_id in run.full_papers_read:
+        return run.full_papers_read[arxiv_id], False
+    if len(run.full_papers_read) >= MAX_FULL_PAPERS_PER_RUN:
+        return "", True
+    text = _read_full_paper(state.conn(), arxiv_id, FULL_PAPER_MAX_CHARS)
+    run.full_papers_read[arxiv_id] = text
+    return text, False
+
+
+async def _answer_from_paper(cfg, model, arxiv_id: str, text: str, query: str) -> str:
+    """One isolated completion: this paper's text plus one question, nothing else.
+
+    Its own fresh conversation, not appended to the round-judging prompt -- the whole
+    point is that a paper can be tens of thousands of tokens and the round prompt must
+    not grow with it. Uses `complete`, the same plain single-turn primitive the rest of
+    this module's JSON verdicts are built on (via `complete_json`), just without the
+    JSON parsing since this call's output is prose, not a schema.
+    """
+    from lara.serve.generate import complete
+
+    prompt = f"Paper ({arxiv_id}):\n\n{text}\n\nQuestion: {query}\n\nAnswer:"
+    return await complete(cfg, prompt, system=PAPER_QA_SYSTEM, model=model,
+                          temperature=0.0, max_tokens=600)
+
+
+def _render_paper_answers(results: list[dict]) -> dict[int, str]:
+    """Tool results as text to append per excerpt, labelled so several answers don't blur."""
+    by_n: dict[int, list[str]] = {}
+    for r in results:
+        by_n.setdefault(r["n"], []).append(
+            f"[tool result -- asked {r['arxiv_id']}: {r['query']}]\n{r['answer']}")
+    return {n: "\n\n".join(blocks) for n, blocks in by_n.items()}
+
+
+async def _dispatch_paper_requests(cfg, model, state, run: Run, hits: list[dict],
+                                   requests: list[dict], round_n: int, ev) -> list[dict]:
+    """Resolve a batch of {n, query} tool requests. Returns one result dict per request.
+
+    Fetching and cap-accounting run sequentially first -- cheap, and it is what makes
+    "only fetch as many as the remaining budget allows" correct when a batch asks for
+    more distinct papers than the cap has left. The paper-reading sub-calls themselves
+    are the slow part and are independent of each other, so those run concurrently via
+    `asyncio.gather`, the same concurrency idiom `agent.py`'s query-decomposition search
+    already uses for independent sub-work.
+    """
+    to_run: list[tuple[int, str, str, str]] = []   # (n, arxiv_id, query, paper_text)
+    results: list[dict] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for req in requests:
+        if not isinstance(req, dict):
+            continue
+        try:
+            n = int(req.get("n", 0))
+        except (TypeError, ValueError):
+            continue
+        query = str(req.get("query") or "").strip()[:400]
+        if not (1 <= n <= len(hits)) or not query:
+            continue
+        arxiv_id = str(hits[n - 1].get("arxiv_id") or "")
+        if not arxiv_id:
+            continue
+        pair = (arxiv_id, query)
+        if pair in seen_pairs:
+            continue
+        seen_pairs.add(pair)
+        if pair in run.paper_qa_answers:
+            results.append({"n": n, "arxiv_id": arxiv_id, "query": query,
+                            "answer": run.paper_qa_answers[pair]})
+            continue
+        text, capped = resolve_full_paper(state, run, arxiv_id)
+        if ev:
+            ev("full_paper", {"round": round_n, "arxiv_id": arxiv_id, "query": query,
+                              "capped": capped, "n_read": len(run.full_papers_read),
+                              "cap": MAX_FULL_PAPERS_PER_RUN})
+        if capped:
+            results.append({"n": n, "arxiv_id": arxiv_id, "query": query,
+                            "answer": (f"[cap reached: {MAX_FULL_PAPERS_PER_RUN} papers "
+                                       "already read in full this run; this one was not "
+                                       "fetched -- judge from the excerpt above]")})
+            continue
+        to_run.append((n, arxiv_id, query, text))
+
+    if to_run:
+        answers = await asyncio.gather(*[
+            _answer_from_paper(cfg, model, arxiv_id, text, query)
+            for _n, arxiv_id, query, text in to_run
+        ])
+        for (n, arxiv_id, query, _text), answer in zip(to_run, answers, strict=True):
+            run.paper_qa_answers[(arxiv_id, query)] = answer
+            results.append({"n": n, "arxiv_id": arxiv_id, "query": query, "answer": answer})
+    return results
+
+
 # ── model steps ───────────────────────────────────────────────────────────────────
 
 
-def _numbered(hits: list[dict], limit: int = 1100) -> str:
+def _numbered(hits: list[dict], limit: int = 1100, extra: dict[int, str] | None = None) -> str:
     out = []
+    extra = extra or {}
     for i, h in enumerate(hits, 1):
         head = f"{h.get('paper_title') or h.get('arxiv_id','')} > {h.get('section') or ''}"
-        out.append(f"[{i}] (id={h.get('chunk_id')}) {head.strip(' >')}\n"
-                   f"{(h.get('text') or '')[:limit]}")
+        body = (h.get('text') or '')[:limit]
+        if i in extra:
+            body += f"\n\n{extra[i]}"
+        out.append(f"[{i}] (id={h.get('chunk_id')}) {head.strip(' >')}\n{body}")
     return "\n\n".join(out)
 
 
 async def extract(cfg, question: str, hits: list[dict], model, stream_answer,
-                  round_n: int) -> tuple[list[Claim], list[int]]:
-    """Label, name and structure one batch of excerpts. Returns (claims, rejected ids)."""
+                  round_n: int, *, state=None, run: Run | None = None,
+                  ev=None) -> tuple[list[Claim], list[int]]:
+    """Label, name and structure one batch of excerpts. Returns (claims, rejected ids).
+
+    When `state` and `run` are given, the model may also call `get_full_paper` (see
+    EXTRACT_SYSTEM) to ask a targeted question of a paper in full before judging its
+    excerpt -- capped per run at MAX_FULL_PAPERS_PER_RUN, see `resolve_full_paper`.
+    Without them (existing callers, and most tests) this is unchanged from before the
+    tool existed.
+    """
     if not hits:
         return [], []
+    from lara.serve.generate import complete_json
+
     prompt = (f"Research question: {question}\n\nExcerpts:\n{_numbered(hits)}\n\n"
               "Reply with the JSON array only.")
-    from lara.serve.generate import complete_json
 
     # No verdict is not evidence of irrelevance. Dropping the batch would silently lose a
     # round's work, so on failure nothing is recorded as rejected either.
@@ -302,11 +497,28 @@ async def extract(cfg, question: str, hits: list[dict], model, stream_answer,
                                model=model, max_tokens=1400, default=None)
     if rows is None:
         return [], []
+    rows = rows if isinstance(rows, list) else []
+
+    tool_rows = [r for r in rows if isinstance(r, dict) and r.get("tool") == FULL_PAPER_TOOL]
+    if tool_rows and state is not None and run is not None:
+        requests = [req for r in tool_rows for req in (r.get("requests") or [])]
+        if requests:
+            results = await _dispatch_paper_requests(cfg, model, state, run, hits,
+                                                      requests, round_n, ev)
+            extra = _render_paper_answers(results)
+            prompt2 = (f"Research question: {question}\n\n"
+                       f"Excerpts:\n{_numbered(hits, extra=extra)}\n\n"
+                       "Reply with the JSON array only, judging every excerpt now -- no "
+                       "more tool calls this reply.")
+            rows2 = await complete_json(cfg, prompt2, system=EXTRACT_SYSTEM, shape="array",
+                                        model=model, max_tokens=1400, default=None)
+            if rows2 is not None:
+                rows = rows2 if isinstance(rows2, list) else []
 
     claims: list[Claim] = []
     kept_idx: set[int] = set()
-    for r in rows if isinstance(rows, list) else []:
-        if not isinstance(r, dict):
+    for r in rows:
+        if not isinstance(r, dict) or r.get("tool"):
             continue
         try:
             n = int(r.get("n", 0))
@@ -870,7 +1082,8 @@ async def run_synthesis(state, cfg, question: str, *, model=None, stream_answer=
             continue
 
         ev("round", {"n": n, "phase": "reading", "n_chunks": len(picked)})
-        claims, rej = await extract(cfg, question, picked, model, stream_answer, n)
+        claims, rej = await extract(cfg, question, picked, model, stream_answer, n,
+                                    state=state, run=run, ev=ev)
         rejected.extend((question, cid) for cid in rej)
         before_papers = set(seen_papers)
         for c in claims:
