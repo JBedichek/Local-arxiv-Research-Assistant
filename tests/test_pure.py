@@ -1460,3 +1460,225 @@ def test_a_reader_with_no_config_at_all_is_exactly_as_it_was():
     from lara.serve import auth as A
 
     assert A.tokens_for_app({}, None) == {}
+
+
+# ── the get_full_paper tool ─────────────────────────────────────────────────────────
+#
+# extract() lets the model ask a targeted question of a paper in full, answered in an
+# isolated sub-call so the paper's text never enters the round-judging context. Covered
+# here: the corpus reassembly, the per-run cap and its dedup/cache, the batch dispatch
+# that backs the tool, and that extract() is unaffected when the tool isn't used or
+# isn't wired up (state/run not given -- existing callers).
+
+import lara.serve.synthesis as SY  # noqa: E402
+
+
+def _fake_corpus():
+    """A tiny in-memory corpus with one paper of two chunks, in reading order."""
+    import sqlite3
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE papers (arxiv_id TEXT PRIMARY KEY, title TEXT, "
+                 "latest_version INTEGER)")
+    conn.execute("CREATE TABLE chunks (arxiv_id TEXT, version INTEGER, ordinal INTEGER, "
+                 "text TEXT)")
+    conn.execute("INSERT INTO papers VALUES ('1111.1111', 'Paper One', 1)")
+    conn.executemany("INSERT INTO chunks VALUES (?,?,?,?)", [
+        ("1111.1111", 1, 0, "Abstract: we study batch sizing."),
+        ("1111.1111", 1, 1, "Table 2 reports a batch size of 512."),
+    ])
+    conn.commit()
+    return conn
+
+
+class _FakeState:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def conn(self):
+        return self._conn
+
+
+def test_resolve_full_paper_reassembles_in_reading_order():
+    conn = _fake_corpus()
+    run = SY.Run(run_id="r", question="q")
+    text, capped = SY.resolve_full_paper(_FakeState(conn), run, "1111.1111")
+    assert not capped
+    assert "batch sizing" in text and "batch size of 512" in text
+    assert text.index("batch sizing") < text.index("batch size of 512")
+    assert run.full_papers_read["1111.1111"] == text
+
+
+def test_resolve_full_paper_serves_a_repeat_request_from_cache():
+    conn = _fake_corpus()
+    run = SY.Run(run_id="r", question="q")
+    first, _ = SY.resolve_full_paper(_FakeState(conn), run, "1111.1111")
+    conn.execute("DELETE FROM chunks")  # a second DB read would come back empty
+    second, capped = SY.resolve_full_paper(_FakeState(conn), run, "1111.1111")
+    assert second == first and not capped
+
+
+def test_resolve_full_paper_enforces_the_run_cap():
+    conn = _fake_corpus()
+    run = SY.Run(run_id="r", question="q")
+    run.full_papers_read = {f"paper-{i}": "x" for i in range(SY.MAX_FULL_PAPERS_PER_RUN)}
+    text, capped = SY.resolve_full_paper(_FakeState(conn), run, "1111.1111")
+    assert capped and text == ""
+    assert "1111.1111" not in run.full_papers_read
+
+
+def test_resolve_full_paper_repeat_of_a_cached_paper_is_not_capped_even_at_the_limit():
+    conn = _fake_corpus()
+    run = SY.Run(run_id="r", question="q")
+    run.full_papers_read = {f"paper-{i}": "x" for i in range(SY.MAX_FULL_PAPERS_PER_RUN - 1)}
+    run.full_papers_read["1111.1111"] = "already read"
+    text, capped = SY.resolve_full_paper(_FakeState(conn), run, "1111.1111")
+    assert not capped and text == "already read"
+
+
+def test_dispatch_paper_requests_runs_the_subcall_and_caches_by_pair(monkeypatch):
+    conn = _fake_corpus()
+    run = SY.Run(run_id="r", question="q")
+    hits = [{"chunk_id": 1, "arxiv_id": "1111.1111"}]
+    calls = []
+
+    async def fake_answer(cfg, model, arxiv_id, text, query):
+        calls.append((arxiv_id, query))
+        return f"answer about {arxiv_id}"
+
+    monkeypatch.setattr(SY, "_answer_from_paper", fake_answer)
+    requests = [{"n": 1, "query": "what was the batch size?"}]
+    results = asyncio.run(SY._dispatch_paper_requests(
+        None, None, _FakeState(conn), run, hits, requests, 1, None))
+    assert results == [{"n": 1, "arxiv_id": "1111.1111",
+                        "query": "what was the batch size?",
+                        "answer": "answer about 1111.1111"}]
+    assert len(calls) == 1
+    assert run.paper_qa_answers[("1111.1111", "what was the batch size?")] == \
+        "answer about 1111.1111"
+
+    # The identical {paper, query} pair asked again must be served from cache, not rerun.
+    results2 = asyncio.run(SY._dispatch_paper_requests(
+        None, None, _FakeState(conn), run, hits, requests, 2, None))
+    assert len(calls) == 1
+    assert results2[0]["answer"] == "answer about 1111.1111"
+
+
+def test_dispatch_paper_requests_batch_only_fetches_as_many_as_the_cap_allows(monkeypatch):
+    """A 6th distinct paper in a batch is refused honestly, not silently dropped."""
+    conn = _fake_corpus()
+    run = SY.Run(run_id="r", question="q")
+    run.full_papers_read = {f"paper-{i}": "x" for i in range(SY.MAX_FULL_PAPERS_PER_RUN - 1)}
+    hits = [{"chunk_id": 1, "arxiv_id": "aaaa.1"}, {"chunk_id": 2, "arxiv_id": "bbbb.2"}]
+    calls = []
+
+    async def fake_answer(cfg, model, arxiv_id, text, query):
+        calls.append(arxiv_id)
+        return "ok"
+
+    monkeypatch.setattr(SY, "_answer_from_paper", fake_answer)
+    events = []
+    requests = [{"n": 1, "query": "q1"}, {"n": 2, "query": "q2"}]
+    results = asyncio.run(SY._dispatch_paper_requests(
+        None, None, _FakeState(conn), run, hits, requests, 1,
+        lambda name, payload: events.append((name, payload))))
+    fetched = [r for r in results if "cap reached" not in r["answer"]]
+    capped = [r for r in results if "cap reached" in r["answer"]]
+    assert len(fetched) == 1 and len(capped) == 1
+    assert calls == ["aaaa.1"]                       # the capped one never ran a sub-call
+    assert len(run.full_papers_read) == SY.MAX_FULL_PAPERS_PER_RUN
+    assert any(e[1].get("capped") for e in events)
+
+
+def test_extract_offers_and_uses_the_full_paper_tool(monkeypatch):
+    conn = _fake_corpus()
+    run = SY.Run(run_id="r", question="What batch size was used?")
+    hits = [{"chunk_id": 101, "arxiv_id": "1111.1111", "paper_title": "Paper One",
+             "section": "Abstract", "text": "Some thin excerpt.", "score": 0.9}]
+    prompts = []
+
+    async def fake_complete_json(cfg, prompt, *, system, shape="object", **kw):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            return [{"tool": "get_full_paper",
+                    "requests": [{"n": 1, "query": "what batch size was used?"}]}]
+        return [{"n": 1, "name": "Batch size", "claim": "Batch size was 512.",
+                "method": "", "metric": "batch size", "value": "512", "condition": ""}]
+
+    async def fake_complete(cfg, prompt, *, system, **kw):
+        return "The batch size was 512, per Table 2."
+
+    monkeypatch.setattr(GEN, "complete_json", fake_complete_json)
+    monkeypatch.setattr(GEN, "complete", fake_complete)
+
+    claims, rejected = asyncio.run(SY.extract(
+        None, run.question, hits, None, None, 1, state=_FakeState(conn), run=run))
+
+    assert len(prompts) == 2
+    assert "tool result -- asked 1111.1111" in prompts[1]
+    assert "The batch size was 512, per Table 2." in prompts[1]
+    assert [c.claim for c in claims] == ["Batch size was 512."]
+    assert rejected == []
+    assert run.full_papers_read.get("1111.1111")
+    assert run.paper_qa_answers[("1111.1111", "what batch size was used?")] == \
+        "The batch size was 512, per Table 2."
+
+
+def test_extract_full_paper_cap_reached_is_reported_not_silently_dropped(monkeypatch):
+    conn = _fake_corpus()
+    run = SY.Run(run_id="r", question="q")
+    run.full_papers_read = {f"paper-{i}": "x" for i in range(SY.MAX_FULL_PAPERS_PER_RUN)}
+    hits = [{"chunk_id": 101, "arxiv_id": "1111.1111", "paper_title": "Paper One",
+             "section": "Abstract", "text": "Some thin excerpt.", "score": 0.9}]
+    prompts = []
+
+    async def fake_complete_json(cfg, prompt, *, system, shape="object", **kw):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            return [{"tool": "get_full_paper", "requests": [{"n": 1, "query": "q?"}]}]
+        return [{"n": 1, "name": "x", "claim": "y", "method": "", "metric": "",
+                "value": "", "condition": ""}]
+
+    async def fake_complete(cfg, prompt, *, system, **kw):
+        raise AssertionError("cap reached; must not have fetched a 6th paper")
+
+    monkeypatch.setattr(GEN, "complete_json", fake_complete_json)
+    monkeypatch.setattr(GEN, "complete", fake_complete)
+
+    asyncio.run(SY.extract(None, run.question, hits, None, None, 1,
+                           state=_FakeState(conn), run=run))
+    assert "cap reached" in prompts[1]
+    assert "1111.1111" not in run.full_papers_read
+
+
+def test_extract_without_tool_use_is_unchanged(monkeypatch):
+    async def fake_complete_json(cfg, prompt, *, system, shape="object", **kw):
+        return [{"n": 1, "name": "X", "claim": "Y", "method": "", "metric": "",
+                "value": "", "condition": ""}]
+
+    monkeypatch.setattr(GEN, "complete_json", fake_complete_json)
+    hits = [{"chunk_id": 1, "arxiv_id": "a", "paper_title": "P", "section": "S",
+             "text": "t", "score": 0.1}]
+    claims, rejected = asyncio.run(SY.extract(None, "q", hits, None, None, 1))
+    assert [c.claim for c in claims] == ["Y"]
+    assert rejected == []
+
+
+def test_extract_tool_request_is_ignored_without_state_or_run():
+    """Old-style callers (and tests) that don't pass state/run must degrade safely: a
+    tool request the caller can't service is just not a claim, not a crash."""
+    async def fake_complete_json(cfg, prompt, *, system, shape="object", **kw):
+        return [{"tool": "get_full_paper", "requests": [{"n": 1, "query": "x"}]}]
+
+    import unittest.mock as mock
+    with mock.patch.object(GEN, "complete_json", fake_complete_json):
+        hits = [{"chunk_id": 1, "arxiv_id": "a", "paper_title": "P", "section": "S",
+                "text": "t", "score": 0.1}]
+        claims, rejected = asyncio.run(SY.extract(None, "q", hits, None, None, 1))
+    assert claims == []
+    assert rejected == [1]
+
+
+def test_extract_system_documents_the_tool_and_its_cap():
+    assert SY.FULL_PAPER_TOOL in SY.EXTRACT_SYSTEM
+    assert str(SY.MAX_FULL_PAPERS_PER_RUN) in SY.EXTRACT_SYSTEM
+    assert '"requests"' in SY.EXTRACT_SYSTEM
