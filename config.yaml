@@ -361,6 +361,9 @@ serving:
     gpu_devices: null
     gpu_memory_utilization: 0.5
     enable_prefix_caching: true
+    # Native tool calls (goal-graph synthesis) need `--enable-auto-tool-choice` and a parser
+    # matching the served model's family; null omits both.
+    tool_call_parser: qwen3_coder
     kv_cache_dtype: auto
     max_model_len: 32768
     max_num_seqs: 64
