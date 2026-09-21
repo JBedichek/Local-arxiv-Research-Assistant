@@ -27,3 +27,6 @@ def import_autoresearch(
         console.print(f"{name}: copied {memory[name]['copied']}, already present {memory[name]['skipped']}")
     console.print(f"interest profile: {memory['profile']}")
     console.print(f"runs: copied {len(runs['copied'])}, already present {len(runs['skipped'])}")
+    if runs["failed"]:
+        console.print(f"runs that could not be written: {', '.join(runs['failed'])}")
+        raise typer.Exit(1)

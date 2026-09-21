@@ -92,5 +92,8 @@ async def condense(cfg, full_text: str, *, level: str, goal: str = "", model=Non
     if not text:
         return ("", [], {})
     cited = C.bind(text, known=known or {}, conn=conn)
-    return (cited.text, list(cited.references),
-            {k: r.to_dict() for k, r in cited.references.items()})
+    # Chunk ids are dense integers, so a key the model mistyped or invented usually exists in the
+    # corpus and would resolve to an unrelated paper. Only keys the source itself carried count.
+    source = set(C.parse_keys(full_text))
+    kept = {k: r for k, r in cited.references.items() if k in source}
+    return cited.text, list(kept), {k: r.to_dict() for k, r in kept.items()}

@@ -104,9 +104,10 @@ def _as_record(d: dict) -> dict | None:
 
 def import_runs(source: Path | None = None, *, root: Path | None = None,
                 states: Path | None = None) -> dict:
-    """Copy each finished synthesis run and its graph. A run already present is left as is."""
+    """Copy each finished synthesis run and its graph. A run already present is left as is;
+    one that could not be written is listed under `failed`."""
     runs_dir = (source or SOURCE) / "runs"
-    copied, skipped = [], []
+    copied, skipped, failed = [], [], []
     for path in sorted(runs_dir.glob("*.json")):
         try:
             d = json.loads(path.read_text())
@@ -118,7 +119,11 @@ def import_runs(source: Path | None = None, *, root: Path | None = None,
         if (SR._path(rec["id"], root)).exists():
             skipped.append(rec["id"])
             continue
-        SR.save_record(rec, root=root)
-        SY.save(rec["id"], SY.SynthesizerState.from_dict(d["plan"]), root=states)
-        copied.append(rec["id"])
-    return {"copied": copied, "skipped": skipped}
+        graph = SY.save(rec["id"], SY.SynthesizerState.from_dict(d["plan"]), root=states)
+        # The record goes last: a run whose graph failed to write is retried next time
+        # rather than skipped forever as "already present".
+        if graph.exists() and SR.save_record(rec, root=root):
+            copied.append(rec["id"])
+        else:
+            failed.append(rec["id"])
+    return {"copied": copied, "skipped": skipped, "failed": failed}

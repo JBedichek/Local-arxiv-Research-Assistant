@@ -369,3 +369,78 @@ def test_delete_and_cancel_handlers():
     SR.save_record(done)
     assert RT.delete(done["id"]).status_code == 200 and RT.delete(done["id"]).status_code == 404
     assert RT.cancel("nope").status_code == 409
+
+
+# ── failures that must not read as success ──
+
+
+def test_a_leaf_that_gathered_no_claims_raises_rather_than_answering():
+    async def fake_run_synthesis(state, cfg, q, **kw):
+        return types.SimpleNamespace(claims=[], thorough="No relevant evidence was found.",
+                                     tldr="No relevant evidence was found.",
+                                     stopped_because="2 rounds found nothing relevant")
+    aresearch = SR.leaf(_app_state(), {}, run_synthesis=fake_run_synthesis, stream_answer=object())
+    with pytest.raises(SR.NoEvidence, match="2 rounds found nothing"):
+        asyncio.run(aresearch("q"))
+
+
+def test_the_leaf_binds_citations_for_a_real_answer():
+    claim = types.SimpleNamespace(chunk_id=7, arxiv_id="1.1", paper_title="P", section="s",
+                                  claim="c", score=0.5)
+
+    async def fake_run_synthesis(state, cfg, q, **kw):
+        return types.SimpleNamespace(claims=[claim], thorough="A [7].", tldr="B [7].",
+                                     stopped_because="")
+    aresearch = SR.leaf(_app_state(), {}, run_synthesis=fake_run_synthesis, stream_answer=object())
+    out = asyncio.run(aresearch("q"))
+    assert out.thorough.papers == ["1.1"] and out.tldr.unresolved == []
+
+
+def test_a_run_where_no_goal_was_researched_is_failed_and_says_why_without_finishing_up(monkeypatch):
+    _fake_generator(monkeypatch)
+    finished = []
+
+    async def spy(*a, **kw):
+        finished.append(1)
+    monkeypatch.setattr(SR, "_finish_up", spy)
+
+    async def fake_run(state, **kw):
+        return SY.SynthesisResult(deliverable="No sub-questions were established toward: g",
+                                  rounds=5, total_done=0, total_failed=0, silent_reason_rounds=5)
+
+    async def go():
+        rec = SR.start(_app_state(), "g", driver=lambda r, f, a: SR._drive(r, f, a, run=fake_run))
+        await SR._TASKS[rec["id"]]
+        return rec
+    rec = asyncio.run(go())
+    stored = SR.load_record(rec["id"])
+    assert stored["status"] == SR.FAILED and finished == []
+    assert "5 of 5 reasoning round(s) returned nothing" in stored["error"]
+    assert "tool-call-parser" in stored["error"]
+
+
+def test_a_failed_finishing_step_is_kept_on_the_record_not_only_the_feed(monkeypatch):
+    async def bad(*a, **kw):
+        raise RuntimeError("boom")
+
+    async def empty(*a, **kw):
+        return []
+    _patch_finishing(monkeypatch, condense=bad, followups=empty)
+    rec, feed = {**SR.new_record("g"), "deliverable": "full"}, SR.Feed()
+    _finish(rec, feed)
+    assert any("medium version failed" in n for n in rec["notes"])
+    assert any("short version failed" in n for n in rec["notes"])
+    assert any("No follow-ups" in n for n in rec["notes"])
+    assert SR.load_record(rec["id"], root=SR.RUNS)["notes"] == rec["notes"]
+
+
+def test_a_degraded_post_hoc_answer_carries_the_pressure_note_in_the_saved_text():
+    async def answer(full, prompt, **kw):
+        return ("a slice of the report", True, "every attempt failed", 1, 1)
+    rec = {**SR.new_record("g"), "deliverable": "REPORT"}
+    out = asyncio.run(SR.compress(rec, "q?", base_url="x", model="m", api_key="",
+                                  max_model_len=1000, answer=answer))
+    assert out["deliverable"].startswith("> **Written under budget pressure.**")
+    assert "every attempt failed" in rec["deliverable"]
+    # and the next answer still starts from the original report, not from this one
+    assert SY.strip_prior_answer(rec["deliverable"]) == "REPORT"

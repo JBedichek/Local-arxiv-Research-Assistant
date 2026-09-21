@@ -27,6 +27,7 @@ import { loadBreadth } from "./ask.js";
 import "./libgraph.js";
 import "./research.js";
 import "./learn.js";
+import "./synth.js";
 import { $, setStatus } from "./dom.js";
 import { applyHeatPrefs } from "./heatmap.js";
 import { applyLayout, makeSplitter } from "./layout.js";

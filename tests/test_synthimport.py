@@ -97,5 +97,17 @@ def test_a_repeat_skips_runs_already_copied_and_never_overwrites(tmp_path):
     mine["deliverable"] = "edited here"
     SR.save_record(mine, root=root)
     out = SI.import_runs(tmp_path / "src", root=root, states=states)
-    assert out == {"copied": [], "skipped": ["a"]}
+    assert out == {"copied": [], "skipped": ["a"], "failed": []}
     assert SR.load_record("a", root=root)["deliverable"] == "edited here"
+
+
+def test_a_run_that_could_not_be_written_is_reported_and_retried_next_time(tmp_path, monkeypatch):
+    runs = tmp_path / "src" / "runs"
+    runs.mkdir(parents=True)
+    (runs / "a.json").write_text(json.dumps(_run("a")))
+    root, states = tmp_path / "lara" / "runs", tmp_path / "lara"
+    monkeypatch.setattr(SR, "save_record", lambda rec, root=None: False)
+    out = SI.import_runs(tmp_path / "src", root=root, states=states)
+    assert out["copied"] == [] and out["failed"] == ["a"]
+    monkeypatch.undo()
+    assert SI.import_runs(tmp_path / "src", root=root, states=states)["copied"] == ["a"]

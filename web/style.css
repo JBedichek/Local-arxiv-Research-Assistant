@@ -815,3 +815,65 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .expansion .lesson-p { margin: 6px 0; }
 #learn .variant-bar { flex-wrap: wrap; align-items: center; gap: 6px; }
 #learn .variant-bar input { width: 4.5rem; }
+/* Synthesize: a question grown into a graph of researched sub-questions and one cited report.
+ * Scoped to #synth; like #learn it derives the few tokens the stylesheet lacks. */
+#synth {
+  position: fixed; inset: 0; z-index: 40;
+  display: flex; flex-direction: column;
+  background: var(--bg); color: var(--text);
+  --ink: var(--text); --faint: var(--dim); --err: var(--warn); --ok: #2f9e6e;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+#synth[hidden] { display: none; }
+#synth-bar { display: flex; align-items: center; gap: 1rem; padding: .5rem 1rem;
+             background: var(--panel); border-bottom: 1px solid var(--line); }
+#synth-bar h2 { font-size: 1rem; margin: 0; }
+#synth-main { flex: 1 1 auto; overflow: auto; padding: .8rem 1.4rem 4rem; }
+#synth h3 { margin: .8rem 0 .3rem; }
+#synth h4 { margin: 1rem 0 .4rem; color: var(--dim); font-size: .95rem; }
+#synth .lede { color: var(--dim); max-width: 70ch; margin-top: 0; }
+#synth .hint { color: var(--dim); font-size: .85rem; }
+#synth .empty { color: var(--dim); font-style: italic; }
+#synth .err { color: var(--err); }
+#synth textarea, #synth input[type="text"], #synth input[type="number"] {
+  background: var(--panel); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: .35rem .5rem; font: inherit; }
+#synth textarea:focus, #synth input:focus { outline: none; border-color: var(--accent); }
+#synth-new { display: flex; flex-direction: column; gap: 8px; max-width: 70ch; margin: 12px 0; }
+#synth-new details { color: var(--dim); }
+#synth-new .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+#synth-new .row input[type="text"] { flex: 1 1 20rem; }
+#synth .synth-runs { list-style: none; padding: 0; }
+#synth .synth-runs li { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; padding: 4px 0; }
+#synth .synth-goal { max-width: 70ch; }
+#synth .badge { font-size: .7143rem; padding: 1px 7px; border-radius: 9px; border: 1px solid var(--line); color: var(--dim); }
+#synth .badge.done { color: var(--ok); border-color: var(--ok); }
+#synth .badge.running { color: var(--accent); border-color: var(--accent); }
+#synth .badge.failed { color: var(--err); border-color: var(--err); }
+#synth .synth-title { max-width: 90ch; margin-bottom: .2rem; }
+#synth .synth-meta { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin: .2rem 0; }
+#synth-cols { display: flex; gap: 1.6rem; align-items: flex-start; }
+#synth-feed { flex: 1 1 42%; min-width: 0; }
+#synth-report { flex: 1 1 58%; min-width: 0; }
+#synth .synth-entry { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+                      padding: 8px 12px; margin: 0 0 8px; }
+#synth .synth-entry.fold { border-style: dashed; }
+#synth .synth-top { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+#synth .synth-q { margin: 4px 0; font-weight: 600; }
+#synth .synth-entry summary { cursor: pointer; color: var(--accent); font-size: .9286rem; }
+#synth .prose { line-height: 1.65; max-width: 78ch; }
+#synth .prose h3, #synth .prose h4 { color: var(--text); margin: 1.1rem 0 .3rem; }
+#synth .prose ul { padding-left: 1.2rem; }
+#synth a.cite, #synth span.cite { color: var(--accent); font-weight: 600; text-decoration: none; }
+#synth span.cite.unresolved { color: var(--dim); font-weight: 400; }
+#synth .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
+#synth .tab { font-size: .8214rem; color: var(--dim); background: none; border: 1px solid var(--line);
+              border-radius: 6px; padding: 3px 12px; cursor: pointer; }
+#synth .tab:hover, #synth .tab.current { border-color: var(--accent); color: var(--accent); }
+#synth .synth-follow { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+#synth .chip { text-align: left; background: var(--panel); border: 1px solid var(--line); color: var(--text);
+               border-radius: 8px; padding: 6px 10px; cursor: pointer; font: inherit; max-width: 78ch; }
+#synth .chip:hover { border-color: var(--accent); }
+#synth-ask { display: flex; gap: 6px; max-width: 78ch; }
+#synth-ask input { flex: 1 1 auto; }
+@media (max-width: 900px) { #synth-cols { flex-direction: column; } }

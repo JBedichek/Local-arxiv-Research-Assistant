@@ -58,16 +58,19 @@ def _path(run_id: str, root: Path | None = None) -> Path:
     return (root or RUNS) / f"{run_id}.json"
 
 
-def save_record(rec: dict, *, root: Path | None = None) -> None:
-    """Atomic write; never raises, since losing the record must not stop the run."""
+def save_record(rec: dict, *, root: Path | None = None) -> bool:
+    """Atomic write; never raises, since losing the record must not stop the run. Returns
+    whether it was written, for a caller (an import) that must not report a write that failed."""
     where = root or RUNS
     try:
         where.mkdir(parents=True, exist_ok=True)
         tmp = where / f"{rec['id']}.writing"
         tmp.write_text(json.dumps(rec, indent=1, default=str))
         tmp.replace(_path(rec["id"], where))
+        return True
     except Exception as exc:                                   # noqa: BLE001
         log.warning("synthruns: could not persist %s: %s", rec.get("id"), exc)
+        return False
 
 
 def load_record(run_id: str, *, root: Path | None = None) -> dict | None:
@@ -190,6 +193,10 @@ async def _served_model(base_url: str, api_key: str) -> str:
     return str(data[0]["id"])
 
 
+class NoEvidence(RuntimeError):
+    """A research leaf that gathered no claims at all."""
+
+
 def leaf(app_state, cfg, *, run_synthesis=None, stream_answer=None):
     """The deep-research leaf `synthesizer.run` injects: one question in, thorough and tldr
     answers out, both with their citations bound to references."""
@@ -201,6 +208,12 @@ def leaf(app_state, cfg, *, run_synthesis=None, stream_answer=None):
     async def aresearch(question: str, *, model=None, base_url=None, api_key=""):
         run = await run_synthesis(app_state, cfg, question, model=model,
                                   stream_answer=stream_answer)
+        if not run.claims:
+            # "Nothing found" is indistinguishable here from a model that was unreachable, and
+            # either way the goal did not produce an answer: land it failed, where the digest
+            # and the feed show it, rather than as a finding that the literature is silent.
+            raise NoEvidence(f"no relevant evidence was gathered for this question "
+                             f"({run.stopped_because or 'no reason recorded'})")
         known = C.from_claims(run.claims)
         conn = app_state.conn()
         return types.SimpleNamespace(
@@ -220,6 +233,13 @@ def new_record(goal: str, *, options: dict | None = None, parent: str = "") -> d
             "deliverable_medium": "", "deliverable_medium_references": {},
             "deliverable_short": "", "deliverable_short_references": {},
             "followups": []}
+
+
+def note(rec: dict, feed: Feed, event: str, text: str) -> None:
+    """A problem worth keeping: on the record, so it survives a reload, and on the feed."""
+    rec.setdefault("notes", []).append(text)
+    save_record(rec)
+    feed.emit(event, {"error": text})
 
 
 def _diff_emitter(state: SY.SynthesizerState, feed: Feed, rec: dict):
@@ -266,10 +286,12 @@ async def _finish_up(rec: dict, feed: Feed, *, cfg, model, window, conn, embedde
                 cfg, deliverable, level=level, goal=goal, model=model, window=window,
                 conn=conn, known=known)
         except Exception as exc:                               # noqa: BLE001
-            feed.emit(f"deliverable_{level}.failed", {"error": f"{type(exc).__name__}: {exc}"})
+            note(rec, feed, f"deliverable_{level}.failed",
+                 f"The {level} version failed: {type(exc).__name__}: {exc}")
             continue
         if not text.strip():
-            feed.emit(f"deliverable_{level}.empty", {})
+            note(rec, feed, f"deliverable_{level}.empty",
+                 f"No {level} version was written: the model returned nothing (or the call failed).")
             continue
         rec[f"deliverable_{level}"], rec[f"deliverable_{level}_references"] = text, refs
         save_record(rec)
@@ -280,12 +302,15 @@ async def _finish_up(rec: dict, feed: Feed, *, cfg, model, window, conn, embedde
             cfg, types.SimpleNamespace(goal=goal), deliverable, run_id=rec["id"],
             embedder=embedder, model=model, window=window)
     except Exception as exc:                                   # noqa: BLE001
-        feed.emit("followups.failed", {"error": f"{type(exc).__name__}: {exc}"})
+        note(rec, feed, "followups.failed", f"Follow-ups failed: {type(exc).__name__}: {exc}")
         return
     if suggestions:
         rec["followups"] = suggestions
         save_record(rec)
         feed.emit("followups", {"suggestions": suggestions})
+    else:
+        note(rec, feed, "followups.empty",
+             "No follow-ups were written: the model returned nothing (or the call failed).")
 
 
 async def generator(app_state, model: str | None = None) -> types.SimpleNamespace:
@@ -321,6 +346,20 @@ async def _drive(rec: dict, feed: Feed, app_state, *, run=SY.run) -> None:
     rec.update(deliverable=result.deliverable, references=result.references,
                verdict=SY.verdict_for(result), rounds=result.rounds,
                tokens_in=result.tokens_in, tokens_out=result.tokens_out)
+    if result.total_done == 0:
+        # The deliverable is a placeholder. Condensing it, distilling "facts" from it and
+        # suggesting follow-ups would dress an outage up as a finished run.
+        rec["status"], rec["ended"] = FAILED, time.time()
+        rec["error"] = (
+            "No sub-question was researched successfully"
+            + (f": {result.silent_reason_rounds} of {result.rounds} reasoning round(s) returned "
+               "nothing. Check that the model server is up and was started with tool calling "
+               "(--enable-auto-tool-choice and a --tool-call-parser matching the model; see "
+               "serving.vllm.tool_call_parser)." if result.silent_reason_rounds
+               else f" ({result.total_failed} failed)."))
+        save_record(rec)
+        feed.emit("verdict", rec["verdict"])
+        return
     save_record(rec)
     feed.emit("deliverable", {"text": result.deliverable, "references": result.references})
     await _finish_up(rec, feed, cfg=g.cfg, model=g.model, window=g.window,
@@ -379,7 +418,10 @@ async def compress(rec: dict, prompt: str, *, base_url: str, model: str, api_key
     text, degraded, because, tin, tout = await answer(
         full, prompt, base_url=base_url, model=model, max_model_len=max_model_len,
         api_key=api_key)
-    rec["deliverable"] = SY.wrap_with_answer(prompt, text, full)
+    wrapped = SY.wrap_with_answer(prompt, text, full)
+    # A degraded call saves a slice of the report as the "answer"; say so in the text, where a
+    # reload will still show it, the way a fresh run's deliverable does.
+    rec["deliverable"] = (SY._pressure_note(because) + "\n\n" + wrapped) if degraded else wrapped
     rec["tokens_in"] = int(rec.get("tokens_in") or 0) + tin
     rec["tokens_out"] = int(rec.get("tokens_out") or 0) + tout
     save_record(rec)

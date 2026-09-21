@@ -65,3 +65,15 @@ def test_known_from_dicts_skips_records_that_are_not_references():
     ref = C.paper_ref(chunk_id=7, arxiv_id="1.1").to_dict()
     known = D.known_from_dicts({"7": ref, "bad": {"no": "key"}, "none": None})
     assert list(known) == ["7"]
+
+
+def test_condense_does_not_resolve_a_key_the_source_never_carried(monkeypatch):
+    import types
+
+    import lara.index.search as S
+    hit = types.SimpleNamespace(to_dict=lambda: {"arxiv_id": "9.9", "paper_title": "Unrelated"})
+    monkeypatch.setattr(S, "hydrate", lambda conn, ids: {i: hit for i in ids})
+    text, keys, refs = asyncio.run(D.condense(
+        {}, "A [7].", level="medium", goal="g", conn=object(), known=_known(),
+        complete=_writer("A [7]. B [8].")))
+    assert keys == ["7"] and list(refs) == ["7"]
