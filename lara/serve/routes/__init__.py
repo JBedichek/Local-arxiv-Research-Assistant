@@ -11,11 +11,13 @@ in :mod:`lara.serve.routes.health`.
 from lara.serve.routes import (
     dataset,
     health,
+    learn,
     library,
     models,
     papers,
     research,
     retrieval,
+    synthesizer,
     taste,
     ui,
 )
@@ -31,6 +33,8 @@ ROUTERS = [
     models.router,
     dataset.router,
     research.router,
+    learn.router,
+    synthesizer.router,
 ]
 
 __all__ = ["ROUTERS"]

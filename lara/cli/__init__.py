@@ -27,6 +27,8 @@ from lara.cli import serve      # noqa: F401
 from lara.cli import settings   # noqa: F401
 from lara.cli import scope      # noqa: F401
 from lara.cli import dataset    # noqa: F401
+from lara.cli import learn      # noqa: F401
+from lara.cli import synth      # noqa: F401
 # isort: on
 
 __all__ = ["app", "console"]

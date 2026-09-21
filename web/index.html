@@ -25,6 +25,8 @@
   </label>
   <label>model <select id="model"><option value="">(loading)</option></select></label>
   <button type="button" id="deep-btn" title="Iterative corpus-wide research (minutes)">Deep Automated Research</button>
+  <button type="button" id="learn-btn" title="Courses built from the papers in your corpus">Learn</button>
+  <button type="button" id="synth-btn" title="Grow a research question into a graph of sub-questions and a cited report">Synthesize</button>
   <button type="button" id="adv-btn" title="Advanced settings">⚙</button>
   <div id="dl-modal" hidden>
     <div class="dl-box">
@@ -170,6 +172,24 @@
       </div>
     </section>
   </div>
+</section>
+
+<section id="learn" hidden>
+  <header id="learn-bar">
+    <h2>Learn</h2>
+    <span class="hint">Courses built from the papers in your corpus — every claim links to its source.</span>
+    <button type="button" id="learn-close">Close</button>
+  </header>
+  <div id="learn-main"></div>
+</section>
+
+<section id="synth" hidden>
+  <header id="synth-bar">
+    <h2>Synthesize</h2>
+    <span class="hint">A question grown into a graph of researched sub-questions, then one cited report.</span>
+    <button type="button" id="synth-close">Close</button>
+  </header>
+  <div id="synth-main"></div>
 </section>
 
 <main>

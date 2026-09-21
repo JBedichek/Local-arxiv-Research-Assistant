@@ -59,6 +59,10 @@ def _flash_attn_takes_value() -> bool:
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
+#: vLLM's tool-call parser for the default model family; it must match the model served.
+#: Override or disable (null) with `serving.vllm.tool_call_parser`.
+DEFAULT_TOOL_CALL_PARSER = "qwen3_coder"
+
 #: Ports commonly used by local OpenAI-compatible servers, in probe order.
 KNOWN_PORTS = ((8000, "vLLM"), (11434, "Ollama"), (1234, "LM Studio"), (8080, "llama.cpp"))
 
@@ -114,7 +118,12 @@ class VllmBackend(Backend):
         ]
         if v.get("enable_prefix_caching", True):
             cmd.append("--enable-prefix-caching")
-        return cmd + [str(a) for a in (v.get("extra_args") or [])]
+        extra = [str(a) for a in (v.get("extra_args") or [])]
+        # Native tool calls (the goal-graph synthesizer's rounds) are a 400 without these.
+        parser = v.get("tool_call_parser", DEFAULT_TOOL_CALL_PARSER)
+        if parser and "--tool-call-parser" not in extra:
+            cmd += ["--enable-auto-tool-choice", "--tool-call-parser", str(parser)]
+        return cmd + extra
 
     def env(self, cfg: dict) -> dict:
         env = dict(os.environ)
