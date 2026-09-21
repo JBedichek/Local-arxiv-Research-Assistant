@@ -40,6 +40,19 @@ import { loadPrompt } from "./sysprompt.js";
 import { loadTaste } from "./taste.js";
 import { applyTypography } from "./typography.js";
 
+/* The full-screen panels (Deep, Learn, Synthesize) start below the top bar so its controls --
+ * style, size, settings -- stay reachable in every view. The bar wraps, so its height is
+ * measured rather than assumed. */
+{
+  const bar = document.getElementById("bar");
+  const publish = () => document.documentElement.style.setProperty(
+    "--bar-h", `${bar.getBoundingClientRect().height}px`);
+  if (bar) {
+    publish();
+    new ResizeObserver(publish).observe(bar);
+  }
+}
+
 /* Reader UI.
  *
  * Latency notes, since perceived responsiveness is the whole point:
