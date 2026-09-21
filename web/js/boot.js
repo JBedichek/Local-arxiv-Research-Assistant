@@ -26,6 +26,7 @@ import { loadBreadth } from "./ask.js";
  * app.js's entry point is the honest place to say the app includes them. */
 import "./libgraph.js";
 import "./research.js";
+import "./learn.js";
 import { $, setStatus } from "./dom.js";
 import { applyHeatPrefs } from "./heatmap.js";
 import { applyLayout, makeSplitter } from "./layout.js";

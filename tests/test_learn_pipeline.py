@@ -1,0 +1,187 @@
+import asyncio
+
+import pytest
+
+from lara.learn import learner as LN
+from lara.learn import pipeline as PL
+from lara.learn import scope as SC
+from lara.learn import store
+from learn_helpers import corpus, llm, model
+
+
+@pytest.fixture(autouse=True)
+def _root(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "ROOT", tmp_path / "courses")
+    PL._building.clear()
+
+
+def run(c):
+    return asyncio.run(c)
+
+
+def ready_course(m):
+    course = run(SC.begin(m, "learn pretraining"))
+    return run(PL.map_course(m, corpus(), course))
+
+
+def test_mapping_records_concepts_in_prerequisite_order():
+    course = ready_course(model())
+    assert course["status"] == "ready" and [c["title"] for c in course["concepts"]] == ["Warmup", "Decay"]
+    assert course["concepts"][1]["prereqs"] == ["c1"]
+    assert store.load_course(course["id"])["status"] == "ready"
+
+
+def test_mapping_an_empty_corpus_fails_the_course_honestly():
+    m = model()
+    course = run(SC.begin(m, "goal"))
+    course = run(PL.map_course(llm(("concept map", "{}")), corpus(), course))
+    assert course["status"] == "failed" and "nothing" in course["error"]
+
+
+def test_building_a_concept_runs_every_stage_and_persists_them():
+    m = model()
+    course = ready_course(m)
+    content = run(PL.build_concept(m, corpus(), course, "c1"))
+    assert [c["key"] for c in content["claims"]] == ["c1", "c2"]
+    assert content["claims"][0]["certainty"] == "established"
+    assert content["lesson"]["stats"]["grounded_pct"] == 100 and content["quiz"]["items"][0]["validated"]
+    assert set(content["stages"]) == set(PL.STAGES) and store.load_build(course["id"], "c1")["stage"] == "done"
+    assert store.load_concept(course["id"], "c1")["title"] == "Warmup"
+
+
+def test_built_stages_are_not_rebuilt_and_force_rebuilds():
+    m = model()
+    course = ready_course(m)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    before = len(m.calls)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    assert len(m.calls) == before
+    run(PL.build_concept(m, corpus(), course, "c1", force=True))
+    assert len(m.calls) > before
+
+
+def test_a_second_course_reuses_a_shared_concept_instead_of_rebuilding_it():
+    m = model()
+    first = ready_course(m)
+    run(PL.build_concept(m, corpus(), first, "c1"))
+    second = ready_course(m)
+    before = len(m.calls)
+    content = run(PL.build_concept(m, corpus(), second, "c1"))
+    assert content["reused"] and len(m.calls) == before
+
+
+def test_a_failing_stage_is_recorded_on_the_course_and_partial_work_is_kept():
+    m = model()
+    course = ready_course(m)
+
+    async def boom(cfg, prompt, *, system="", **kw):
+        if "write a lesson" in system:
+            raise RuntimeError("model down")
+        return await m.complete(cfg, prompt, system=system, **kw)
+
+    bad = type(m)(complete=boom, window=200_000)
+    with pytest.raises(RuntimeError):
+        run(PL.build_concept(bad, corpus(), course, "c1"))
+    assert store.load_build(course["id"], "c1")["stage"] == "error" and "model down" in store.load_build(course["id"], "c1")["error"]
+    assert store.load_concept(course["id"], "c1")["claims"], "claims survived the lesson failure"
+
+
+def test_two_requests_for_one_concept_share_a_single_build():
+    async def go():
+        m = model()
+        course = await PL.map_course(m, corpus(), await SC.begin(m, "goal"))
+        a = PL.ensure_concept(m, corpus(), course, "c1")
+        b = PL.ensure_concept(m, corpus(), course, "c1")
+        assert a is b
+        await a
+    run(go())
+
+
+def test_public_items_hide_the_answer_until_graded():
+    item = {"id": "c1-q1", "concept": "c1", "type": "mcq", "question": "q", "choices": ["a"], "answer": "A",
+            "explanation": "e", "claim": "c1", "source": {"title": "t"}}
+    assert PL.public_item(item) == {"id": "c1-q1", "concept": "c1", "type": "mcq", "question": "q", "choices": ["a"]}
+
+
+def test_answering_records_mastery_and_reveals_the_answer():
+    m = model()
+    course = ready_course(m)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    learner = LN.blank()
+    graded = run(PL.answer_item(m, course, learner, "c1-q1", "A", 3))
+    assert graded["correct"] and graded["answer"].startswith("A.") and learner["concepts"]["c1"]["mastery"] > 0
+    assert store.load_learner(course["id"])["items"]["c1-q1"]["seen"] == 1
+    with pytest.raises(KeyError):
+        run(PL.answer_item(m, course, learner, "c1-q99", "A"))
+
+
+def test_a_pretest_builds_only_claims_and_quiz_and_a_pass_skips_prerequisites():
+    m = model()
+    course = ready_course(m)
+    learner = LN.blank()
+    items = run(PL.start_pretest(m, corpus(), course, learner))
+    assert {i["concept"] for i in items} == {"c1", "c2"}
+    assert "lesson" not in store.load_concept(course["id"], "c1")
+    for i in items:
+        run(PL.answer_item(m, course, learner, i["id"], "A", 3))
+    assert learner["pretest"]["state"] == "done"
+    ov = PL.overview(course, learner)
+    assert ov["pretest"] == "done" and all(c["passed"] or c["mastery"] >= 0.6 for c in ov["concepts"])
+
+
+def test_overview_reports_progress_and_hides_the_next_items_answer():
+    m = model()
+    course = ready_course(m)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    learner = LN.blank()
+    LN.concept_state(learner, "c1")["lesson_read"] = True
+    ov = PL.overview(course, learner)
+    assert ov["next"]["action"] == "quiz" and "answer" not in ov["next"]["item"]
+    assert [c["built"] for c in ov["concepts"]][0] == list(PL.STAGES) and ov["concepts"][1]["unlocked"] is False
+
+
+def test_flagging_a_claim_the_source_does_not_support_withdraws_it_on_disk():
+    m = model()
+    course = ready_course(m)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    learner = LN.blank()
+    flagger = llm(("strict fact-checker", "unrelated"))
+    out = run(PL.flag_claim(flagger, course, learner, "c1", "c1", "this is wrong"))
+    saved = store.load_concept(course["id"], "c1")
+    assert out["withdrawn"] and saved["claims"][0]["withdrawn"] and saved["lesson"]["stale"]
+    assert saved["quiz"]["items"] == [] and learner["flags"][0]["withdrawn"] is True
+
+
+def test_a_stale_lesson_is_regenerated_without_redoing_the_other_stages():
+    m = model()
+    course = ready_course(m)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    content = store.load_concept(course["id"], "c1")
+    content["lesson"]["stale"] = True
+    store.save_concept(course["id"], "c1", content)
+    m.calls.clear()
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    assert any("write a lesson" in s for s, _ in m.calls) and not any("extract atomic" in s for s, _ in m.calls)
+    assert not store.load_concept(course["id"], "c1")["lesson"].get("stale")
+
+
+def test_critique_updates_mastery_only_when_the_claims_speak_to_the_response():
+    m = model()
+    course = ready_course(m)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    learner = LN.blank()
+    assert run(PL.submit_critique(m, course, learner, "c1", "my plan")) == []
+    assert learner["concepts"] == {}
+
+
+def test_concurrent_builds_keep_their_own_progress():
+    async def go():
+        m = model()
+        course = await PL.map_course(m, corpus(), await SC.begin(m, "goal"))
+        # Each build gets its own copy of the course, as separate requests do.
+        import copy
+        a, b = copy.deepcopy(course), copy.deepcopy(course)
+        await asyncio.gather(PL.build_concept(m, corpus(), a, "c1"), PL.build_concept(m, corpus(), b, "c2"))
+        assert store.load_build(course["id"], "c1")["stage"] == "done"
+        assert store.load_build(course["id"], "c2")["stage"] == "done"
+    run(go())

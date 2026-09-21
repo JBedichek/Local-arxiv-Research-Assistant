@@ -11,6 +11,7 @@ in :mod:`lara.serve.routes.health`.
 from lara.serve.routes import (
     dataset,
     health,
+    learn,
     library,
     models,
     papers,
@@ -31,6 +32,7 @@ ROUTERS = [
     models.router,
     dataset.router,
     research.router,
+    learn.router,
 ]
 
 __all__ = ["ROUTERS"]

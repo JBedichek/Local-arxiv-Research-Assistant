@@ -708,3 +708,110 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 .ctx-summary { margin-top: .4rem; font-size: .78rem; }
 .ctx-summary > summary { cursor: pointer; opacity: .75; }
 .ctx-summary > div { padding: .3rem 0 0; opacity: .9; white-space: pre-wrap; }
+
+/* ── Learn ───────────────────────────────────────────────────────────────────────
+   Courses built from the paper corpus, in a full-screen panel like Deep Research. Every
+   claim links to its source passage; papers that disagree are shown disagreeing. The
+   panel defines the few tokens this stylesheet does not, from the ones it does. */
+
+#learn {
+  position: fixed; inset: 0; z-index: 40;
+  display: flex; flex-direction: column;
+  background: var(--bg); color: var(--text);
+  --ink: var(--text); --faint: var(--dim); --err: var(--warn);
+  --ok: #2f9e6e; --attention: #9b6bd6;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+#learn[hidden] { display: none; }
+#learn-bar { display: flex; align-items: center; gap: 1rem; padding: .5rem 1rem;
+             background: var(--panel); border-bottom: 1px solid var(--line); }
+#learn-bar h2 { font-size: 1rem; margin: 0; }
+#learn-main { flex: 1 1 auto; overflow: auto; padding: .8rem 1.4rem 4rem; }
+#learn-pop { --ink: var(--text); z-index: 60; }
+#learn h3 { margin: .8rem 0 .3rem; }
+#learn h4 { margin: 1rem 0 .4rem; color: var(--dim); font-size: .95rem; }
+#learn .lede { color: var(--dim); max-width: 70ch; margin-top: 0; }
+#learn .hint { color: var(--dim); font-size: .85rem; }
+#learn .empty { color: var(--dim); font-style: italic; }
+#learn .error { color: var(--warn); }
+#learn textarea, #learn input[type="text"], #learn input[type="number"] {
+  background: var(--panel); color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: .35rem .5rem; font: inherit; }
+#learn textarea:focus, #learn input:focus { outline: none; border-color: var(--accent); }
+#learn .link { background: none; border: none; padding: 0; color: var(--accent);
+        font-size: 0.8571rem; cursor: pointer; text-decoration: underline; }
+#learn .link:hover { color: var(--ink); }
+/* Version selector above a lesson (TL;DR / Standard / Thorough / custom length): several
+ * lengths of the same lesson, switched in place. */
+#learn .length-bar { display: flex; gap: 6px; margin-bottom: 18px; }
+#learn .length-tab { font-size: 0.8214rem; color: var(--dim); background: none;
+             border: 1px solid var(--line); border-radius: 6px; padding: 3px 12px;
+             cursor: pointer; }
+#learn .length-tab:hover { border-color: var(--accent); color: var(--text); }
+#learn .length-tab.active { border-color: var(--accent); color: var(--accent); }
+/* Learn: courses built from the paper corpus. */
+#learn .learn-new { display: flex; flex-direction: column; gap: 8px; max-width: 70ch; margin: 12px 0; }
+#learn .learn-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
+#learn .learn-head h3 { margin: 0; }
+#learn .learn-courses, #learn .learn-comps, #learn .learn-progress, #learn .claims, #learn .conflicts, #learn .critique { padding-left: 1.1rem; }
+#learn .learn-courses { list-style: none; padding: 0; }
+#learn .learn-course { display: flex; gap: 12px; align-items: baseline; padding: 4px 0; }
+#learn .learn-card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+              padding: 12px 14px; margin: 12px 0; max-width: 84ch; }
+#learn .learn-card.claim { border-color: var(--accent); }
+#learn .learn-card blockquote { margin: 8px 0; padding: 6px 10px; border-left: 3px solid var(--line);
+                         color: var(--dim); font-size: 0.9286rem; }
+#learn .learn-progress { list-style: none; padding: 0; }
+#learn .learn-progress li { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
+#learn .learn-progress li.done { color: var(--ok); }
+#learn .bar { flex: none; width: 90px; height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
+#learn .bar i { display: block; height: 100%; background: var(--accent); }
+#learn .learn-progress li.done .bar i { background: var(--ok); }
+#learn .lesson-p { max-width: 78ch; line-height: 1.7; }
+#learn .lsent { margin-right: 0.25rem; }
+#learn sup.ck, #learn span.ck { font-size: 0.7143rem; color: var(--accent); cursor: pointer; padding: 0 3px;
+                  border: 1px solid var(--line); border-radius: 4px; margin-left: 2px; }
+#learn sup.ck.on, #learn span.ck.on { background: var(--accent); color: var(--bg); }
+#learn .trust { border-left: 3px solid var(--ok); padding-left: 8px; }
+#learn .badge.cert { font-size: 0.7143rem; padding: 1px 7px; border-radius: 9px; border: 1px solid var(--line); }
+#learn .badge.cert.established { color: var(--ok); border-color: var(--ok); }
+#learn .badge.cert.single-source { color: var(--dim); }
+#learn .badge.cert.contested { color: var(--err); border-color: var(--err); }
+#learn .badge.cert.speculative { color: var(--attention); border-color: var(--attention); }
+#learn .badge.cert.superseded { color: var(--faint); text-decoration: line-through; }
+#learn .choice { display: block; padding: 3px 0; }
+#learn .critique li.contradicted b { color: var(--err); }
+#learn .critique li.supported b { color: var(--ok); }
+#learn .ok { color: var(--ok); }
+#learn .err { color: var(--err); }
+#learn .warn { color: var(--warn); }
+#learn .link.danger { color: var(--err); }
+#learn .svg-wrap { overflow-x: auto; max-width: 100%; margin: 8px 0; }
+#learn .svg-wrap svg { max-width: none; }
+#learn .gnode rect { fill: var(--panel-2); stroke: var(--line); stroke-width: 1.5; }
+#learn .gnode text { fill: var(--ink); font-size: 0.7857rem; }
+#learn .gnode text.sub { fill: var(--dim); font-size: 0.6786rem; }
+#learn .gnode[data-learn] { cursor: pointer; }
+#learn .gnode.passed rect { stroke: var(--ok); }
+#learn .gnode.open rect { stroke: var(--accent); }
+#learn .gnode.locked { opacity: 0.55; }
+#learn .gnode.unavailable rect { stroke: var(--warn); stroke-dasharray: 4 3; }
+#learn .gnode.current rect { stroke-width: 3; }
+#learn .edge { fill: none; stroke: var(--faint); stroke-width: 1.4; }
+#learn .arrowhead { fill: var(--faint); }
+#learn .elabel { fill: var(--dim); font-size: 0.6786rem; paint-order: stroke; stroke: var(--panel); stroke-width: 4px; stroke-linejoin: round; }
+#learn .bar, #learn .pt { fill: var(--accent); }
+#learn .ln { fill: none; stroke: var(--accent); stroke-width: 2; }
+#learn .axis { stroke: var(--line); }
+#learn .val, #learn .lab { fill: var(--dim); font-size: 0.6786rem; }
+/* Highlight a lesson passage, ask for more detail inline. */
+#learn-pop { position: fixed; z-index: 30; padding: 4px 10px; font-size: 0.8214rem; cursor: pointer;
+             background: var(--accent); color: var(--bg); border: 0; border-radius: 6px;
+             box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35); }
+#learn .ask-panel textarea { width: 100%; box-sizing: border-box; margin: 6px 0; }
+#learn .expansion { max-width: 78ch; margin: 8px 0 14px; padding: 6px 12px; border-left: 3px solid var(--accent);
+             background: var(--panel-2); border-radius: 0 6px 6px 0; }
+#learn .expansion summary { cursor: pointer; color: var(--accent); font-size: 0.9286rem; }
+#learn .expansion .lesson-p { margin: 6px 0; }
+#learn .variant-bar { flex-wrap: wrap; align-items: center; gap: 6px; }
+#learn .variant-bar input { width: 4.5rem; }
