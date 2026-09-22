@@ -105,6 +105,11 @@ label.breadth em { font-style: normal; opacity: .75; }
 #open-form { display: flex; gap: 6px; }
 .status { margin-left: auto; color: var(--dim); font-variant-numeric: tabular-nums; }
 .status.error { color: var(--warn); }
+/* Sits right before .status, so together the two end up flush at the far right of the bar:
+ * the first margin-left:auto in a flex row claims the free space, the next has none left to
+ * claim and just follows immediately after via #bar's own gap. Empty when unreachable --
+ * collapses to nothing rather than showing a dash for a generator that is not vLLM. */
+.tps { margin-left: auto; color: var(--dim); font-variant-numeric: tabular-nums; font-size: 0.85em; }
 
 /* layout */
 /* Column widths are CSS variables so the splitters can write to them and the sizes

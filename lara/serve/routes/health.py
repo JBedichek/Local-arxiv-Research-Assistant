@@ -34,6 +34,20 @@ def health() -> dict:
     }
 
 
+@router.get("/api/generation/rate")
+async def generation_rate() -> JSONResponse:
+    """Tokens/sec the generator is producing right now, read from vLLM's own counters --
+    see lara.serve.generation_rate. {"tokens_per_sec": 0.0, "reachable": False} before the
+    server is ready or when there is no vLLM base_url to scrape."""
+    from lara.serve import generation_rate as GR
+
+    s = current_state()
+    base_url = (s.cfg.get_in("serving.vllm") or {}).get("base_url", "") if s else ""
+    if not base_url:
+        return JSONResponse({"tokens_per_sec": 0.0, "reachable": False})
+    return JSONResponse(await GR.rate(base_url))
+
+
 def _parse_size(text: str) -> float | None:
     """vmmap's '  7.8G' or '892.3M' -> gigabytes."""
     t = text.strip().rstrip("B").strip()

@@ -38,6 +38,7 @@ import { prefs } from "./prefs.js";
 import { bindSearchGraph, searchPapers } from "./search.js";
 import { loadPrompt } from "./sysprompt.js";
 import { loadTaste } from "./taste.js";
+import { bindTokRate } from "./tokrate.js";
 import { applyTypography } from "./typography.js";
 
 /* The full-screen panels (Deep, Learn, Synthesize) start below the top bar so its controls --
@@ -97,6 +98,7 @@ async function boot() {
   loadLibrary();
   loadPrompt();
   loadTaste();
+  bindTokRate();
 
   await loadBreadth();
 
