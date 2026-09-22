@@ -88,9 +88,25 @@ async def _llm() -> Llm | None:
     return _shared_llm
 
 
+def _figure_lookup(state):
+    """(arxiv_id, version, anchor) -> {"src", "caption"} | None, over whatever HTML the
+    crawl already cached locally -- see lara.serve.papers.figure_image. A paper with no
+    cached HTML (crawled for metadata only, never for fulltext) has nothing to look up in,
+    which is the ordinary case for most of the corpus, not an error."""
+    def lookup(arxiv_id: str, version: int, anchor: str) -> dict | None:
+        path = state.raw_html_path(arxiv_id)
+        if path is None:
+            return None
+        from lara.serve import papers as papers_mod
+
+        return papers_mod.figure_image(str(path), arxiv_id, version or 1, anchor)
+    return lookup
+
+
 async def _corpus():
     state = require_state()
-    return CorpusRetriever(state), embed_fn(getattr(state.retriever, "embedder", None))
+    return (CorpusRetriever(state, figure=_figure_lookup(state)),
+            embed_fn(getattr(state.retriever, "embedder", None)))
 
 
 def _course(course_id: str) -> dict | None:

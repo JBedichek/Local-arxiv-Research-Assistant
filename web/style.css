@@ -760,6 +760,9 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .learn-courses, #learn .learn-comps, #learn .learn-progress, #learn .claims, #learn .conflicts, #learn .critique { padding-left: 1.1em; }
 #learn .learn-courses { list-style: none; padding: 0; }
 #learn .learn-course { display: flex; gap: 12px; align-items: baseline; padding: 4px 0; }
+/* A lesson is read, not scanned -- centered as a column instead of pinned to the left edge
+ * of a full-width overlay, the way the course list and concept map stay full width. */
+#learn .learn-concept { max-width: 86ch; margin: 0 auto; }
 #learn .learn-card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
               padding: 12px 14px; margin: 12px 0; max-width: 84ch; }
 #learn .learn-card.claim { border-color: var(--accent); }
@@ -773,6 +776,27 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .learn-progress li.done .bar i { background: var(--ok); }
 #learn .lesson-p { max-width: 78ch; line-height: 1.7; }
 #learn .lsent { margin-right: 0.25em; }
+/* Jump nav: only shown for a lesson with more than one section (see sectionNav in learn.js). */
+#learn .lesson-nav { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 18px; }
+#learn .lesson-nav button { font-size: 0.8214em; color: var(--dim); background: var(--panel);
+              border: 1px solid var(--line); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+#learn .lesson-nav button:hover { border-color: var(--accent); color: var(--text); }
+/* Pseudocode: a synthesized visual, same grounded/cited pattern as a chart or a diagram --
+ * see PSEUDOCODE_SYSTEM in lara/learn/visuals.py. `depth` nests a step under the loop or
+ * branch above it via indent alone, the way pseudocode conventionally reads. */
+#learn ol.pseudocode { list-style: none; counter-reset: pc; margin: 8px 0 0; padding: 0;
+              font-family: var(--mono); font-size: 0.9em; }
+#learn ol.pseudocode li { counter-increment: pc; padding: 2px 0 2px calc(1.6em + var(--depth, 0) * 1.4em);
+              position: relative; }
+#learn ol.pseudocode li::before { content: counter(pc) "."; position: absolute; left: calc(var(--depth, 0) * 1.4em);
+              color: var(--dim); }
+#learn .pc-line { white-space: pre-wrap; }
+#learn ol.pseudocode sup.ck { font-family: var(--font-system, inherit); }
+/* Figure: the actual source image, hotlinked from arXiv's own already-cached HTML -- see
+ * figures_in in lara/learn/visuals.py. Framed like a figure in a paper, not like a card. */
+#learn .learn-card.figure { text-align: center; }
+#learn .learn-card.figure img { max-width: 100%; max-height: 60vh; border-radius: 4px; }
+#learn .learn-card.figure p { text-align: left; margin-top: 8px; }
 #learn sup.ck, #learn span.ck { font-size: 0.7143em; color: var(--accent); cursor: pointer; padding: 0 3px;
                   border: 1px solid var(--line); border-radius: 4px; margin-left: 2px; }
 #learn sup.ck.on, #learn span.ck.on { background: var(--accent); color: var(--bg); }

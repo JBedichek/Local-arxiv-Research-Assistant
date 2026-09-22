@@ -227,3 +227,29 @@ def test_the_concept_lists_every_version_and_expansions_accept_a_variant(_env):
         assert out["lesson_generated"] == 42.0
         assert (await LR.expand(cid, "c1", LR.ExpandRequest(selection="Warmup avoids", variant="thorough"))).status_code == 409
     run(go())
+
+
+# ── the figure lookup injected into CorpusRetriever ──────────────────────────────────
+
+
+def test_figure_lookup_is_none_with_no_cached_html():
+    import types
+    state = types.SimpleNamespace(raw_html_path=lambda arxiv_id: None)
+    assert LR._figure_lookup(state)("2401.00001", 1, "S4.F2") is None
+
+
+def test_figure_lookup_reads_the_cached_html_when_there_is_one(tmp_path, monkeypatch):
+    import types
+
+    from lara.serve import papers as papers_mod
+
+    seen = []
+    monkeypatch.setattr(papers_mod, "figure_image",
+                        lambda path, arxiv_id, version, anchor: seen.append(
+                            (path, arxiv_id, version, anchor)) or {"src": "https://x/y.png", "caption": "c"})
+    path = tmp_path / "2401.00001.arxiv_html.html.zst"
+    state = types.SimpleNamespace(raw_html_path=lambda arxiv_id: path)
+    out = LR._figure_lookup(state)("2401.00001", 0, "S4.F2")
+    assert out["src"] == "https://x/y.png"
+    # version 0 (unknown) becomes 1, the same fallback resolve_full_paper-style callers use.
+    assert seen == [(str(path), "2401.00001", 1, "S4.F2")]
