@@ -6,6 +6,7 @@
 
 import { $, escapeHtml } from "./dom.js";
 import { renderMath } from "./tex.js";
+import * as VOICE from "./voice.js";
 
 /* lara's api.js returns parsed JSON and throws the raw response text; the Learn endpoints
  * report what is wrong in an `error` field and some requests run for minutes, so this panel
@@ -509,13 +510,128 @@ function lessonBody(concept) {
   const sections = lesson.sections.map((sec, i) => `
     <div id="learn-sec-${i}">
     ${sec.heading ? `<h4>${md(sec.heading)}</h4>` : ""}
-    ${paragraphs(sec.sentences, PARAGRAPH).map((group) => `<p class="lesson-p" data-section="${i}">${group.map((x) => `<span class="lsent" data-claims="${escapeHtml(x.claims.join(","))}">${md(x.text)}${x.claims.map((k) =>
+    ${paragraphs(sec.sentences, PARAGRAPH).map((group) => `<p class="lesson-p" data-section="${i}">${group.map((x) => `<span class="lsent" data-claims="${escapeHtml(x.claims.join(","))}" data-text="${escapeHtml(x.text)}">${md(x.text)}${x.claims.map((k) =>
       `<sup class="ck ${k === L.claim ? "on" : ""}" data-learn="claim" data-claim="${escapeHtml(k)}">${escapeHtml(k)}</sup>`).join("")}</span>`).join(" ")}</p>`).join("")}
     ${visualsFor[i].map(visualCard).join("")}
     </div>
     ${sec.sentences.some((x) => x.claims.includes(L.claim)) ? claimCard(concept) : ""}
     ${askPanel(i)}${expansionsFor(concept, i)}`).join("");
-  return trust + sectionNav(lesson.sections) + sections + leftover.map(visualCard).join("");
+  return trust + readAloudBar() + sectionNav(lesson.sections) + sections + leftover.map(visualCard).join("");
+}
+
+/* Read aloud ------------------------------------------------------------------------ */
+/* Reads every .lsent in the currently-rendered lesson, in order, highlighting each as it
+ * plays. State lives outside L: a MediaRecorder-style handle and an Audio element are not
+ * serializable and have no business surviving a JSON round trip, and re-rendering the
+ * whole panel on every state change here would also wipe an in-progress mic recording
+ * elsewhere on the page (see the mic handlers in bindLearn). `readToken` invalidates a
+ * running loop on stop/navigate without needing to cancel an in-flight fetch or audio. */
+let readState = "idle";     // idle | playing | paused
+let readToken = 0;
+let pauseWaiter = null;
+
+/* An in-progress mic recording (the ask panel's voice input) -- also kept outside L for
+ * the same reason: it is not serializable, and its handlers mutate their button directly
+ * rather than calling renderLearn(). Null whenever nothing is being recorded. */
+let micHandle = null;
+
+function readAloudBar() {
+  if (!VOICE.ttsAvailable()) return "";
+  if (readState === "idle") {
+    return `<p class="read-bar"><button type="button" data-learn="read-start">🔊 Read this lesson aloud</button></p>`;
+  }
+  return `<p class="read-bar">
+    ${readState === "playing"
+      ? `<button type="button" data-learn="read-pause">⏸ Pause</button>`
+      : `<button type="button" data-learn="read-resume">▶ Resume</button>`}
+    <button type="button" class="link" data-learn="read-stop">⏹ Stop</button></p>`;
+}
+
+function readSentences() {
+  return [...document.querySelectorAll("#learn-main .lesson-p .lsent")];
+}
+
+function highlightReading(el) {
+  document.querySelectorAll("#learn-main .lsent.reading-now")
+    .forEach((n) => { if (n !== el) n.classList.remove("reading-now"); });
+  el.classList.add("reading-now");
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function clearReadingHighlight() {
+  document.querySelectorAll("#learn-main .lsent.reading-now")
+    .forEach((n) => n.classList.remove("reading-now"));
+}
+
+/* Only the read-bar itself needs to change, the same reasoning as the mic handlers below:
+ * a full renderLearn() here would also blow away anything typed in an open ask panel. */
+function refreshReadBar() {
+  const bar = document.querySelector("#learn-main .read-bar");
+  if (bar) bar.outerHTML = readAloudBar();
+}
+
+async function waitIfPaused() {
+  if (readState !== "paused") return;
+  await new Promise((resolve) => { pauseWaiter = resolve; });
+}
+
+async function startReading() {
+  const sents = readSentences();
+  if (!sents.length) return;
+  const token = ++readToken;
+  readState = "playing";
+  refreshReadBar();
+
+  const textOf = (el) => el.dataset.text || el.textContent;
+  let next = VOICE.fetchSpeech(textOf(sents[0])).catch((err) => ({ __error: err }));
+  for (let i = 0; i < sents.length; i++) {
+    if (token !== readToken) return;
+    await waitIfPaused();
+    if (token !== readToken) return;
+
+    const clip = await next;
+    if (token !== readToken) return;
+    if (clip && clip.__error) {
+      L.error = `Could not read this aloud: ${clip.__error.message}`;
+      readState = "idle";
+      clearReadingHighlight();
+      renderLearn();
+      return;
+    }
+    next = i + 1 < sents.length
+      ? VOICE.fetchSpeech(textOf(sents[i + 1])).catch((err) => ({ __error: err }))
+      : Promise.resolve(null);
+
+    highlightReading(sents[i]);
+    const { done } = VOICE.playBlob(clip);
+    await done;
+  }
+  if (token === readToken) {
+    readState = "idle";
+    clearReadingHighlight();
+    refreshReadBar();
+  }
+}
+
+function pauseReading() {
+  readState = "paused";
+  VOICE.stopPlayback();
+  refreshReadBar();
+}
+
+function resumeReading() {
+  readState = "playing";
+  refreshReadBar();
+  if (pauseWaiter) { const w = pauseWaiter; pauseWaiter = null; w(); }
+}
+
+function stopReading() {
+  readToken++;                    // invalidates the running loop at its next check
+  readState = "idle";
+  VOICE.stopPlayback();
+  if (pauseWaiter) { const w = pauseWaiter; pauseWaiter = null; w(); }
+  clearReadingHighlight();
+  refreshReadBar();
 }
 
 /* Deep lessons find many conflicts; the first few are shown and the rest folded away. */
@@ -611,7 +727,8 @@ function askPanel(section) {
     <blockquote>${md(a.selection.slice(0, 400))}${a.selection.length > 400 ? "…" : ""}</blockquote>
     ${L.askResult ? `<p class="warn">${md(L.askResult)}</p>` : ""}
     ${L.asking ? `<p class="hint">Looking through the sources… <span class="hint">this can take up to half a minute</span></p>` : `
-    <textarea id="learn-ask-question" rows="2" placeholder="Ask something specific, or leave blank for more detail on this"></textarea>
+    <div class="ask-row"><textarea id="learn-ask-question" rows="2" placeholder="Ask something specific, or leave blank for more detail on this"></textarea>
+    ${VOICE.sttAvailable() ? `<button type="button" class="mic" data-learn="mic-start" title="Ask by voice">🎙</button>` : ""}</div>
     <button type="button" data-learn="ask-go">Get more detail</button>
     <button type="button" class="link" data-learn="ask-cancel">Cancel</button>`}</div>`;
 }
@@ -771,6 +888,8 @@ export function closeLearn() {
   clearTimeout(L.poll);
   const pop = document.getElementById("learn-pop");
   if (pop) pop.style.display = "none";
+  stopReading();
+  if (micHandle) { VOICE.abortRecording(micHandle); micHandle = null; }
 }
 
 export function bindLearn() {
@@ -838,7 +957,7 @@ export function bindLearn() {
     else if (a === "accept") act("Accepting", async () => { await send("POST", `${base()}/accept`, {}); await loadLearn(); });
     else if (a === "map") act("Starting", async () => { await send("POST", `${base()}/map`, {}); await loadLearn(); });
     else if (a === "concept") { openConcept(id); }
-    else if (a === "close-concept") { L.view = "path"; L.conceptId = ""; L.concept = null; L.graded = null; L.ask = null; L.variant = "standard"; renderLearn(); }
+    else if (a === "close-concept") { stopReading(); L.view = "path"; L.conceptId = ""; L.concept = null; L.graded = null; L.ask = null; L.variant = "standard"; renderLearn(); }
     else if (a === "claim") { L.claim = L.claim === t.dataset.claim ? "" : t.dataset.claim; renderLearn(); }
     else if (a === "build") {
       L.requested.add(id);
@@ -863,12 +982,61 @@ export function bindLearn() {
         L.concept = await fetchConcept(L.conceptId);
       });
     } else if (a === "variant") {
+      stopReading();
       L.variant = t.dataset.variant;
       L.ask = null;
       L.claim = "";
       renderLearn();
     } else if (a === "jump") {
       document.getElementById(`learn-sec-${t.dataset.section}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    } else if (a === "read-start") {
+      startReading();
+    } else if (a === "read-pause") {
+      pauseReading();
+    } else if (a === "read-resume") {
+      resumeReading();
+    } else if (a === "read-stop") {
+      stopReading();
+    } else if (a === "mic-start") {
+      /* Deliberately no renderLearn() anywhere in the mic flow (see startReading's own
+       * note above) -- it would also wipe whatever the learner already typed into this
+       * same ask box. Every state change here is a direct mutation of this one button. */
+      t.dataset.learn = "mic-stop";
+      t.classList.add("recording");
+      t.title = "Click to stop and transcribe";
+      t.textContent = "⏹";
+      (async () => {
+        try {
+          micHandle = await VOICE.startRecording();
+        } catch (err) {
+          t.dataset.learn = "mic-start";
+          t.classList.remove("recording");
+          t.textContent = "🎙";
+          t.title = `Could not access the microphone: ${err.message}`;
+        }
+      })();
+    } else if (a === "mic-stop") {
+      const handle = micHandle;
+      micHandle = null;
+      t.dataset.learn = "";
+      t.classList.remove("recording");
+      t.classList.add("transcribing");
+      t.textContent = "…";
+      t.title = "Transcribing…";
+      (async () => {
+        try {
+          const blob = await VOICE.stopRecording(handle);
+          const text = await VOICE.transcribe(blob);
+          const box = document.getElementById("learn-ask-question");
+          if (box && text) box.value = box.value.trim() ? `${box.value.trim()} ${text}` : text;
+          t.title = text ? "Ask by voice" : "Heard nothing — try again";
+        } catch (err) {
+          t.title = `Could not transcribe: ${err.message}`;
+        }
+        t.classList.remove("transcribing");
+        t.dataset.learn = "mic-start";
+        t.textContent = "🎙";
+      })();
     } else if (a === "write" || a === "write-pages") {
       const pages = a === "write-pages" ? Number($("#learn-pages")?.value || 8) : Number(t.dataset.pages || 0) || null;
       const variant = a === "write-pages" ? "pages" : t.dataset.variant;
@@ -889,6 +1057,7 @@ export function bindLearn() {
     } else if (a === "ask-go") {
       askForDetail();
     } else if (a === "ask-cancel") {
+      if (micHandle) { VOICE.abortRecording(micHandle); micHandle = null; }
       L.ask = null;
       L.askResult = "";
       renderLearn();
@@ -908,3 +1077,6 @@ export function bindLearn() {
 }
 
 bindLearn();
+// Checked once, well before anyone opens Learn, so the mic/speaker buttons' first render
+// already knows whether either is installed rather than showing then hiding them.
+VOICE.checkAvailable();

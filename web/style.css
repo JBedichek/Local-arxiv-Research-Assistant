@@ -842,6 +842,22 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
              background: var(--accent); color: var(--bg); border: 0; border-radius: 6px;
              box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35); }
 #learn .ask-panel textarea { width: 100%; box-sizing: border-box; margin: 6px 0; }
+/* Voice: mic button beside the ask textarea, and the read-aloud bar above a lesson. */
+#learn .ask-row { display: flex; gap: 6px; align-items: flex-start; }
+#learn .ask-row textarea { flex: 1 1 auto; }
+#learn .mic { flex: none; width: 2.4em; height: 2.4em; margin-top: 6px; padding: 0;
+              font-size: 1rem; line-height: 1; border-radius: 50%;
+              border: 1px solid var(--line); background: var(--panel); cursor: pointer; }
+#learn .mic:hover { border-color: var(--accent); }
+#learn .mic.recording { border-color: var(--warn); color: var(--warn);
+              animation: mic-pulse 1.2s ease-in-out infinite; }
+#learn .mic.transcribing { opacity: 0.6; cursor: default; }
+@keyframes mic-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(220, 90, 90, 0.35); }
+              50% { box-shadow: 0 0 0 6px rgba(220, 90, 90, 0); } }
+#learn .read-bar { display: flex; gap: 8px; align-items: center; margin: 0 0 14px; }
+#learn .read-bar button { font-size: 0.8571em; }
+#learn .lsent.reading-now { background: var(--panel-2); border-radius: 3px;
+              box-shadow: 0 0 0 2px var(--panel-2); transition: background .15s; }
 #learn .expansion { max-width: 78ch; margin: 8px 0 14px; padding: 6px 12px; border-left: 3px solid var(--accent);
              background: var(--panel-2); border-radius: 0 6px 6px 0; }
 #learn .expansion summary { cursor: pointer; color: var(--accent); font-size: 0.9286em; }

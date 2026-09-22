@@ -94,6 +94,12 @@ serve = ["vllm>=0.10; sys_platform == 'linux'"]   # legacy alias for `vllm`
 #     pip install git+https://github.com/KellerJordan/Muon
 # Everything except `lara finetune` works without it.
 finetune = []
+# Reading a lesson aloud and asking a question by mic (lara/serve/speech.py). Optional
+# because most installs never touch a microphone: faster-whisper needs no torch of its
+# own (ctranslate2 instead, ~75 MB), and kokoro's only heavy dependency, torch, is already
+# in the base install for the embedder -- so this extra is small in practice even though
+# neither package is free-standing.
+speech = ["faster-whisper>=1.0", "kokoro>=0.9", "soundfile>=0.12"]
 # No pytest-asyncio: the few coroutine tests drive asyncio.run directly, so the suite
 # runs with plain pytest and nothing else.
 dev = ["pytest>=8.3", "ruff>=0.7", "mypy>=1.13"]
