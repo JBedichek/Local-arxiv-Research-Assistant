@@ -36,14 +36,16 @@ ANSWER = "learner highlighted"
 
 
 def test_the_concepts_own_claims_answer_first_and_no_search_happens():
-    reply = "Warmup lasted 1000 steps for the 1B model [c2].\nIt avoids early loss spikes [c1, c2]."
+    reply = ("Warmup lasted 1000 steps for the 1B model [c2].\nIt avoids early loss spikes [c1, c2]."
+             "\nLoss spikes are more likely without it [c1].\nThe effect is strongest at the start of training [c1]."
+             "\nIt was validated on the 1B model specifically [c2].")
     m = llm((ANSWER, reply), ("strict fact-checker", "supports"))
     c = FakeCorpus(default=[passage(9, LONG)])
     out = run(EX.expand(m, c, CONCEPT, content(), selection="Warmup avoids spikes", selection_claims=["c1"], section=2,
                         lesson_generated=111.0))
     assert out["searched"] is False and out["claims"] == [] and c.queries == []
     assert out["id"] == "x1" and out["section"] == 2 and out["lesson_generated"] == 111.0
-    assert [s["claims"] for s in out["answer"]["sections"][0]["sentences"]] == [["c2"], ["c1", "c2"]]
+    assert [s["claims"] for s in out["answer"]["sections"][0]["sentences"][:2]] == [["c2"], ["c1", "c2"]]
 
 
 def test_a_generic_answer_that_only_restates_the_highlighted_claims_falls_back_to_search():
@@ -60,7 +62,9 @@ def test_a_generic_answer_that_only_restates_the_highlighted_claims_falls_back_t
 
 
 def test_a_specific_question_may_be_answered_from_claims_the_text_already_cites():
-    reply = "Warmup avoids early loss spikes [c1].\nIt was needed from the first steps [c1]."
+    reply = ("Warmup avoids early loss spikes [c1].\nIt was needed from the first steps [c1]."
+             "\nThe mechanism is a gradual learning-rate ramp-up [c1].\nWithout it, spikes occur in early batches [c1]."
+             "\nThis holds regardless of batch size [c1].")
     m = llm((ANSWER, reply), ("strict fact-checker", "supports"))
     c = FakeCorpus(default=[passage(9, LONG)])
     out = run(EX.expand(m, c, CONCEPT, content(), selection="Warmup avoids spikes", question="Why does it avoid spikes?",

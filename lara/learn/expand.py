@@ -12,18 +12,18 @@ from lara.learn import claims as CL
 from lara.learn import lesson as LE
 from lara.learn.llm import Llm
 
-MAX_CONTEXT_CLAIMS = 8
-MIN_SENTENCES = 2
 DEFAULT_REQUEST = "Explain the highlighted text in more detail."
 
 ANSWER_SYSTEM = """A learner highlighted part of a lesson and asked for more detail. Answer \
-using ONLY the numbered claims.
+using ONLY the numbered claims. Be as thorough as the claims allow -- there is no length limit, \
+so do not cut the answer short to save space.
 
 Format: one sentence per line, each ending -- before its full stop -- with the keys of the claims \
 it rests on in brackets, like [c1] or [x1c2, c3]. A sentence with no key is not allowed.
 
-- Give what the highlighted text leaves out (mechanism, conditions, numbers, caveats) rather \
-than restating it. Do not add any fact that is not in the claims.
+- Draw out everything the claims support beyond the highlighted text: mechanism, conditions, \
+numbers, caveats, examples, how it relates to nearby ideas. Do not add any fact that is not in \
+the claims, and do not pad by restating the highlighted text itself.
 - Convey certainty as marked: one paper, a hypothesis, replaced by later work.
 - If the claims cannot add anything to the highlighted text, reply exactly: INSUFFICIENT"""
 
@@ -50,7 +50,9 @@ async def _answer(llm: Llm, selection: str, request: str, claims: list[dict]):
     by_key = {c["key"]: c for c in claims}
     prompt = (f"HIGHLIGHTED LESSON TEXT: {selection}\nREQUEST: {request}\n\nCLAIMS:\n"
               + "\n".join(LE.line(c) for c in claims))
-    text = await llm.ask(ANSWER_SYSTEM, prompt, default=900, cap=3_000, stage="learn_expand")
+    # cap=0: no fixed ceiling -- the answer may use whatever of the context window is left
+    # once the prompt is in it (see reply_room), rather than an arbitrary token budget.
+    text = await llm.ask(ANSWER_SYSTEM, prompt, default=2_000, cap=0, stage="learn_expand")
     if not text or text.upper().startswith("INSUFFICIENT"):
         return None
     sections, stats = await LE.verify(llm, LE.parse(text, set(by_key)), by_key)
@@ -58,13 +60,11 @@ async def _answer(llm: Llm, selection: str, request: str, claims: list[dict]):
 
 
 def _adds_something(answer, selection_claims: set[str], specific: bool) -> bool:
-    """Enough sentences survived, and -- unless the learner asked something specific -- the
-    answer draws on at least one claim the highlighted text did not already cite."""
+    """Unless the learner asked something specific, the answer must draw on at least one claim
+    the highlighted text did not already cite -- otherwise it is pure restatement, however long."""
     if answer is None:
         return False
     sentences = [s for sec in answer[0] for s in sec["sentences"]]
-    if len(sentences) < MIN_SENTENCES:
-        return False
     return specific or any(k not in selection_claims for s in sentences for k in s["claims"])
 
 
@@ -97,14 +97,14 @@ async def expand(llm: Llm, corpus, concept: dict, content: dict, *, selection: s
     focus = f"{selection}\n{question}" if question else selection
     request = question or DEFAULT_REQUEST
     live = [c for c in content.get("claims", []) if not c.get("withdrawn")]
-    context = rank(live, focus, embed)[:MAX_CONTEXT_CLAIMS]
+    context = rank(live, focus, embed)
     answer = await _answer(llm, selection, request, context)
     searched, new = False, []
     if not _adds_something(answer, set(selection_claims), bool(question)):
         searched = True
         n = _next_id(content.get("expansions", []))
         new = await _new_claims(llm, corpus, concept, live, focus, n, embed)
-        pool = context[:6] + [c.to_dict() for c in new]
+        pool = context + [c.to_dict() for c in new]
         answer = await _answer(llm, selection, request, pool)
         if answer is None:
             return {"insufficient": True, "message": INSUFFICIENT, "searched": True}
