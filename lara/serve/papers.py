@@ -106,3 +106,25 @@ def render(path_str: str, arxiv_id: str, version: int = 1) -> str:
 
 def anchor_exists(html_text: str, anchor: str) -> bool:
     return f'id="{anchor}"' in html_text
+
+
+def figure_image(path_str: str, arxiv_id: str, version: int, anchor: str) -> dict | None:
+    """The first image and caption inside one figure/table float, by the element id its own
+    caption chunk is anchored to (`extract_blocks` anchors a `<figure id="...">`'s caption to
+    the figure itself, not to a child). None if the anchor is not a figure, or is one with no
+    image -- a table with no image, most often.
+
+    Reuses `render`'s cache and its `_absolutize`, so a figure a lesson has already shown once
+    costs nothing to show again, and its `src` is the same already-resolved, already-hotlinked
+    URL the paper reader's own `<img>` tags use.
+    """
+    html = render(path_str, arxiv_id, version)
+    root = LH.fromstring(html)
+    els = root.xpath(f'//*[@id="{anchor}"]')
+    if not els or els[0].tag != "figure":
+        return None
+    imgs = els[0].xpath(".//img[@src]")
+    if not imgs:
+        return None
+    caps = els[0].xpath(".//figcaption | .//caption")
+    return {"src": imgs[0].get("src"), "caption": " ".join(c.text_content() for c in caps).strip()}

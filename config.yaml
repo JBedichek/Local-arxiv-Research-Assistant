@@ -376,3 +376,20 @@ serving:
   # How long the server may sit idle before it releases cached device memory. 0 disables
   # the reaper. Read at startup; the reaper never fires while a query is in flight.
   empty_cache_sec: 60
+
+# Reading a lesson aloud, and asking a question by mic (lara/serve/speech.py). Optional:
+# `pip install -e '.[speech]'`. Both models are lazy-loaded on first use and then held
+# warm, so an install that never calls /api/speech/* never pays for either.
+speech:
+  stt:
+    # faster-whisper model name or local path. distil-large-v3 measured at the same
+    # latency as `small` with better accuracy -- worth the extra ~1 GB of VRAM.
+    model: distil-large-v3
+    device: auto              # same convention as embedding.devices: auto | an index | cpu
+    # null picks float16 on GPU, int8 on CPU -- see lara/serve/speech.py.
+    compute_type: null
+  tts:
+    # One of Kokoro's built-in voices — see https://huggingface.co/hexgrad/Kokoro-82M
+    # for the full list (af_* = American female, am_* = American male, bf_*/bm_* = British).
+    voice: af_heart
+    device: auto

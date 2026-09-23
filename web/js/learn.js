@@ -5,6 +5,8 @@
  * answered, and never a chart number or diagram edge the server did not check against a claim. */
 
 import { $, escapeHtml } from "./dom.js";
+import { renderMath } from "./tex.js";
+import * as VOICE from "./voice.js";
 
 /* lara's api.js returns parsed JSON and throws the raw response text; the Learn endpoints
  * report what is wrong in an `error` field and some requests run for minutes, so this panel
@@ -42,6 +44,11 @@ const L = {
   open: false, requested: new Set(), autostart: false, poll: 0, critique: null, items: {},
   pending: null, ask: null, asking: false, askResult: "", variant: "standard",
 };
+
+/* Lesson/claim/quiz text comes from the model, reading real papers -- 66% of chunks
+ * carry inline LaTeX (see tex.js), so it has to go through the same renderer the paper
+ * reader and Deep Research use, or every $O(n^2)$ shows up as literal dollar signs. */
+const md = (s) => renderMath(escapeHtml(s ?? ""));
 
 const CERTAINTY = {
   established: "several papers agree",
@@ -185,9 +192,9 @@ function scopeView(c) {
   if (s.pending) {
     const q = s.pending;
     action = `<div class="learn-card">
-      <p><b>${escapeHtml(q.question)}</b></p>
-      ${q.why ? `<p class="hint">${escapeHtml(q.why)}</p>` : ""}
-      <p>${(q.options || []).map((o) => `<button type="button" data-learn="answer" data-value="${escapeHtml(o)}">${escapeHtml(o)}</button>`).join(" ")}</p>
+      <p><b>${md(q.question)}</b></p>
+      ${q.why ? `<p class="hint">${md(q.why)}</p>` : ""}
+      <p>${(q.options || []).map((o) => `<button type="button" data-learn="answer" data-value="${escapeHtml(o)}">${md(o)}</button>`).join(" ")}</p>
       <form id="learn-answer" class="learn-new"><input id="learn-answer-text" type="text" placeholder="or in your own words">
         <button type="submit">Answer</button></form>
       <button type="button" class="link" data-learn="accept">Good enough — use this plan</button></div>`;
@@ -208,7 +215,7 @@ function competenciesView(c) {
   const rows = c.competencies.map((x) => `
     <li class="${x.mastered ? "done" : ""}">
       <span class="bar"><i style="width:${Math.round(x.progress * 100)}%"></i></span>
-      ${x.mastered ? "<b>You can now:</b> " : ""}${escapeHtml(x.text)}
+      ${x.mastered ? "<b>You can now:</b> " : ""}${md(x.text)}
     </li>`).join("");
   const gaps = c.uncovered?.length
     ? `<p class="hint warn">The corpus had nothing to build these from: ${c.uncovered.map(escapeHtml).join("; ")}</p>` : "";
@@ -403,11 +410,11 @@ function claimCard(concept) {
   const p = claim.passage;
   const notes = claim.conflicts.map((x) => `<li>${escapeHtml(x.relation === "scope" ? "differs by setting" : "conflicts")} with ${escapeHtml(x.with)}: ${escapeHtml(x.note)}</li>`).join("");
   return `<div class="learn-card claim">
-    <p>${badge(claim.certainty)} ${escapeHtml(claim.text)}</p>
-    ${claim.conditions ? `<p class="hint">Holds when: ${escapeHtml(claim.conditions)}</p>` : ""}
+    <p>${badge(claim.certainty)} ${md(claim.text)}</p>
+    ${claim.conditions ? `<p class="hint">Holds when: ${md(claim.conditions)}</p>` : ""}
     ${notes ? `<ul class="hint">${notes}</ul>` : ""}
     <p class="hint">${sourceLine(p)} · <a href="https://arxiv.org/abs/${escapeHtml(p.arxiv_id)}" target="_blank" rel="noopener">arXiv:${escapeHtml(p.arxiv_id)}</a></p>
-    <blockquote>${escapeHtml(p.text.slice(0, 700))}${p.text.length > 700 ? "…" : ""}</blockquote>
+    <blockquote>${md(p.text.slice(0, 700))}${p.text.length > 700 ? "…" : ""}</blockquote>
     ${claim.flags?.length ? `<p class="hint">Flagged ${claim.flags.length}× — re-checked against this passage.</p>` : ""}
     <button type="button" data-learn="flag" data-claim="${escapeHtml(claim.key)}">This looks wrong — re-check it</button></div>`;
 }
@@ -421,27 +428,210 @@ function paragraphs(sentences, size) {
   return out;
 }
 
+/* Visuals are generated per lesson section server-side (see lara/learn/visuals.py) but
+ * carry no section index of their own -- only the claim keys they rest on. So placement is
+ * done here, by the same signal: the section whose sentences cite the most of a visual's
+ * claims is where it belongs. A visual that overlaps no section in the lesson actually
+ * showing (built against a different variant's section boundaries, or from before this
+ * scheme existed) falls back to the end, same as every visual used to render. */
+function bestSectionFor(v, sections) {
+  let best = -1, bestScore = 0;
+  sections.forEach((sec, i) => {
+    const cited = new Set(sec.sentences.flatMap((x) => x.claims));
+    const score = v.claims.filter((k) => cited.has(k)).length;
+    if (score > bestScore) { best = i; bestScore = score; }
+  });
+  return best;
+}
+
+function visualsBySection(concept, sections) {
+  const by = Array.from({ length: sections.length }, () => []);
+  const leftover = [];
+  (concept.visuals || []).forEach((v) => {
+    const i = bestSectionFor(v, sections);
+    (i < 0 ? leftover : by[i]).push(v);
+  });
+  return { by, leftover };
+}
+
+function visualCard(v) {
+  if (v.kind === "chart") return chartSvg(v);
+  if (v.kind === "diagram") {
+    return `<div class="learn-card"><p><b>${md(v.title)}</b> <span class="hint">every relation is stated by a source claim: ${v.claims.map(escapeHtml).join(", ")}</span></p>
+      ${svgGraph(v.nodes.map((n) => ({ ...n })), v.edges)}</div>`;
+  }
+  if (v.kind === "pseudocode") return pseudocodeCard(v);
+  if (v.kind === "figure") return figureCard(v);
+  return "";
+}
+
+/* Not synthesized like the other three kinds -- the image itself, from wherever the cited
+ * claim's own passage came from (see figures_in in lara/learn/visuals.py). A broken/expired
+ * hotlink degrades to a line of text (see the capturing "error" listener in bindLearn)
+ * rather than a broken-image icon filling the card. */
+function figureCard(v) {
+  return `<div class="learn-card figure">
+    <img src="${escapeHtml(v.src)}" alt="${escapeHtml(v.caption || v.title)}" loading="lazy">
+    <p class="hint">${md(v.caption)} <span class="hint">— from
+      <a href="https://arxiv.org/abs/${escapeHtml(v.arxiv_id)}" target="_blank" rel="noopener">arXiv:${escapeHtml(v.arxiv_id)}</a></span></p>
+  </div>`;
+}
+
+function pseudocodeCard(v) {
+  const lines = v.steps.map((s) => `<li style="--depth: ${s.depth}"><span class="pc-line">${md(s.text)}</span>
+    <sup class="ck ${s.claim === L.claim ? "on" : ""}" data-learn="claim" data-claim="${escapeHtml(s.claim)}">${escapeHtml(s.claim)}</sup></li>`).join("");
+  return `<div class="learn-card"><p><b>${md(v.title)}</b> <span class="hint">every step is stated by a source claim: ${v.claims.map(escapeHtml).join(", ")}</span></p>
+    <ol class="pseudocode">${lines}</ol></div>`;
+}
+
+/* A jump nav is only worth showing once there is more than one heading to jump between --
+ * a TL;DR or a short standard lesson is one section and needs no map of itself. */
+function sectionNav(sections) {
+  if (sections.length < 2) return "";
+  return `<nav class="lesson-nav">${sections.map((sec, i) =>
+    `<button type="button" data-learn="jump" data-section="${i}">${md(sec.heading || `Section ${i + 1}`)}</button>`).join("")}</nav>`;
+}
+
 /* The claim card opens under the paragraph whose chip was clicked, so the source is beside the
  * sentence it backs rather than a long scroll away. */
 function lessonBody(concept) {
   const lesson = activeLesson(concept);
   if (!lesson) return concept.lesson ? writeCard(concept) : `<p class="hint">Not built yet.</p>`;
-  if (lesson.insufficient) return `<div class="learn-card"><p class="warn">${escapeHtml(lesson.message)}</p></div>`;
+  if (lesson.insufficient) return `<div class="learn-card"><p class="warn">${md(lesson.message)}</p></div>`;
   const s = lesson.stats;
   const length = lesson.target_pages
     ? `<p class="hint">About ${lesson.achieved_pages} page(s), for the ${lesson.target_pages} asked for.
-        ${lesson.shortfall ? `<span class="warn">${escapeHtml(lesson.shortfall)}</span>` : ""}
+        ${lesson.shortfall ? `<span class="warn">${md(lesson.shortfall)}</span>` : ""}
         ${lesson.dropped_sections?.length ? `Not enough sources for: ${lesson.dropped_sections.map(escapeHtml).join("; ")}.` : ""}</p>` : "";
   const trust = length + `<p class="hint trust" title="Every sentence is re-checked against the claims it cites; ones that fail are rewritten once, then dropped.">
     ${s.grounded_pct}% of sentences verified on the first pass · ${s.repaired} rewritten · ${s.dropped} dropped
     ${lesson.stale ? ' · <span class="warn">a source was withdrawn — rewrite this version to refresh</span>' : ""}</p>`;
+  const { by: visualsFor, leftover } = visualsBySection(concept, lesson.sections);
   const sections = lesson.sections.map((sec, i) => `
-    ${sec.heading ? `<h4>${escapeHtml(sec.heading)}</h4>` : ""}
-    ${paragraphs(sec.sentences, PARAGRAPH).map((group) => `<p class="lesson-p" data-section="${i}">${group.map((x) => `<span class="lsent" data-claims="${escapeHtml(x.claims.join(","))}">${escapeHtml(x.text)}${x.claims.map((k) =>
+    <div id="learn-sec-${i}">
+    ${sec.heading ? `<h4>${md(sec.heading)}</h4>` : ""}
+    ${paragraphs(sec.sentences, PARAGRAPH).map((group) => `<p class="lesson-p" data-section="${i}">${group.map((x) => `<span class="lsent" data-claims="${escapeHtml(x.claims.join(","))}" data-text="${escapeHtml(x.text)}">${md(x.text)}${x.claims.map((k) =>
       `<sup class="ck ${k === L.claim ? "on" : ""}" data-learn="claim" data-claim="${escapeHtml(k)}">${escapeHtml(k)}</sup>`).join("")}</span>`).join(" ")}</p>`).join("")}
+    ${visualsFor[i].map(visualCard).join("")}
+    </div>
     ${sec.sentences.some((x) => x.claims.includes(L.claim)) ? claimCard(concept) : ""}
     ${askPanel(i)}${expansionsFor(concept, i)}`).join("");
-  return trust + sections;
+  return trust + readAloudBar() + sectionNav(lesson.sections) + sections + leftover.map(visualCard).join("");
+}
+
+/* Read aloud ------------------------------------------------------------------------ */
+/* Reads every .lsent in the currently-rendered lesson, in order, highlighting each as it
+ * plays. State lives outside L: a MediaRecorder-style handle and an Audio element are not
+ * serializable and have no business surviving a JSON round trip, and re-rendering the
+ * whole panel on every state change here would also wipe an in-progress mic recording
+ * elsewhere on the page (see the mic handlers in bindLearn). `readToken` invalidates a
+ * running loop on stop/navigate without needing to cancel an in-flight fetch or audio. */
+let readState = "idle";     // idle | playing | paused
+let readToken = 0;
+let pauseWaiter = null;
+
+/* An in-progress mic recording (the ask panel's voice input) -- also kept outside L for
+ * the same reason: it is not serializable, and its handlers mutate their button directly
+ * rather than calling renderLearn(). Null whenever nothing is being recorded. */
+let micHandle = null;
+
+function readAloudBar() {
+  if (!VOICE.ttsAvailable()) return "";
+  if (readState === "idle") {
+    return `<p class="read-bar"><button type="button" data-learn="read-start">🔊 Read this lesson aloud</button></p>`;
+  }
+  return `<p class="read-bar">
+    ${readState === "playing"
+      ? `<button type="button" data-learn="read-pause">⏸ Pause</button>`
+      : `<button type="button" data-learn="read-resume">▶ Resume</button>`}
+    <button type="button" class="link" data-learn="read-stop">⏹ Stop</button></p>`;
+}
+
+function readSentences() {
+  return [...document.querySelectorAll("#learn-main .lesson-p .lsent")];
+}
+
+function highlightReading(el) {
+  document.querySelectorAll("#learn-main .lsent.reading-now")
+    .forEach((n) => { if (n !== el) n.classList.remove("reading-now"); });
+  el.classList.add("reading-now");
+  el.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function clearReadingHighlight() {
+  document.querySelectorAll("#learn-main .lsent.reading-now")
+    .forEach((n) => n.classList.remove("reading-now"));
+}
+
+/* Only the read-bar itself needs to change, the same reasoning as the mic handlers below:
+ * a full renderLearn() here would also blow away anything typed in an open ask panel. */
+function refreshReadBar() {
+  const bar = document.querySelector("#learn-main .read-bar");
+  if (bar) bar.outerHTML = readAloudBar();
+}
+
+async function waitIfPaused() {
+  if (readState !== "paused") return;
+  await new Promise((resolve) => { pauseWaiter = resolve; });
+}
+
+async function startReading() {
+  const sents = readSentences();
+  if (!sents.length) return;
+  const token = ++readToken;
+  readState = "playing";
+  refreshReadBar();
+
+  const textOf = (el) => el.dataset.text || el.textContent;
+  let next = VOICE.fetchSpeech(textOf(sents[0])).catch((err) => ({ __error: err }));
+  for (let i = 0; i < sents.length; i++) {
+    if (token !== readToken) return;
+    await waitIfPaused();
+    if (token !== readToken) return;
+
+    const clip = await next;
+    if (token !== readToken) return;
+    if (clip && clip.__error) {
+      L.error = `Could not read this aloud: ${clip.__error.message}`;
+      readState = "idle";
+      clearReadingHighlight();
+      renderLearn();
+      return;
+    }
+    next = i + 1 < sents.length
+      ? VOICE.fetchSpeech(textOf(sents[i + 1])).catch((err) => ({ __error: err }))
+      : Promise.resolve(null);
+
+    highlightReading(sents[i]);
+    const { done } = VOICE.playBlob(clip);
+    await done;
+  }
+  if (token === readToken) {
+    readState = "idle";
+    clearReadingHighlight();
+    refreshReadBar();
+  }
+}
+
+function pauseReading() {
+  readState = "paused";
+  VOICE.stopPlayback();
+  refreshReadBar();
+}
+
+function resumeReading() {
+  readState = "playing";
+  refreshReadBar();
+  if (pauseWaiter) { const w = pauseWaiter; pauseWaiter = null; w(); }
+}
+
+function stopReading() {
+  readToken++;                    // invalidates the running loop at its next check
+  readState = "idle";
+  VOICE.stopPlayback();
+  if (pauseWaiter) { const w = pauseWaiter; pauseWaiter = null; w(); }
+  clearReadingHighlight();
+  refreshReadBar();
 }
 
 /* Deep lessons find many conflicts; the first few are shown and the rest folded away. */
@@ -450,23 +640,12 @@ const CONFLICTS_SHOWN = 4;
 function conflictsView(concept) {
   if (!concept.conflicts.length) return "";
   const row = (x) => `<li><b>${x.relation === "scope" ? "Differs by setting" : "Papers disagree"}</b>
-    ${x.note ? `— ${escapeHtml(x.note)}` : ""}
-    <ul>${x.sides.map((s) => `<li>${escapeHtml(s.text)} <span class="hint">(${escapeHtml(s.date)}${s.conditions ? `; ${escapeHtml(s.conditions)}` : ""})</span></li>`).join("")}</ul></li>`;
+    ${x.note ? `— ${md(x.note)}` : ""}
+    <ul>${x.sides.map((s) => `<li>${md(s.text)} <span class="hint">(${escapeHtml(s.date)}${s.conditions ? `; ${escapeHtml(s.conditions)}` : ""})</span></li>`).join("")}</ul></li>`;
   const first = concept.conflicts.slice(0, CONFLICTS_SHOWN).map(row).join("");
   const rest = concept.conflicts.slice(CONFLICTS_SHOWN);
   return `<h4>The disagreement, side by side</h4><ul class="conflicts">${first}</ul>
     ${rest.length ? `<details><summary>${rest.length} more</summary><ul class="conflicts">${rest.map(row).join("")}</ul></details>` : ""}`;
-}
-
-function visualsView(concept) {
-  return (concept.visuals || []).map((v) => {
-    if (v.kind === "chart") return chartSvg(v);
-    if (v.kind === "diagram") {
-      return `<div class="learn-card"><p><b>${escapeHtml(v.title)}</b> <span class="hint">every relation is stated by a source claim: ${v.claims.map(escapeHtml).join(", ")}</span></p>
-        ${svgGraph(v.nodes.map((n) => ({ ...n })), v.edges)}</div>`;
-    }
-    return "";
-  }).join("");
 }
 
 function chartSvg(v) {
@@ -483,7 +662,7 @@ function chartSvg(v) {
   }).join("");
   const line = v.chart === "line" ? `<polyline class="ln" points="${v.points.map((p, i) => `${pad + i * bw + bw * 0.5},${H - pad - Math.max(2, (p.value / max) * (H - pad * 2))}`).join(" ")}"/>`
     + v.points.map((p, i) => `<text x="${pad + i * bw + bw * 0.5}" y="${H - pad + 14}" text-anchor="middle" class="lab">${escapeHtml(String(p.label).slice(0, 14))}</text>`).join("") : "";
-  return `<div class="learn-card"><p><b>${escapeHtml(v.title)}</b> <span class="hint">${escapeHtml(v.y_label || "")} · every number is in its claim: ${v.claims.map(escapeHtml).join(", ")}</span></p>
+  return `<div class="learn-card"><p><b>${md(v.title)}</b> <span class="hint">${md(v.y_label || "")} · every number is in its claim: ${v.claims.map(escapeHtml).join(", ")}</span></p>
     <div class="svg-wrap"><svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img">
     <line x1="${pad}" y1="${H - pad}" x2="${W - pad}" y2="${H - pad}" class="axis"/>${line}${bars}</svg></div></div>`;
 }
@@ -492,13 +671,13 @@ function conceptView(concept) {
   const built = concept.build?.stage === "done" || concept.lesson;
   const notBuilt = !built ? `<div class="learn-card"><p>${buildingNow(concept) ? `Building… <span class="hint">step: ${escapeHtml(concept.build.stage)}</span>` : "This concept has not been built yet."}</p>
     ${buildingNow(concept) ? "" : `<button type="button" data-learn="build" data-id="${escapeHtml(concept.id)}">Build it from the papers</button>`}</div>` : "";
-  const list = concept.claims.map((k) => `<li><span class="ck ${k.key === L.claim ? "on" : ""}" data-learn="claim" data-claim="${escapeHtml(k.key)}">${escapeHtml(k.key)}</span> ${badge(k.certainty)} ${escapeHtml(k.text)}${k.withdrawn ? ' <span class="err">withdrawn</span>' : ""}</li>`).join("");
+  const list = concept.claims.map((k) => `<li><span class="ck ${k.key === L.claim ? "on" : ""}" data-learn="claim" data-claim="${escapeHtml(k.key)}">${escapeHtml(k.key)}</span> ${badge(k.certainty)} ${md(k.text)}${k.withdrawn ? ' <span class="err">withdrawn</span>' : ""}</li>`).join("");
   const s = concept.stats || {};
   return `<div class="learn-concept">
     <button type="button" class="link" data-learn="close-concept">← back to your path</button>
-    <h3>${escapeHtml(concept.title)}</h3><p class="hint">${escapeHtml(concept.summary)}
+    <h3>${md(concept.title)}</h3><p class="hint">${md(concept.summary)}
       ${concept.reused ? " · reused from an earlier course" : ""}</p>
-    ${notBuilt}${concept.lesson ? variantBar(concept) : ""}${lessonBody(concept)}${claimShownInLesson(concept) ? "" : claimCard(concept)}${visualsView(concept)}${conflictsView(concept)}
+    ${notBuilt}${concept.lesson ? variantBar(concept) : ""}${lessonBody(concept)}${claimShownInLesson(concept) ? "" : claimCard(concept)}${conflictsView(concept)}
     ${concept.lesson && !concept.lesson.insufficient ? critiqueBox(concept) : ""}
     ${concept.lesson ? `<p><button type="button" data-learn="read" data-id="${escapeHtml(concept.id)}">I've read this — start practice</button>
       <button type="button" class="link" data-learn="build" data-id="${escapeHtml(concept.id)}" data-force="1">Refresh from the corpus</button></p>` : ""}
@@ -527,11 +706,11 @@ function expansionsFor(concept, section) {
 }
 
 function expansionView(e, concept) {
-  const sents = expansionSentences(e).map((x) => `<span class="lsent">${escapeHtml(x.text)}${x.claims.map((k) =>
+  const sents = expansionSentences(e).map((x) => `<span class="lsent">${md(x.text)}${x.claims.map((k) =>
     `<sup class="ck ${k === L.claim ? "on" : ""}" data-learn="claim" data-claim="${escapeHtml(k)}">${escapeHtml(k)}</sup>`).join("")}</span>`).join(" ");
   const st = e.answer.stats;
   const shown = expansionSentences(e).some((x) => x.claims.includes(L.claim));
-  const label = e.question ? `“${escapeHtml(e.question)}”` : `More on “${escapeHtml(e.selection.slice(0, 70))}${e.selection.length > 70 ? "…" : ""}”`;
+  const label = e.question ? `“${md(e.question)}”` : `More on “${md(e.selection.slice(0, 70))}${e.selection.length > 70 ? "…" : ""}”`;
   return `<details class="expansion" ${L.claim && shown ? "open" : ""}>
     <summary>${label}</summary>
     <p class="hint">${e.searched ? "Found by searching the corpus for this" : "From the lesson's own sources"} ·
@@ -545,10 +724,11 @@ function askPanel(section) {
   if (!L.ask || L.ask.section !== section) return "";
   const a = L.ask;
   return `<div class="learn-card ask-panel">
-    <blockquote>${escapeHtml(a.selection.slice(0, 400))}${a.selection.length > 400 ? "…" : ""}</blockquote>
-    ${L.askResult ? `<p class="warn">${escapeHtml(L.askResult)}</p>` : ""}
+    <blockquote>${md(a.selection.slice(0, 400))}${a.selection.length > 400 ? "…" : ""}</blockquote>
+    ${L.askResult ? `<p class="warn">${md(L.askResult)}</p>` : ""}
     ${L.asking ? `<p class="hint">Looking through the sources… <span class="hint">this can take up to half a minute</span></p>` : `
-    <textarea id="learn-ask-question" rows="2" placeholder="Ask something specific, or leave blank for more detail on this"></textarea>
+    <div class="ask-row"><textarea id="learn-ask-question" rows="2" placeholder="Ask something specific, or leave blank for more detail on this"></textarea>
+    ${VOICE.sttAvailable() ? `<button type="button" class="mic" data-learn="mic-start" title="Ask by voice">🎙</button>` : ""}</div>
     <button type="button" data-learn="ask-go">Get more detail</button>
     <button type="button" class="link" data-learn="ask-cancel">Cancel</button>`}</div>`;
 }
@@ -630,7 +810,7 @@ async function askForDetail() {
 
 function critiqueBox(concept) {
   const out = L.critique;
-  const points = out ? (out.length ? out.map((p) => `<li class="${p.verdict}"><b>${escapeHtml(p.verdict)}</b> — “${escapeHtml(p.statement)}” ${escapeHtml(p.advice)}
+  const points = out ? (out.length ? out.map((p) => `<li class="${p.verdict}"><b>${escapeHtml(p.verdict)}</b> — “${md(p.statement)}” ${md(p.advice)}
     <span class="hint">${p.claims.map(escapeHtml).join(", ")}</span></li>`).join("")
     : `<li class="hint">The sources I have do not speak to anything you wrote — so I will not comment on it.</li>`) : "";
   return `<h4>Test your own thinking</h4><form id="learn-critique" class="learn-new" data-id="${escapeHtml(concept.id)}">
@@ -645,19 +825,19 @@ function critiqueBox(concept) {
 function gradedCard() {
   const item = L.items[L.graded.id] || { question: "", id: L.graded.id };
   const graded = L.graded;
-  return `<div class="learn-card"><p><b>${escapeHtml(item.question)}</b></p>
-    <p class="${graded.correct ? "ok" : "err"}"><b>${graded.correct ? "Correct." : "Not quite."}</b> Answer: ${escapeHtml(graded.answer)}</p>
-    ${graded.feedback ? `<p>${escapeHtml(graded.feedback)}</p>` : ""}
+  return `<div class="learn-card"><p><b>${md(item.question)}</b></p>
+    <p class="${graded.correct ? "ok" : "err"}"><b>${graded.correct ? "Correct." : "Not quite."}</b> Answer: ${md(graded.answer)}</p>
+    ${graded.feedback ? `<p>${md(graded.feedback)}</p>` : ""}
     <p class="hint">Source: ${escapeHtml(graded.source?.title || "")} · arXiv:${escapeHtml(graded.source?.arxiv_id || "")}</p>
     <button type="button" data-learn="next-item">Continue</button></div>`;
 }
 
 function itemCard(item, title) {
   L.items[item.id] = item;
-  const choices = item.type === "mcq" ? item.choices.map((c, i) => `<label class="choice"><input type="radio" name="learn-choice" value="${String.fromCharCode(65 + i)}"> ${String.fromCharCode(65 + i)}. ${escapeHtml(c.replace(/^\(?[A-Da-d][).:]\s+/, ""))}</label>`).join("")
+  const choices = item.type === "mcq" ? item.choices.map((c, i) => `<label class="choice"><input type="radio" name="learn-choice" value="${String.fromCharCode(65 + i)}"> ${String.fromCharCode(65 + i)}. ${md(c.replace(/^\(?[A-Da-d][).:]\s+/, ""))}</label>`).join("")
     : `<textarea id="learn-response" rows="2" placeholder="${item.type === "predict" ? "Predict it before you look" : "Your answer"}"></textarea>`;
   return `<form id="learn-item" class="learn-card" data-id="${escapeHtml(item.id)}">
-    <p class="hint">${escapeHtml(title)}${item.type === "predict" ? " · predict, then see" : ""}</p><p><b>${escapeHtml(item.question)}</b></p>
+    <p class="hint">${escapeHtml(title)}${item.type === "predict" ? " · predict, then see" : ""}</p><p><b>${md(item.question)}</b></p>
     ${choices}
     <p class="hint">How sure are you?
       <label><input type="radio" name="learn-conf" value="1"> guessing</label>
@@ -708,6 +888,8 @@ export function closeLearn() {
   clearTimeout(L.poll);
   const pop = document.getElementById("learn-pop");
   if (pop) pop.style.display = "none";
+  stopReading();
+  if (micHandle) { VOICE.abortRecording(micHandle); micHandle = null; }
 }
 
 export function bindLearn() {
@@ -718,6 +900,14 @@ export function bindLearn() {
     if (e.target.id !== "learn-pop") setTimeout(checkSelection, 0);
   });
   document.addEventListener("keyup", (e) => { if (e.key === "Shift" || e.key.startsWith("Arrow")) checkSelection(); });
+  // "error" does not bubble, so this has to capture -- the only way to catch it from one
+  // listener rather than one per <img>, which a re-render would leak more of every time.
+  document.addEventListener("error", (e) => {
+    const img = e.target;
+    if (img.tagName !== "IMG" || !img.closest(".learn-card.figure")) return;
+    img.replaceWith(Object.assign(document.createElement("p"),
+      { className: "hint", textContent: "The figure could not be loaded from arXiv." }));
+  }, true);
 
   document.addEventListener("submit", async (e) => {
     const f = e.target;
@@ -767,7 +957,7 @@ export function bindLearn() {
     else if (a === "accept") act("Accepting", async () => { await send("POST", `${base()}/accept`, {}); await loadLearn(); });
     else if (a === "map") act("Starting", async () => { await send("POST", `${base()}/map`, {}); await loadLearn(); });
     else if (a === "concept") { openConcept(id); }
-    else if (a === "close-concept") { L.view = "path"; L.conceptId = ""; L.concept = null; L.graded = null; L.ask = null; L.variant = "standard"; renderLearn(); }
+    else if (a === "close-concept") { stopReading(); L.view = "path"; L.conceptId = ""; L.concept = null; L.graded = null; L.ask = null; L.variant = "standard"; renderLearn(); }
     else if (a === "claim") { L.claim = L.claim === t.dataset.claim ? "" : t.dataset.claim; renderLearn(); }
     else if (a === "build") {
       L.requested.add(id);
@@ -792,10 +982,61 @@ export function bindLearn() {
         L.concept = await fetchConcept(L.conceptId);
       });
     } else if (a === "variant") {
+      stopReading();
       L.variant = t.dataset.variant;
       L.ask = null;
       L.claim = "";
       renderLearn();
+    } else if (a === "jump") {
+      document.getElementById(`learn-sec-${t.dataset.section}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    } else if (a === "read-start") {
+      startReading();
+    } else if (a === "read-pause") {
+      pauseReading();
+    } else if (a === "read-resume") {
+      resumeReading();
+    } else if (a === "read-stop") {
+      stopReading();
+    } else if (a === "mic-start") {
+      /* Deliberately no renderLearn() anywhere in the mic flow (see startReading's own
+       * note above) -- it would also wipe whatever the learner already typed into this
+       * same ask box. Every state change here is a direct mutation of this one button. */
+      t.dataset.learn = "mic-stop";
+      t.classList.add("recording");
+      t.title = "Click to stop and transcribe";
+      t.textContent = "⏹";
+      (async () => {
+        try {
+          micHandle = await VOICE.startRecording();
+        } catch (err) {
+          t.dataset.learn = "mic-start";
+          t.classList.remove("recording");
+          t.textContent = "🎙";
+          t.title = `Could not access the microphone: ${err.message}`;
+        }
+      })();
+    } else if (a === "mic-stop") {
+      const handle = micHandle;
+      micHandle = null;
+      t.dataset.learn = "";
+      t.classList.remove("recording");
+      t.classList.add("transcribing");
+      t.textContent = "…";
+      t.title = "Transcribing…";
+      (async () => {
+        try {
+          const blob = await VOICE.stopRecording(handle);
+          const text = await VOICE.transcribe(blob);
+          const box = document.getElementById("learn-ask-question");
+          if (box && text) box.value = box.value.trim() ? `${box.value.trim()} ${text}` : text;
+          t.title = text ? "Ask by voice" : "Heard nothing — try again";
+        } catch (err) {
+          t.title = `Could not transcribe: ${err.message}`;
+        }
+        t.classList.remove("transcribing");
+        t.dataset.learn = "mic-start";
+        t.textContent = "🎙";
+      })();
     } else if (a === "write" || a === "write-pages") {
       const pages = a === "write-pages" ? Number($("#learn-pages")?.value || 8) : Number(t.dataset.pages || 0) || null;
       const variant = a === "write-pages" ? "pages" : t.dataset.variant;
@@ -816,6 +1057,7 @@ export function bindLearn() {
     } else if (a === "ask-go") {
       askForDetail();
     } else if (a === "ask-cancel") {
+      if (micHandle) { VOICE.abortRecording(micHandle); micHandle = null; }
       L.ask = null;
       L.askResult = "";
       renderLearn();
@@ -835,3 +1077,6 @@ export function bindLearn() {
 }
 
 bindLearn();
+// Checked once, well before anyone opens Learn, so the mic/speaker buttons' first render
+// already knows whether either is installed rather than showing then hiding them.
+VOICE.checkAvailable();

@@ -24,6 +24,14 @@ class Passage:
     date: str = ""
     cited_by: int = 0
     journal_ref: str = ""
+    #: The element id of the exact block this passage is -- `S4.F2` for a figure's caption,
+    #: `S3.p4` for an ordinary paragraph (see lara.ingest.parse.extract_blocks/Block.anchor).
+    #: NOT the enclosing section's id (`section`, above, is that -- a human-readable title,
+    #: not an id). Only a `kind="caption"` passage's own anchor is a figure/table float
+    #: itself, which is what makes a claim built from one resolvable back to a real image,
+    #: not just a citation (see CorpusRetriever.figure).
+    anchor: str = ""
+    version: int = 0
 
     @property
     def key(self) -> str:
@@ -47,9 +55,14 @@ class CorpusRetriever:
     """The warm lara retriever, narrowed to what learning may cite. Blocking -- callers
     run it in a thread."""
 
-    def __init__(self, state):
+    def __init__(self, state, figure=None):
         self.retriever = state.retriever
         self._conn = state.conn
+        # Injected rather than reached for directly, the same shape `Llm`/`embed_fn` already
+        # are here: lara.learn never imports lara.serve, so resolving an anchor to an actual
+        # image -- which needs the raw cached HTML lara.serve.papers owns -- is a capability
+        # the caller hands in, not one this module goes looking for.
+        self._figure = figure
 
     def search(self, query: str, k: int = 8) -> list[Passage]:
         hits = self.retriever.retrieve(query, final_k=k * 2).hits
@@ -57,7 +70,19 @@ class CorpusRetriever:
         meta = self._meta({h.arxiv_id for h in hits})
         return [Passage(chunk_id=h.chunk_id, arxiv_id=h.arxiv_id, title=h.paper_title,
                         text=h.text, section=h.section_title, kind=h.kind,
+                        anchor=h.anchor_start, version=h.version,
                         **meta.get(h.arxiv_id, {})) for h in hits]
+
+    def figure(self, arxiv_id: str, version: int, anchor: str) -> dict | None:
+        """The image and caption of the figure/table float at `anchor`, or None -- no image
+        there, the paper's HTML is not cached locally, or no lookup was injected at all
+        (a caller that never needs figures, e.g. every test in this package)."""
+        if self._figure is None:
+            return None
+        try:
+            return self._figure(arxiv_id, version, anchor)
+        except Exception:                                      # noqa: BLE001
+            return None
 
     def relevance(self, pairs: list[tuple[str, str]]) -> list[float] | None:
         """Reranker scores for (claim, passage) pairs -- a relevance screen, not entailment.

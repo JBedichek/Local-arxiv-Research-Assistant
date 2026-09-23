@@ -76,7 +76,8 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
         elif stage == "quiz":
             content["quiz"] = await QZ.build(llm, concept, content.get("claims", []))
         elif stage == "visuals":
-            content["visuals"] = await VS.build(llm, concept, content.get("claims", []))
+            content["visuals"] = await VS.build(llm, concept, content.get("claims", []),
+                                               lesson=content.get("lesson"), corpus=corpus)
         content.setdefault("stages", {})[stage] = time.time()
         store.save_concept(course["id"], cid, content)
 

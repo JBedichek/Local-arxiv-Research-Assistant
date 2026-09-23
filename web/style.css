@@ -105,6 +105,11 @@ label.breadth em { font-style: normal; opacity: .75; }
 #open-form { display: flex; gap: 6px; }
 .status { margin-left: auto; color: var(--dim); font-variant-numeric: tabular-nums; }
 .status.error { color: var(--warn); }
+/* Sits right before .status, so together the two end up flush at the far right of the bar:
+ * the first margin-left:auto in a flex row claims the free space, the next has none left to
+ * claim and just follows immediately after via #bar's own gap. Empty when unreachable --
+ * collapses to nothing rather than showing a dash for a generator that is not vLLM. */
+.tps { margin-left: auto; color: var(--dim); font-variant-numeric: tabular-nums; font-size: 0.85em; }
 
 /* layout */
 /* Column widths are CSS variables so the splitters can write to them and the sizes
@@ -495,7 +500,8 @@ label.breadth #breadth-val em { font-style: normal; color: var(--dim); }
 #adv-btn { background: var(--panel-2); color: var(--dim); border: 1px solid var(--line);
   border-radius: 6px; padding: 4px 9px; font-size: 14px; cursor: pointer; line-height: 1; }
 #adv-btn:hover, #adv-btn.on { color: var(--accent); border-color: var(--accent); }
-#advanced { position: absolute; right: 12px; top: 46px; z-index: 40; width: 320px;
+/* Above the full-screen panels (Deep, Learn, Synthesize; z-index 40), which start below the bar. */
+#advanced { position: absolute; right: 12px; top: 46px; z-index: 50; width: 320px;
   background: var(--panel); border: 1px solid var(--line); border-radius: 9px;
   padding: 12px 14px; box-shadow: 0 10px 34px rgba(0,0,0,.42);
   display: flex; flex-direction: column; gap: 10px; }
@@ -560,7 +566,7 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
    growing evidence graph into a sidebar would make the part worth watching the
    part you cannot read. */
 #deep {
-  position: fixed; inset: 0; z-index: 40;
+  position: fixed; inset: var(--bar-h, 0px) 0 0 0; z-index: 40;
   display: flex; flex-direction: column;
   background: var(--bg); color: var(--text);
 }
@@ -715,7 +721,7 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
    panel defines the few tokens this stylesheet does not, from the ones it does. */
 
 #learn {
-  position: fixed; inset: 0; z-index: 40;
+  position: fixed; inset: var(--bar-h, 0px) 0 0 0; z-index: 40;
   display: flex; flex-direction: column;
   background: var(--bg); color: var(--text);
   --ink: var(--text); --faint: var(--dim); --err: var(--warn);
@@ -723,28 +729,31 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 #learn[hidden] { display: none; }
-#learn-bar { display: flex; align-items: center; gap: 1rem; padding: .5rem 1rem;
+#learn-bar { display: flex; align-items: center; gap: 1em; padding: .5em 1em;
              background: var(--panel); border-bottom: 1px solid var(--line); }
-#learn-bar h2 { font-size: 1rem; margin: 0; }
-#learn-main { flex: 1 1 auto; overflow: auto; padding: .8rem 1.4rem 4rem; }
+#learn-bar h2 { font-size: 1em; margin: 0; }
+#learn-main { flex: 1 1 auto; overflow: auto; padding: .8em 1.4em 4em;
+  font-family: var(--paper-font, inherit); font-size: var(--paper-size, 16px);
+  line-height: var(--paper-leading, 1.6); }
+#learn-main button, #synth-main button { font: inherit; font-size: .9em; }
 #learn-pop { --ink: var(--text); z-index: 60; }
-#learn h3 { margin: .8rem 0 .3rem; }
-#learn h4 { margin: 1rem 0 .4rem; color: var(--dim); font-size: .95rem; }
+#learn h3 { margin: .8em 0 .3em; }
+#learn h4 { margin: 1em 0 .4em; color: var(--dim); font-size: .95em; }
 #learn .lede { color: var(--dim); max-width: 70ch; margin-top: 0; }
-#learn .hint { color: var(--dim); font-size: .85rem; }
+#learn .hint { color: var(--dim); font-size: .85em; }
 #learn .empty { color: var(--dim); font-style: italic; }
 #learn .error { color: var(--warn); }
 #learn textarea, #learn input[type="text"], #learn input[type="number"] {
   background: var(--panel); color: var(--text); border: 1px solid var(--line);
-  border-radius: 6px; padding: .35rem .5rem; font: inherit; }
+  border-radius: 6px; padding: .35em .5em; font: inherit; }
 #learn textarea:focus, #learn input:focus { outline: none; border-color: var(--accent); }
 #learn .link { background: none; border: none; padding: 0; color: var(--accent);
-        font-size: 0.8571rem; cursor: pointer; text-decoration: underline; }
+        font-size: 0.8571em; cursor: pointer; text-decoration: underline; }
 #learn .link:hover { color: var(--ink); }
 /* Version selector above a lesson (TL;DR / Standard / Thorough / custom length): several
  * lengths of the same lesson, switched in place. */
 #learn .length-bar { display: flex; gap: 6px; margin-bottom: 18px; }
-#learn .length-tab { font-size: 0.8214rem; color: var(--dim); background: none;
+#learn .length-tab { font-size: 0.8214em; color: var(--dim); background: none;
              border: 1px solid var(--line); border-radius: 6px; padding: 3px 12px;
              cursor: pointer; }
 #learn .length-tab:hover { border-color: var(--accent); color: var(--text); }
@@ -753,14 +762,17 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .learn-new { display: flex; flex-direction: column; gap: 8px; max-width: 70ch; margin: 12px 0; }
 #learn .learn-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
 #learn .learn-head h3 { margin: 0; }
-#learn .learn-courses, #learn .learn-comps, #learn .learn-progress, #learn .claims, #learn .conflicts, #learn .critique { padding-left: 1.1rem; }
+#learn .learn-courses, #learn .learn-comps, #learn .learn-progress, #learn .claims, #learn .conflicts, #learn .critique { padding-left: 1.1em; }
 #learn .learn-courses { list-style: none; padding: 0; }
 #learn .learn-course { display: flex; gap: 12px; align-items: baseline; padding: 4px 0; }
+/* A lesson is read, not scanned -- centered as a column instead of pinned to the left edge
+ * of a full-width overlay, the way the course list and concept map stay full width. */
+#learn .learn-concept { max-width: 86ch; margin: 0 auto; }
 #learn .learn-card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
               padding: 12px 14px; margin: 12px 0; max-width: 84ch; }
 #learn .learn-card.claim { border-color: var(--accent); }
 #learn .learn-card blockquote { margin: 8px 0; padding: 6px 10px; border-left: 3px solid var(--line);
-                         color: var(--dim); font-size: 0.9286rem; }
+                         color: var(--dim); font-size: 0.9286em; }
 #learn .learn-progress { list-style: none; padding: 0; }
 #learn .learn-progress li { display: flex; align-items: center; gap: 10px; padding: 3px 0; }
 #learn .learn-progress li.done { color: var(--ok); }
@@ -768,12 +780,33 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .bar i { display: block; height: 100%; background: var(--accent); }
 #learn .learn-progress li.done .bar i { background: var(--ok); }
 #learn .lesson-p { max-width: 78ch; line-height: 1.7; }
-#learn .lsent { margin-right: 0.25rem; }
-#learn sup.ck, #learn span.ck { font-size: 0.7143rem; color: var(--accent); cursor: pointer; padding: 0 3px;
+#learn .lsent { margin-right: 0.25em; }
+/* Jump nav: only shown for a lesson with more than one section (see sectionNav in learn.js). */
+#learn .lesson-nav { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 18px; }
+#learn .lesson-nav button { font-size: 0.8214em; color: var(--dim); background: var(--panel);
+              border: 1px solid var(--line); border-radius: 6px; padding: 3px 10px; cursor: pointer; }
+#learn .lesson-nav button:hover { border-color: var(--accent); color: var(--text); }
+/* Pseudocode: a synthesized visual, same grounded/cited pattern as a chart or a diagram --
+ * see PSEUDOCODE_SYSTEM in lara/learn/visuals.py. `depth` nests a step under the loop or
+ * branch above it via indent alone, the way pseudocode conventionally reads. */
+#learn ol.pseudocode { list-style: none; counter-reset: pc; margin: 8px 0 0; padding: 0;
+              font-family: var(--mono); font-size: 0.9em; }
+#learn ol.pseudocode li { counter-increment: pc; padding: 2px 0 2px calc(1.6em + var(--depth, 0) * 1.4em);
+              position: relative; }
+#learn ol.pseudocode li::before { content: counter(pc) "."; position: absolute; left: calc(var(--depth, 0) * 1.4em);
+              color: var(--dim); }
+#learn .pc-line { white-space: pre-wrap; }
+#learn ol.pseudocode sup.ck { font-family: var(--font-system, inherit); }
+/* Figure: the actual source image, hotlinked from arXiv's own already-cached HTML -- see
+ * figures_in in lara/learn/visuals.py. Framed like a figure in a paper, not like a card. */
+#learn .learn-card.figure { text-align: center; }
+#learn .learn-card.figure img { max-width: 100%; max-height: 60vh; border-radius: 4px; }
+#learn .learn-card.figure p { text-align: left; margin-top: 8px; }
+#learn sup.ck, #learn span.ck { font-size: 0.7143em; color: var(--accent); cursor: pointer; padding: 0 3px;
                   border: 1px solid var(--line); border-radius: 4px; margin-left: 2px; }
 #learn sup.ck.on, #learn span.ck.on { background: var(--accent); color: var(--bg); }
 #learn .trust { border-left: 3px solid var(--ok); padding-left: 8px; }
-#learn .badge.cert { font-size: 0.7143rem; padding: 1px 7px; border-radius: 9px; border: 1px solid var(--line); }
+#learn .badge.cert { font-size: 0.7143em; padding: 1px 7px; border-radius: 9px; border: 1px solid var(--line); }
 #learn .badge.cert.established { color: var(--ok); border-color: var(--ok); }
 #learn .badge.cert.single-source { color: var(--dim); }
 #learn .badge.cert.contested { color: var(--err); border-color: var(--err); }
@@ -789,8 +822,8 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .svg-wrap { overflow-x: auto; max-width: 100%; margin: 8px 0; }
 #learn .svg-wrap svg { max-width: none; }
 #learn .gnode rect { fill: var(--panel-2); stroke: var(--line); stroke-width: 1.5; }
-#learn .gnode text { fill: var(--ink); font-size: 0.7857rem; }
-#learn .gnode text.sub { fill: var(--dim); font-size: 0.6786rem; }
+#learn .gnode text { fill: var(--ink); font-size: 0.7857em; }
+#learn .gnode text.sub { fill: var(--dim); font-size: 0.6786em; }
 #learn .gnode[data-learn] { cursor: pointer; }
 #learn .gnode.passed rect { stroke: var(--ok); }
 #learn .gnode.open rect { stroke: var(--accent); }
@@ -799,60 +832,78 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .gnode.current rect { stroke-width: 3; }
 #learn .edge { fill: none; stroke: var(--faint); stroke-width: 1.4; }
 #learn .arrowhead { fill: var(--faint); }
-#learn .elabel { fill: var(--dim); font-size: 0.6786rem; paint-order: stroke; stroke: var(--panel); stroke-width: 4px; stroke-linejoin: round; }
+#learn .elabel { fill: var(--dim); font-size: 0.6786em; paint-order: stroke; stroke: var(--panel); stroke-width: 4px; stroke-linejoin: round; }
 #learn .bar, #learn .pt { fill: var(--accent); }
 #learn .ln { fill: none; stroke: var(--accent); stroke-width: 2; }
 #learn .axis { stroke: var(--line); }
-#learn .val, #learn .lab { fill: var(--dim); font-size: 0.6786rem; }
+#learn .val, #learn .lab { fill: var(--dim); font-size: 0.6786em; }
 /* Highlight a lesson passage, ask for more detail inline. */
-#learn-pop { position: fixed; z-index: 30; padding: 4px 10px; font-size: 0.8214rem; cursor: pointer;
+#learn-pop { position: fixed; z-index: 30; padding: 4px 10px; font-size: 0.8214em; cursor: pointer;
              background: var(--accent); color: var(--bg); border: 0; border-radius: 6px;
              box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35); }
 #learn .ask-panel textarea { width: 100%; box-sizing: border-box; margin: 6px 0; }
+/* Voice: mic button beside the ask textarea, and the read-aloud bar above a lesson. */
+#learn .ask-row { display: flex; gap: 6px; align-items: flex-start; }
+#learn .ask-row textarea { flex: 1 1 auto; }
+#learn .mic { flex: none; width: 2.4em; height: 2.4em; margin-top: 6px; padding: 0;
+              font-size: 1rem; line-height: 1; border-radius: 50%;
+              border: 1px solid var(--line); background: var(--panel); cursor: pointer; }
+#learn .mic:hover { border-color: var(--accent); }
+#learn .mic.recording { border-color: var(--warn); color: var(--warn);
+              animation: mic-pulse 1.2s ease-in-out infinite; }
+#learn .mic.transcribing { opacity: 0.6; cursor: default; }
+@keyframes mic-pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(220, 90, 90, 0.35); }
+              50% { box-shadow: 0 0 0 6px rgba(220, 90, 90, 0); } }
+#learn .read-bar { display: flex; gap: 8px; align-items: center; margin: 0 0 14px; }
+#learn .read-bar button { font-size: 0.8571em; }
+#learn .lsent.reading-now { background: var(--panel-2); border-radius: 3px;
+              box-shadow: 0 0 0 2px var(--panel-2); transition: background .15s; }
 #learn .expansion { max-width: 78ch; margin: 8px 0 14px; padding: 6px 12px; border-left: 3px solid var(--accent);
              background: var(--panel-2); border-radius: 0 6px 6px 0; }
-#learn .expansion summary { cursor: pointer; color: var(--accent); font-size: 0.9286rem; }
+#learn .expansion summary { cursor: pointer; color: var(--accent); font-size: 0.9286em; }
 #learn .expansion .lesson-p { margin: 6px 0; }
 #learn .variant-bar { flex-wrap: wrap; align-items: center; gap: 6px; }
-#learn .variant-bar input { width: 4.5rem; }
+#learn .variant-bar input { width: 4.5em; }
 /* Synthesize: a question grown into a graph of researched sub-questions and one cited report.
  * Scoped to #synth; like #learn it derives the few tokens the stylesheet lacks. */
 #synth {
-  position: fixed; inset: 0; z-index: 40;
+  position: fixed; inset: var(--bar-h, 0px) 0 0 0; z-index: 40;
   display: flex; flex-direction: column;
   background: var(--bg); color: var(--text);
   --ink: var(--text); --faint: var(--dim); --err: var(--warn); --ok: #2f9e6e;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
 }
 #synth[hidden] { display: none; }
-#synth-bar { display: flex; align-items: center; gap: 1rem; padding: .5rem 1rem;
+#synth-bar { display: flex; align-items: center; gap: 1em; padding: .5em 1em;
              background: var(--panel); border-bottom: 1px solid var(--line); }
-#synth-bar h2 { font-size: 1rem; margin: 0; }
-#synth-main { flex: 1 1 auto; overflow: auto; padding: .8rem 1.4rem 4rem; }
-#synth h3 { margin: .8rem 0 .3rem; }
-#synth h4 { margin: 1rem 0 .4rem; color: var(--dim); font-size: .95rem; }
+#synth-bar h2 { font-size: 1em; margin: 0; }
+#synth-main { flex: 1 1 auto; overflow: auto; padding: .8em 1.4em 4em;
+  font-family: var(--paper-font, inherit); font-size: var(--paper-size, 16px);
+  line-height: var(--paper-leading, 1.6); }
+#synth h3 { margin: .8em 0 .3em; }
+#synth h4 { margin: 1em 0 .4em; color: var(--dim); font-size: .95em; }
 #synth .lede { color: var(--dim); max-width: 70ch; margin-top: 0; }
-#synth .hint { color: var(--dim); font-size: .85rem; }
+#synth .hint { color: var(--dim); font-size: .85em; }
 #synth .empty { color: var(--dim); font-style: italic; }
 #synth .err { color: var(--err); }
 #synth textarea, #synth input[type="text"], #synth input[type="number"] {
   background: var(--panel); color: var(--text); border: 1px solid var(--line);
-  border-radius: 6px; padding: .35rem .5rem; font: inherit; }
+  border-radius: 6px; padding: .35em .5em; font: inherit; }
 #synth textarea:focus, #synth input:focus { outline: none; border-color: var(--accent); }
 #synth-new { display: flex; flex-direction: column; gap: 8px; max-width: 70ch; margin: 12px 0; }
 #synth-new details { color: var(--dim); }
 #synth-new .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
-#synth-new .row input[type="text"] { flex: 1 1 20rem; }
+#synth-new .row input[type="text"] { flex: 1 1 20em; }
 #synth .synth-runs { list-style: none; padding: 0; }
 #synth .synth-runs li { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; padding: 4px 0; }
 #synth .synth-goal { max-width: 70ch; }
-#synth .badge { font-size: .7143rem; padding: 1px 7px; border-radius: 9px; border: 1px solid var(--line); color: var(--dim); }
+#synth .badge { font-size: .7143em; padding: 1px 7px; border-radius: 9px; border: 1px solid var(--line); color: var(--dim); }
 #synth .badge.done { color: var(--ok); border-color: var(--ok); }
 #synth .badge.running { color: var(--accent); border-color: var(--accent); }
 #synth .badge.failed { color: var(--err); border-color: var(--err); }
-#synth .synth-title { max-width: 90ch; margin-bottom: .2rem; }
-#synth .synth-meta { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin: .2rem 0; }
-#synth-cols { display: flex; gap: 1.6rem; align-items: flex-start; }
+#synth .synth-title { max-width: 90ch; margin-bottom: .2em; }
+#synth .synth-meta { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin: .2em 0; }
+#synth-cols { display: flex; gap: 1.6em; align-items: flex-start; }
 #synth-feed { flex: 1 1 42%; min-width: 0; }
 #synth-report { flex: 1 1 58%; min-width: 0; }
 #synth .synth-entry { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
@@ -860,14 +911,14 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #synth .synth-entry.fold { border-style: dashed; }
 #synth .synth-top { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
 #synth .synth-q { margin: 4px 0; font-weight: 600; }
-#synth .synth-entry summary { cursor: pointer; color: var(--accent); font-size: .9286rem; }
+#synth .synth-entry summary { cursor: pointer; color: var(--accent); font-size: .9286em; }
 #synth .prose { line-height: 1.65; max-width: 78ch; }
-#synth .prose h3, #synth .prose h4 { color: var(--text); margin: 1.1rem 0 .3rem; }
-#synth .prose ul { padding-left: 1.2rem; }
+#synth .prose h3, #synth .prose h4 { color: var(--text); margin: 1.1em 0 .3em; }
+#synth .prose ul { padding-left: 1.2em; }
 #synth a.cite, #synth span.cite { color: var(--accent); font-weight: 600; text-decoration: none; }
 #synth span.cite.unresolved { color: var(--dim); font-weight: 400; }
 #synth .tabs { display: flex; gap: 6px; margin-bottom: 14px; }
-#synth .tab { font-size: .8214rem; color: var(--dim); background: none; border: 1px solid var(--line);
+#synth .tab { font-size: .8214em; color: var(--dim); background: none; border: 1px solid var(--line);
               border-radius: 6px; padding: 3px 12px; cursor: pointer; }
 #synth .tab:hover, #synth .tab.current { border-color: var(--accent); color: var(--accent); }
 #synth .synth-follow { list-style: none; padding: 0; display: flex; flex-direction: column; gap: 6px; }

@@ -17,6 +17,7 @@ from lara.serve.routes import (
     papers,
     research,
     retrieval,
+    speech,
     synthesizer,
     taste,
     ui,
@@ -35,6 +36,7 @@ ROUTERS = [
     research.router,
     learn.router,
     synthesizer.router,
+    speech.router,
 ]
 
 __all__ = ["ROUTERS"]
