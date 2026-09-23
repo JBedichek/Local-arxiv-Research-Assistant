@@ -13,7 +13,6 @@ from lara.learn import judge as J
 from lara.learn.llm import Llm
 
 MIN_CLAIMS = 2
-MAX_CLAIMS = 30
 
 LESSON_SYSTEM = """You write a lesson on one concept for a learner, using ONLY the numbered \
 claims provided.
@@ -49,10 +48,11 @@ def line(claim: dict) -> str:
 
 
 def usable(claims: list[dict]) -> list[dict]:
-    """Claims a lesson may teach from: not withdrawn, strongest first."""
+    """Claims a lesson may teach from: not withdrawn, strongest first. No count cap -- a lesson
+    uses everything the corpus supported, not a fixed number picked in advance."""
     rank = {"established": 0, "single-source": 1, "contested": 2, "speculative": 3, "superseded": 4}
     live = [c for c in claims if not c.get("withdrawn")]
-    return sorted(live, key=lambda c: rank.get(c["certainty"], 5))[:MAX_CLAIMS]
+    return sorted(live, key=lambda c: rank.get(c["certainty"], 5))
 
 
 def parse(text: str, known: set[str]) -> list[tuple[str, list[dict]]]:

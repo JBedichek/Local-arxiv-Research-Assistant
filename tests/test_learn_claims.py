@@ -112,6 +112,85 @@ def test_build_returns_serialisable_claims_conflicts_and_stats():
     assert out["claims"][0]["certainty"] == "superseded" and out["stats"]["comparisons"] == 1
 
 
+def test_facets_are_parsed_and_capped():
+    m = llm(("choosing what a learner needs evidence", json.dumps(["a", "b", "c", "d", "e", "f", "g", "h"])))
+    assert run(CL.facets(m, concept())) == ["a", "b", "c", "d", "e", "f"]
+
+
+def test_facets_falls_back_to_the_concept_title_on_a_bad_reply():
+    assert run(CL.facets(llm(("choosing what a learner needs evidence", "not json")), concept())) == [concept()["title"]]
+
+
+def test_build_researches_each_facet_and_merges_what_they_find():
+    fc = FakeCorpus(by_query={"facet a": [passage(1, LONG, arxiv="2401.1")],
+                              "facet b": [passage(2, LONG, arxiv="2402.2")]})
+
+    def extract_by_facet(system, prompt):
+        if "facet a" in prompt:
+            return json.dumps([{"passage": 1, "claim": "Warmup gradually raises the learning rate."},
+                               {"passage": 1, "claim": "A linear ramp is the most common warmup shape."}])
+        if "facet b" in prompt:
+            return json.dumps([{"passage": 1, "claim": "A cosine schedule is a less common warmup shape."},
+                               {"passage": 1, "claim": "Warmup length often scales with batch size."}])
+        return "[]"
+
+    m = llm(("choosing what a learner needs evidence", json.dumps(["facet a", "facet b"])),
+            ("extract atomic claims", extract_by_facet), ("strict fact-checker", "supports"),
+            ("compare two claims", '{"relation": "unrelated", "note": ""}'))
+    out = run(CL.build(m, fc, concept()))
+    assert out["facets"] == ["facet a", "facet b"]
+    assert {c["text"] for c in out["claims"]} == {
+        "Warmup gradually raises the learning rate.", "A linear ramp is the most common warmup shape.",
+        "A cosine schedule is a less common warmup shape.", "Warmup length often scales with batch size."}
+    assert [c["key"] for c in out["claims"]] == ["c1", "c2", "c3", "c4"] and out["stats"]["facets_widened"] == 0
+
+
+def test_a_thin_facet_is_retried_against_a_wider_search():
+    """"thin facet" only has 2 passages allowed through in round one (MAX_PER_PAPER, all from
+    the same paper); its one claim is below MIN_FACET_CLAIMS, so it is searched again excluding
+    what every facet has used -- and the paper's third passage, held back the first time only by
+    the per-call MAX_PER_PAPER count, comes through."""
+    thin = [passage(1, LONG, arxiv="2401.1"), passage(2, LONG, arxiv="2401.1"), passage(3, LONG, arxiv="2401.1")]
+    rich = [passage(9, LONG, arxiv="2402.1"), passage(10, LONG, arxiv="2402.2")]
+    fc = FakeCorpus(by_query={"thin facet": thin, "rich facet": rich})
+
+    seen_thin_calls = []
+
+    def extract_by_facet(system, prompt):
+        if "thin facet" in prompt:
+            seen_thin_calls.append(prompt)
+            text = "Thin facet claim one." if len(seen_thin_calls) == 1 else "Thin facet claim two, found widening."
+            return json.dumps([{"passage": 1, "claim": text}])
+        if "rich facet" in prompt:
+            return json.dumps([{"passage": 1, "claim": "Rich facet claim one."},
+                               {"passage": 2, "claim": "Rich facet claim two."}])
+        return "[]"
+
+    m = llm(("choosing what a learner needs evidence", json.dumps(["thin facet", "rich facet"])),
+            ("extract atomic claims", extract_by_facet), ("strict fact-checker", "supports"),
+            ("compare two claims", '{"relation": "unrelated", "note": ""}'))
+    out = run(CL.build(m, fc, concept()))
+    assert len(seen_thin_calls) == 2, "the thin facet was searched again"
+    assert out["stats"]["facets_widened"] == 1
+    texts = {c["text"] for c in out["claims"]}
+    assert {"Thin facet claim one.", "Thin facet claim two, found widening.",
+           "Rich facet claim one.", "Rich facet claim two."} == texts
+
+
+def test_near_duplicate_claims_from_different_papers_across_facets_stay_separate_for_corroboration():
+    """A `_merge_facets` regression: the same idea surfacing from two different papers, via two
+    different facets, is corroboration -- it must not be merged away like a same-paper repeat."""
+    fc = FakeCorpus(by_query={"facet a": [passage(1, LONG, arxiv="2401.1")],
+                              "facet b": [passage(2, LONG, arxiv="2402.2")]})
+    same_claim = json.dumps([{"passage": 1, "claim": "Warmup avoids early loss spikes."}])
+    m = llm(("choosing what a learner needs evidence", json.dumps(["facet a", "facet b"])),
+            ("extract atomic claims", same_claim), ("strict fact-checker", "supports"),
+            ("compare two claims", '{"relation": "agree", "note": ""}'))
+    out = run(CL.build(m, fc, concept()))
+    assert len(out["claims"]) == 2 and out["stats"]["cross_facet_merged"] == 0
+    assert out["claims"][0]["certainty"] == out["claims"][1]["certainty"] == "established"
+
+
 def test_the_same_claim_from_two_papers_is_kept_for_corroboration_but_not_twice_from_one():
     ps = [passage(1, LONG, arxiv="2401.1"), passage(2, LONG, arxiv="2402.2")]
     items = [{"passage": 1, "claim": "Warmup avoids early loss spikes in training."},

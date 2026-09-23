@@ -1,10 +1,13 @@
 """Claims: what the sources actually say about a concept, and how they relate.
 
-Each claim is extracted from one passage and re-checked against it by the judge, so a claim
-the model paraphrased beyond its source never enters. Claims from different papers are then
-compared pairwise: agreement corroborates, opposite conclusions under the same conditions are
-a conflict (the newer one supersedes), and different conclusions explained by different
-conditions are a scope difference -- taught as such, not as a contradiction."""
+A concept is researched one facet at a time (what it is, how it works, its evidence, its limits,
+...) rather than by one generic search on its title, so a lesson has more than whatever passages
+happen to be nearest the title to draw on. Each claim is extracted from one passage and
+re-checked against it by the judge, so a claim the model paraphrased beyond its source never
+enters. Claims from different papers are then compared pairwise: agreement corroborates,
+opposite conclusions under the same conditions are a conflict (the newer one supersedes), and
+different conclusions explained by different conditions are a scope difference -- taught as
+such, not as a contradiction."""
 
 from __future__ import annotations
 
@@ -17,10 +20,16 @@ from lara.learn import judge as J
 from lara.learn.llm import Llm
 from lara.learn.passages import Passage
 
-PASSAGES_PER_CONCEPT = 12
 MAX_PER_PAPER = 2
 MIN_PASSAGE_CHARS = 200
-MAX_PAIR_CHECKS = 40
+#: Bounds the O(claims^2) candidate pairs relate() will pay an LLM call to compare -- a compute
+#: safeguard, not a content limit: pairs are already filtered by similarity before this cuts in.
+MAX_PAIR_CHECKS = 80
+MAX_FACETS = 6
+#: A facet whose own passages support fewer claims than this is under-covered; retried once
+#: against a wider slice of the corpus (excluding what every facet has already used) before
+#: being accepted as genuinely thin.
+MIN_FACET_CLAIMS = 2
 #: A pair of claims is worth a comparison call above either similarity.
 PAIR_WORD_OVERLAP = 0.25
 PAIR_COSINE = 0.65
@@ -30,6 +39,18 @@ DUPLICATE_OVERLAP = 0.8
 #: Two claims from one paper this close (embedding cosine) are put to the judge as possible
 #: repeats -- measured on real output, repeats scored 0.73-0.79 and the nearest non-repeat 0.63.
 SAME_PAPER_COSINE = 0.62
+
+FACETS_SYSTEM = """You are choosing what a learner needs evidence for, to fully understand one \
+concept from a research-paper corpus, before a lesson on it is written.
+
+Reply with JSON only: ["facet query 1", "facet query 2", ...]
+
+- 4 to 6 short, specific search queries (not sentences), each aimed at a DIFFERENT angle of the \
+concept: what it is, how or why it works, concrete numbers or empirical results, the conditions \
+or limits it holds under, how it compares to alternatives -- adapted to what actually matters \
+for THIS concept and the learner's goal. Skip an angle that does not apply to it.
+- Each facet should surface different passages than the others -- do not just reword the \
+concept's title several times."""
 
 EXTRACT_SYSTEM = """You extract atomic claims about a concept from numbered passages of \
 research papers.
@@ -110,13 +131,25 @@ def _days_apart(a: str, b: str) -> int:
         return 0
 
 
+async def facets(llm: Llm, concept: dict) -> list[str]:
+    """Search queries covering the distinct angles a lesson on this concept needs evidence for.
+    Falls back to the concept's own title (the old, single-query behaviour) if the model's reply
+    cannot be used, so a bad facet call degrades retrieval rather than failing the build."""
+    data = await llm.ask_json(FACETS_SYSTEM,
+                              f"LEARNER'S GOAL: {concept.get('goal') or '(not given)'}\n"
+                              f"CONCEPT: {concept['title']} -- {concept.get('summary', '')}",
+                              default=400, cap=1_200, stage="learn_facets")
+    out = [str(f).strip() for f in data][:MAX_FACETS] if isinstance(data, list) else []
+    return [f for f in out if f] or [concept["title"]]
+
+
 async def gather_passages(corpus, concept: dict, *, per_query: int = 8, focus: str = "",
-                          exclude: frozenset = frozenset(),
-                          limit: int = PASSAGES_PER_CONCEPT) -> list[Passage]:
+                          exclude: frozenset = frozenset()) -> list[Passage]:
     """Distinct, substantial passages for a concept, at most `MAX_PER_PAPER` from one paper so
-    corroboration means independent papers. `focus` (a highlighted passage and question)
-    steers the search toward it; `exclude` holds chunk ids already used, so a follow-up
-    search finds something new."""
+    corroboration means independent papers. `focus` (a facet query, or a highlighted passage and
+    question) steers the search toward it; `exclude` holds chunk ids already used, so a follow-up
+    search finds something new. No cap on how many come back -- that is `MAX_PER_PAPER` and
+    however many facets are searched, not a fixed number picked in advance."""
     seen, per_paper, out = set(), {}, []
     goal = concept.get("goal", "")[:160]
     if focus:
@@ -134,7 +167,7 @@ async def gather_passages(corpus, concept: dict, *, per_query: int = 8, focus: s
             seen.add(p.key)
             per_paper[p.arxiv_id] = per_paper.get(p.arxiv_id, 0) + 1
             out.append(p)
-    return out[:limit]
+    return out
 
 
 async def _merge_repeats(llm: Llm, items: list[tuple], embed) -> tuple[list[tuple], int]:
@@ -245,11 +278,45 @@ def conflicts(claims: list[Claim]) -> list[dict]:
     return out
 
 
+def _merge_facets(groups: list[list[Claim]]) -> list[Claim]:
+    """Every facet's claims, renumbered from c1 and deduplicated against everything kept so far --
+    facets often surface overlapping passages, and a passage two facets both found should not
+    become two claims. Only a same-paper repeat is dropped here, matching `extract`'s own rule:
+    a near-identical claim from a DIFFERENT paper is corroboration, not a repeat, and stays for
+    `relate` to record as agreement."""
+    seen: list[tuple[str, str]] = []       # (arxiv_id, text) of every claim kept so far
+    out: list[Claim] = []
+    for group in groups:
+        for c in group:
+            if all(c.paper != paper or overlap(c.text, text) < DUPLICATE_OVERLAP for paper, text in seen):
+                c.key = f"c{len(out) + 1}"
+                seen.append((c.paper, c.text))
+                out.append(c)
+    return out
+
+
 async def build(llm: Llm, corpus, concept: dict, *, embed=None) -> dict:
-    passages = await gather_passages(corpus, concept)
-    claims, dropped, merged, off_topic = await extract(llm, concept, passages, embed=embed)
+    """Researches one facet at a time (see `facets`) instead of a single generic search on the
+    concept's title, then widens the search once for any facet that came back thin, so a lesson
+    has more than whatever a handful of passages nearest the title happened to say."""
+    queries = await facets(llm, concept)
+
+    async def one(facet: str, exclude: frozenset) -> tuple[list[Claim], frozenset, tuple[int, int, int, int]]:
+        passages = await gather_passages(corpus, concept, focus=facet, exclude=exclude)
+        claims, dropped, merged, off_topic = await extract(llm, concept, passages, embed=embed, focus=facet)
+        return claims, frozenset(p.chunk_id for p in passages), (len(passages), dropped, merged, off_topic)
+
+    first = await asyncio.gather(*(one(f, frozenset()) for f in queries))
+    used = frozenset(cid for _, exhausted, _ in first for cid in exhausted)
+    thin = [f for f, (claims, _, _) in zip(queries, first) if len(claims) < MIN_FACET_CLAIMS]
+    widened = await asyncio.gather(*(one(f, used) for f in thin)) if thin else []
+
+    rounds = first + widened
+    claims = _merge_facets([c for c, _, _ in rounds])
     compared = await relate(llm, claims, embed=embed)
-    return {"claims": [c.to_dict() for c in claims], "conflicts": conflicts(claims),
-            "stats": {"passages": len(passages), "unfaithful_dropped": dropped,
-                      "repeats_merged": merged, "off_topic_dropped": off_topic,
-                      "comparisons": compared}}
+    stats = [s for _, _, s in rounds]
+    return {"claims": [c.to_dict() for c in claims], "conflicts": conflicts(claims), "facets": queries,
+            "stats": {"passages": sum(s[0] for s in stats), "unfaithful_dropped": sum(s[1] for s in stats),
+                      "repeats_merged": sum(s[2] for s in stats), "off_topic_dropped": sum(s[3] for s in stats),
+                      "cross_facet_merged": sum(len(g) for g, _, _ in rounds) - len(claims),
+                      "comparisons": compared, "facets_widened": len(thin)}}

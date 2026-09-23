@@ -25,16 +25,12 @@ WORDS_PER_CLAIM = 55
 OVERRUN = 1.15
 #: A malformed outline reply is retried once before giving up on the lesson.
 OUTLINE_ATTEMPTS = 2
-#: A section is researched more widely than a whole standard concept is: the length asked for
-#: depends on how many claims turn up, and a dozen passages per section is too few for that.
-PASSAGES_PER_SECTION = 24
 SEARCH_BREADTH = 12
 MIN_PAGES, MAX_PAGES = 1, 20
 THOROUGH_PAGES = 5
 MIN_SECTIONS, MAX_SECTIONS = 3, 16
 MIN_SECTION_CLAIMS = 2
 MAX_SECTION_CLAIMS = 24
-_CERTAINTY_ORDER = {"established": 0, "single-source": 1, "contested": 2, "speculative": 3, "superseded": 4}
 #: A page is enough of a shortfall to mention only when the lesson lands below this share.
 SHORTFALL_BELOW = 0.75
 
@@ -111,7 +107,7 @@ async def research(llm: Llm, corpus, concept: dict, existing: list[dict], outlin
     async def one(sec: dict) -> list[CL.Claim]:
         focus = f"{sec['heading']}. {sec['focus']}".strip()
         passages = await CL.gather_passages(corpus, concept, focus=focus, exclude=used,
-                                            per_query=SEARCH_BREADTH, limit=PASSAGES_PER_SECTION)
+                                            per_query=SEARCH_BREADTH)
         found, *_ = await CL.extract(llm, concept, passages, embed=embed, focus=focus)
         return found
 
@@ -195,9 +191,7 @@ async def deepen(llm: Llm, corpus, concept: dict, content: dict, pages: int, *, 
     everything = [CL.Claim.from_dict(c) for c in content.get("claims", [])] + fresh
     await CL.relate(llm, everything, embed=embed, involving={c.key for c in fresh})
     merged = _merge_back(content.get("claims", []), everything)
-    # Not `LE.usable`: that caps at a standard lesson's 30 claims, and a deep lesson needs them all.
-    usable = sorted((c for c in merged if not c.get("withdrawn")),
-                    key=lambda c: _CERTAINTY_ORDER.get(c["certainty"], 5))
+    usable = LE.usable(merged)
     note(f"found {len(fresh)} new claims; writing")
 
     words = max(60, round(pages * WORDS_PER_PAGE / len(outline)))
