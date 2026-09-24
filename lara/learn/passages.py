@@ -93,6 +93,30 @@ class CorpusRetriever:
         except Exception:                                      # noqa: BLE001
             return {"cites": [], "cited_by": []}
 
+    def full_paper(self, arxiv_id: str, version: int, *, max_chunks: int = 30) -> list[Passage]:
+        """Every chunk of one paper's given version, in reading order -- not just the handful
+        a query happened to retrieve. For a facet that turns out to be anchored to one clearly
+        dominant paper, reading it whole finds what similarity search over isolated chunks
+        missed. `max_chunks` bounds one very long paper from blowing the extraction prompt's
+        budget; [] on any failure, same as a paper this reader has nothing more to offer."""
+        try:
+            rows = self._conn().execute(
+                "SELECT c.chunk_id, c.arxiv_id, c.version, c.anchor_start, c.kind, c.text, "
+                "p.title AS paper_title, s.title AS section_title "
+                "FROM chunks c JOIN papers p ON p.arxiv_id = c.arxiv_id "
+                "LEFT JOIN sections s ON s.arxiv_id = c.arxiv_id AND s.version = c.version "
+                "                     AND s.anchor = c.section_anchor "
+                "WHERE c.arxiv_id = ? AND c.version = ? ORDER BY c.ordinal LIMIT ?",
+                (arxiv_id, version, max_chunks)).fetchall()
+        except Exception:                                      # noqa: BLE001
+            return []
+        meta = self._meta({arxiv_id})
+        return [Passage(chunk_id=r["chunk_id"], arxiv_id=r["arxiv_id"], title=r["paper_title"],
+                        text=r["text"], section=r["section_title"] or "", kind=r["kind"] or "",
+                        anchor=r["anchor_start"] or "", version=r["version"],
+                        **meta.get(arxiv_id, {}))
+                for r in rows if (r["kind"] or "") not in EXCLUDED_KINDS]
+
     def figure(self, arxiv_id: str, version: int, anchor: str) -> dict | None:
         """The image and caption of the figure/table float at `anchor`, or None -- no image
         there, the paper's HTML is not cached locally, or no lookup was injected at all

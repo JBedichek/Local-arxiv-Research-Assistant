@@ -720,19 +720,25 @@ function traceView(concept) {
   const t = concept.trace;
   if (!t || !t.rounds?.length) return "";
   const cov = t.coverage || {}, bud = t.budget || {};
-  const rounds = t.rounds.map((r, i) => {
-    const tags = `${r.widened ? '<span class="tag">widened</span>' : ""}${
-      r.citation_passages_kept ? '<span class="tag cit">citation graph</span>' : ""}`;
-    const note = `${r.dense_retrieved} passage${r.dense_retrieved === 1 ? "" : "s"} by similarity` +
-      (r.citation_papers_tried ? ` · ${r.citation_passages_kept} of ${r.citation_papers_tried} citation neighbour(s) added a passage` : "");
-    return `<details class="deep-round"><summary><b>Facet ${i + 1}</b>${tags}<span class="rq">${md(r.facet)}</span>
+  const facetOrder = [];
+  t.rounds.forEach((r) => { if (!facetOrder.includes(r.facet)) facetOrder.push(r.facet); });
+  const rounds = t.rounds.map((r) => {
+    const tags = `${r.round > 1 ? `<span class="tag">round ${r.round}</span>` : ""}${
+      r.citation_passages_kept ? '<span class="tag cit">citation graph</span>' : ""}${
+      r.full_paper_read ? '<span class="tag cit">full paper</span>' : ""}`;
+    const note = [`${r.dense_retrieved} passage${r.dense_retrieved === 1 ? "" : "s"} by similarity`,
+      r.citation_papers_tried ? `${r.citation_passages_kept} of ${r.citation_papers_tried} citation neighbour(s) added a passage` : "",
+      r.full_paper_read ? `read the whole of ${escapeHtml(r.full_paper_read)} -- one paper anchored this round` : ""]
+      .filter(Boolean).join(" · ");
+    return `<details class="deep-round"><summary><b>Facet ${facetOrder.indexOf(r.facet) + 1}</b>${tags}<span class="rq">${md(r.query)}</span>
       <span class="rstat" style="margin-left:auto;opacity:.7">${r.claims} claim${r.claims === 1 ? "" : "s"}</span></summary>
       <div class="deep-claims"><div class="deep-note">${note}</div></div></details>`;
   }).join("");
+  const depth = [bud.citation_walk ? "citation walk on" : "citation walk off",
+    bud.gap_round ? "follow-up round on" : "", bud.full_paper ? "full-paper read on" : ""].filter(Boolean).join(", ");
   return `<details class="learn-card"><summary><b>How this lesson was built</b></summary>
     <p class="hint">${cov.papers ?? 0} paper(s) / ${cov.chunks ?? 0} passage(s) touch this in the corpus →
-      researched as <b>${escapeHtml(bud.tier || "")}</b>
-      (${bud.facets || 0} facet(s) planned, ${bud.citation_walk ? "citation walk on" : "citation walk off"})</p>
+      researched as <b>${escapeHtml(bud.tier || "")}</b> (${bud.facets || 0} facet(s) planned, ${depth})</p>
     ${rounds}
     <p class="hint">${t.claims} claim(s) from ${t.papers} paper(s) · ${t.comparisons} pairwise comparison(s) · ${t.ms}ms</p>
   </details>`;

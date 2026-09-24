@@ -45,15 +45,19 @@ class FakeCorpus:
     is a no-op unless a test wires some in. A `papers=` search draws from `by_paper` instead
     of the query-matched set, regardless of query text -- restricting to specific papers is
     what the real retriever's own `papers=` does too (Retriever.retrieve): it narrows the
-    candidate pool, it does not change which query text matched it."""
+    candidate pool, it does not change which query text matched it. `full_papers` is what
+    full_paper() returns per arxiv_id -- every chunk of that paper, not just what a query
+    would surface."""
 
-    def __init__(self, by_query=None, default=(), coverage=None, neighbours=None, by_paper=()):
+    def __init__(self, by_query=None, default=(), coverage=None, neighbours=None, by_paper=(),
+                full_papers=None):
         self.by_query = by_query or {}
         self.default = list(default)
         self.queries = []
         self._coverage = {"chunks": 100, "papers": 20} if coverage is None else coverage
         self._neighbours = neighbours or {}
         self._by_paper = {p.arxiv_id: p for p in by_paper}
+        self._full_papers = full_papers or {}
 
     def search(self, query, k=8, papers=None):
         self.queries.append(query)
@@ -71,6 +75,9 @@ class FakeCorpus:
 
     def coverage(self, query):
         return dict(self._coverage)
+
+    def full_paper(self, arxiv_id, version, *, max_chunks=30):
+        return list(self._full_papers.get(arxiv_id, ()))[:max_chunks]
 
     def neighbours(self, arxiv_id):
         found = self._neighbours.get(arxiv_id, {})

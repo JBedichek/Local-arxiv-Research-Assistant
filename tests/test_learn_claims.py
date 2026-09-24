@@ -312,7 +312,7 @@ def test_build_walks_citations_from_a_facets_top_result_when_the_budget_allows_i
     out = run(CL.build(m, fc, concept()))
     trace = out["trace"]
     assert trace["budget"]["tier"] == "rich" and trace["budget"]["citation_walk"] is True
-    [round_] = [r for r in trace["rounds"] if not r["widened"]]
+    [round_] = [r for r in trace["rounds"] if r["round"] == 1]
     assert round_["citation_papers_tried"] == 1 and round_["citation_passages_kept"] == 1
     assert {c["passage"]["arxiv_id"] for c in out["claims"]} == {"2401.1", "2402.2"}
 
@@ -342,3 +342,111 @@ def test_build_trace_reports_coverage_budget_and_per_facet_rounds():
     assert trace["budget"]["tier"] == "typical"
     assert trace["rounds"][0]["facet"] == "warmup basics" and trace["rounds"][0]["claims"] == 1
     assert trace["claims"] == 1 and trace["papers"] == 1 and "ms" in trace
+
+
+# ── decision loop / named gap ────────────────────────────────────────────────────
+
+def test_facet_gap_returns_the_facet_itself_when_claims_are_still_thin():
+    claims = [CL.Claim("c1", "Warmup avoids early loss spikes.", passage(1, LONG).to_dict())]
+    m = llm(("remains worth one more search", "should not be called"))
+    assert run(CL._facet_gap(m, "warmup basics", claims)) == "warmup basics"
+    assert m.calls == [], "too few claims to reason about -- no call needed"
+
+
+def test_facet_gap_names_a_specific_missing_angle():
+    claims = [CL.Claim("c1", "Warmup ramps the rate up.", passage(1, LONG).to_dict()),
+             CL.Claim("c2", "The ramp is usually linear.", passage(2, LONG).to_dict())]
+    m = llm(("remains worth one more search", json.dumps({"gap": "warmup empirical results"})))
+    assert run(CL._facet_gap(m, "warmup basics", claims)) == "warmup empirical results"
+    assert "FACET: warmup basics" in m.calls[0][1] and "Warmup ramps the rate up." in m.calls[0][1]
+
+
+def test_facet_gap_is_empty_when_the_model_finds_nothing_missing():
+    claims = [CL.Claim("c1", "a", passage(1, LONG).to_dict()), CL.Claim("c2", "b", passage(2, LONG).to_dict())]
+    assert run(CL._facet_gap(llm(("remains worth one more search", "null")), "warmup basics", claims)) == ""
+
+
+def test_build_runs_a_gap_driven_third_round_when_the_richest_budget_names_one():
+    p1, p2 = passage(1, LONG, arxiv="2401.1"), passage(2, LONG, arxiv="2402.2")
+    p3 = passage(3, LONG, arxiv="2403.3")
+    fc = FakeCorpus(by_query={"warmup basics": [p1, p2], "warmup numbers": [p3]},
+                    coverage={"chunks": 50, "papers": 20})
+
+    def extract_by_query(system, prompt):
+        if "warmup numbers" in prompt:
+            return json.dumps([{"passage": 1, "claim": "Third round claim about numbers."}])
+        return json.dumps([{"passage": 1, "claim": "Warmup ramps the rate up."},
+                           {"passage": 2, "claim": "The ramp is usually linear."}])
+
+    m = llm(("choosing what a learner needs evidence", json.dumps(["warmup basics"])),
+            ("extract atomic claims", extract_by_query), ("strict fact-checker", "supports"),
+            ("compare two claims", '{"relation": "unrelated", "note": ""}'),
+            ("remains worth one more search", json.dumps({"gap": "warmup numbers"})))
+    out = run(CL.build(m, fc, concept()))
+    trace = out["trace"]
+    assert {r["round"] for r in trace["rounds"]} == {1, 3}, "round 2 never fires -- round 1 was not thin"
+    third = next(r for r in trace["rounds"] if r["round"] == 3)
+    assert third["query"] == "warmup numbers" and third["claims"] == 1
+    assert out["stats"]["facets_gap_researched"] == 1
+    assert {c["text"] for c in out["claims"]} >= {"Third round claim about numbers."}
+
+
+def test_build_skips_the_gap_round_when_the_budget_is_not_rich():
+    fc = FakeCorpus(default=[passage(1, LONG, arxiv="2401.1"), passage(2, LONG, arxiv="2402.2")],
+                    coverage={"chunks": 8, "papers": 6})   # typical tier
+    items = [{"passage": 1, "claim": "Warmup ramps the rate up."}, {"passage": 2, "claim": "The ramp is linear."}]
+    m = llm(("choosing what a learner needs evidence", json.dumps(["warmup basics"])),
+            ("extract atomic claims", json.dumps(items)), ("strict fact-checker", "supports"),
+            ("compare two claims", '{"relation": "unrelated", "note": ""}'),
+            ("remains worth one more search", json.dumps({"gap": "should not be reached"})))
+    out = run(CL.build(m, fc, concept()))
+    assert out["trace"]["budget"]["tier"] == "typical" and out["trace"]["budget"]["gap_round"] is False
+    assert {r["round"] for r in out["trace"]["rounds"]} == {1}
+    assert out["stats"]["facets_gap_researched"] == 0
+
+
+# ── full-paper read ───────────────────────────────────────────────────────────────
+
+def test_build_reads_a_dominant_papers_full_text_when_one_paper_anchors_a_round():
+    dense_chunk = passage(1, LONG, arxiv="2401.1")
+    full_chunks = [passage(1, LONG, arxiv="2401.1"), passage(2, LONG, arxiv="2401.1"),
+                  passage(3, LONG, arxiv="2401.1")]
+    fc = FakeCorpus(default=[dense_chunk], coverage={"chunks": 50, "papers": 20},
+                    full_papers={"2401.1": full_chunks})
+    items = [{"passage": 1, "claim": "First finding from the paper."},
+             {"passage": 2, "claim": "Second finding from the paper."},
+             {"passage": 3, "claim": "Third finding from the paper."}]
+    m = llm(("choosing what a learner needs evidence", json.dumps(["warmup basics"])),
+            ("extract atomic claims", json.dumps(items)), ("strict fact-checker", "supports"),
+            ("remains worth one more search", "null"))
+    out = run(CL.build(m, fc, concept()))
+    [round1] = [r for r in out["trace"]["rounds"] if r["round"] == 1]
+    assert round1["full_paper_read"] == "2401.1"
+    assert len(out["claims"]) == 3, "all three of the paper's chunks were read, not just the one dense search found"
+
+
+def test_build_does_not_read_the_full_paper_when_more_than_one_paper_was_found():
+    p1, p2 = passage(1, LONG, arxiv="2401.1"), passage(2, LONG, arxiv="2402.2")
+    fc = FakeCorpus(default=[p1, p2], coverage={"chunks": 50, "papers": 20},
+                    full_papers={"2401.1": [p1, passage(9, LONG, arxiv="2401.1")]})
+    items = [{"passage": 1, "claim": "Warmup avoids early loss spikes."},
+             {"passage": 2, "claim": "A second, corroborating result."}]
+    m = llm(("choosing what a learner needs evidence", json.dumps(["warmup basics"])),
+            ("extract atomic claims", json.dumps(items)), ("strict fact-checker", "supports"),
+            ("compare two claims", '{"relation": "unrelated", "note": ""}'),
+            ("remains worth one more search", "null"))
+    out = run(CL.build(m, fc, concept()))
+    [round1] = [r for r in out["trace"]["rounds"] if r["round"] == 1]
+    assert round1["full_paper_read"] == ""
+
+
+def test_build_skips_the_full_paper_read_when_the_budget_is_not_rich():
+    fc = FakeCorpus(default=[passage(1, LONG, arxiv="2401.1")], coverage={"chunks": 8, "papers": 6},
+                    full_papers={"2401.1": [passage(1, LONG, arxiv="2401.1"), passage(2, LONG, arxiv="2401.1")]})
+    m = llm(("choosing what a learner needs evidence", json.dumps(["warmup basics"])),
+            ("extract atomic claims", extract_reply([{"passage": 1, "claim": "Warmup avoids early loss spikes."}])[1]),
+            ("strict fact-checker", "supports"))
+    out = run(CL.build(m, fc, concept()))
+    assert out["trace"]["budget"]["tier"] == "typical" and out["trace"]["budget"]["full_paper"] is False
+    [round1] = [r for r in out["trace"]["rounds"] if r["round"] == 1]
+    assert round1["full_paper_read"] == ""

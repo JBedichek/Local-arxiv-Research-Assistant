@@ -50,12 +50,18 @@ SAME_PAPER_COSINE = 0.62
 #: leaves real material unread.
 COVERAGE_THIN = 3
 COVERAGE_RICH = 15
-#: (facets, passages per query, citation walk on?) by coverage tier -- thin/typical/rich.
-BUDGETS = {"thin": {"facets": 3, "per_query": 6, "citation_walk": False},
-          "typical": {"facets": MAX_FACETS, "per_query": 8, "citation_walk": True},
-          "rich": {"facets": 8, "per_query": 12, "citation_walk": True}}
-#: Citation neighbours (of a facet's own top result) tried per facet, at most.
+#: (facets, passages per query, citation walk?, a gap-driven extra round?, a full-paper read
+#: when one paper dominates a round?) by coverage tier -- thin/typical/rich. The extra depth
+#: (gap round, full paper) is reserved for the richest tier: both cost real extra calls, and
+#: are only worth paying for where the corpus can actually support going deeper.
+BUDGETS = {"thin": {"facets": 3, "per_query": 6, "citation_walk": False, "gap_round": False, "full_paper": False},
+          "typical": {"facets": MAX_FACETS, "per_query": 8, "citation_walk": True, "gap_round": False, "full_paper": False},
+          "rich": {"facets": 8, "per_query": 12, "citation_walk": True, "gap_round": True, "full_paper": True}}
+#: Citation neighbours (of a round's own top result) tried per round, at most.
 CITATION_NEIGHBOURS = 6
+#: Claims shown to the gap check, at most -- enough to judge coverage without an unbounded
+#: prompt once a facet has accumulated a couple of rounds.
+MAX_GAP_LISTING = 12
 
 FACETS_SYSTEM = """You are choosing what a learner needs evidence for, to fully understand one \
 concept from a research-paper corpus, before a lesson on it is written.
@@ -69,6 +75,17 @@ adapted to what actually matters for THIS concept and the learner's goal. Fewer 
 the concept genuinely has fewer distinct angles; skip one that does not apply to it.
 - Each facet should surface different passages than the others -- do not just reword the \
 concept's title several times."""
+
+FACET_GAP_SYSTEM = """A concept's research is organized by facet (angle). Look at the claims \
+found so far for one facet and judge whether a real, specific gap remains worth one more search.
+
+Reply with JSON only: {"gap": "..."} or the word null.
+
+- "gap": a short, specific search query for what these claims do not cover but the facet is \
+about -- a concrete number, mechanism, comparison or limitation, not already stated. Not "more \
+detail" or "more sources" -- name the actual missing thing.
+- null if the claims already cover the facet's angle reasonably, or if what seems to be missing \
+is unlikely to exist in a paper corpus -- do not chase something that probably is not there."""
 
 EXTRACT_SYSTEM = """You extract atomic claims about a concept from numbered passages of \
 research papers.
@@ -165,6 +182,19 @@ def budget(coverage: dict) -> dict:
     re-finding the same handful of passages, not more material. A corpus rich in it gets more
     facets, a wider net per facet, and a citation walk on top of similarity search."""
     return {"tier": (tier := coverage_tier(coverage)), **BUDGETS[tier]}
+
+
+async def _facet_gap(llm: Llm, facet: str, claims: list[Claim]) -> str:
+    """A short follow-up query naming what a facet's research still misses, or "" if it looks
+    adequately covered. Below MIN_FACET_CLAIMS is always a gap -- broaden the same facet, no
+    need to ask why -- so the model is only asked to judge and name one once there is enough
+    found to reason about."""
+    if len(claims) < MIN_FACET_CLAIMS:
+        return facet
+    listing = "\n".join(f"- {c.text}" for c in claims[:MAX_GAP_LISTING])
+    data = await llm.ask_json(FACET_GAP_SYSTEM, f"FACET: {facet}\n\nCLAIMS FOUND SO FAR:\n{listing}",
+                              default=20, cap=200, stage="learn_facet_gap")
+    return str(data.get("gap") or "").strip() if isinstance(data, dict) else ""
 
 
 async def facets(llm: Llm, concept: dict, *, max_facets: int = MAX_FACETS) -> list[str]:
@@ -354,21 +384,23 @@ def _merge_facets(groups: list[list[Claim]]) -> list[Claim]:
 
 async def build(llm: Llm, corpus, concept: dict, *, embed=None) -> dict:
     """Researches one facet at a time (see `facets`), sized by a cheap coverage probe (see
-    `budget`) instead of one fixed effort for every concept, then widens the search once for
-    any facet that came back thin, so a lesson has more than whatever a handful of passages
-    nearest the title happened to say. Also returns a `trace`: the coverage probe, the budget
-    it picked, and a per-facet record of what was searched and found -- for a build's own
-    profiling view, not just its output."""
+    `budget`) instead of one fixed effort for every concept. A facet with too few claims is
+    widened against a broader slice of the corpus; the richest budget goes further still,
+    asking after that whether a real, specific gap remains (see `_facet_gap`) and running one
+    more round on just that -- not a third blind retry, one the model judged worth it -- and
+    reading a round's one dominant paper whole (see `CorpusRetriever.full_paper`) when its
+    passages turn out to come from nowhere else. Also returns a `trace`: the coverage probe,
+    the budget it picked, and a per-round record of what was searched and found -- for a
+    build's own profiling view, not just its output."""
     t0 = time.time()
     coverage = await asyncio.to_thread(
         corpus.coverage, f"{concept['title']} {concept.get('summary', '')}".strip())
     bud = budget(coverage)
     queries = await facets(llm, concept, max_facets=bud["facets"])
 
-    async def citation_round(facet: str, dense: list[Passage], exclude: frozenset) -> tuple[list[Passage], dict]:
-        """The facet's own top result's citation neighbours, searched once for this facet --
-        {} straight away when the budget has the citation walk off, or there is nothing to
-        walk from yet."""
+    async def citation_round(query: str, dense: list[Passage], exclude: frozenset) -> tuple[list[Passage], dict]:
+        """The round's own top result's citation neighbours, searched once -- {} straight away
+        when the budget has the citation walk off, or there is nothing to walk from yet."""
         if not bud["citation_walk"] or not dense:
             return [], {"tried": 0, "kept": 0}
         nb = await asyncio.to_thread(corpus.neighbours, dense[0].arxiv_id)
@@ -377,25 +409,65 @@ async def build(llm: Llm, corpus, concept: dict, *, embed=None) -> dict:
             a for a in (nb.get("cites", []) + nb.get("cited_by", [])) if a not in have))[:CITATION_NEIGHBOURS]
         if not neighbours:
             return [], {"tried": 0, "kept": 0}
-        found = await gather_citation_passages(corpus, facet, neighbours, per_query=bud["per_query"], exclude=exclude)
+        found = await gather_citation_passages(corpus, query, neighbours, per_query=bud["per_query"], exclude=exclude)
         return found, {"tried": len(neighbours), "kept": len(found)}
 
-    async def one(facet: str, exclude: frozenset, *, widened: bool = False):
-        dense = await gather_passages(corpus, concept, focus=facet, exclude=exclude, per_query=bud["per_query"])
-        cited, cite_stats = await citation_round(facet, dense, exclude | frozenset(p.chunk_id for p in dense))
+    async def full_paper_round(passages: list[Passage], exclude: frozenset) -> tuple[list[Passage], str]:
+        """Every chunk of a round's one dominant paper, when its passages came from nowhere
+        else -- what similarity search over a few isolated chunks of it could have missed.
+        Unchanged when the budget has this off, more than one paper showed up, or reading the
+        whole paper would not actually add anything beyond what was already found."""
+        papers_found = {p.arxiv_id for p in passages}
+        if not bud["full_paper"] or len(papers_found) != 1 or not passages:
+            return passages, ""
+        [only] = papers_found
+        whole = await asyncio.to_thread(corpus.full_paper, only, passages[0].version)
+        whole = [p for p in whole if p.chunk_id not in exclude]
+        if len(whole) <= len(passages):
+            return passages, ""
+        return whole, only
+
+    async def one(facet: str, query: str, exclude: frozenset, *, round_n: int) -> tuple:
+        """One research round on `query` (the facet itself for round 1, or a later round's
+        named gap); citation walk and full-paper read only apply to a facet's first round,
+        where "the round's own top result" still means the facet as a whole."""
+        dense = await gather_passages(corpus, concept, focus=query, exclude=exclude, per_query=bud["per_query"])
+        cited, cite_stats = ([], {"tried": 0, "kept": 0})
+        if round_n == 1:
+            cited, cite_stats = await citation_round(query, dense, exclude | frozenset(p.chunk_id for p in dense))
         passages = dense + cited
-        claims, dropped, merged, off_topic = await extract(llm, concept, passages, embed=embed, focus=facet)
-        round_ = {"facet": facet, "widened": widened, "dense_retrieved": len(dense),
+        full_paper_id = ""
+        if round_n == 1:
+            passages, full_paper_id = await full_paper_round(passages, exclude)
+        claims, dropped, merged, off_topic = await extract(llm, concept, passages, embed=embed, focus=query)
+        round_ = {"facet": facet, "round": round_n, "query": query, "dense_retrieved": len(dense),
                  "citation_papers_tried": cite_stats["tried"], "citation_passages_kept": cite_stats["kept"],
-                 "claims": len(claims)}
+                 "full_paper_read": full_paper_id, "claims": len(claims)}
         return claims, frozenset(p.chunk_id for p in passages), (len(passages), dropped, merged, off_topic), round_
 
-    first = await asyncio.gather(*(one(f, frozenset()) for f in queries))
+    first = await asyncio.gather(*(one(f, f, frozenset(), round_n=1) for f in queries))
     used = frozenset(cid for _, exhausted, _, _ in first for cid in exhausted)
     thin = [f for f, (claims, _, _, _) in zip(queries, first) if len(claims) < MIN_FACET_CLAIMS]
-    widened = await asyncio.gather(*(one(f, used, widened=True) for f in thin)) if thin else []
+    widened = await asyncio.gather(*(one(f, f, used, round_n=2) for f in thin)) if thin else []
 
-    rounds = first + widened
+    # What each facet has found across rounds 1-2, for the gap check and (if it names one) the
+    # round-3 search to exclude -- not just round 1's, or a widened facet's gap round would
+    # re-tread round 2's own passages.
+    accum: dict[str, tuple[list[Claim], frozenset]] = {
+        f: (list(c), x) for f, (c, x, _, _) in zip(queries, first)}
+    for f, (c, x, _, _) in zip(thin, widened):
+        prior_claims, prior_exclude = accum[f]
+        accum[f] = (prior_claims + c, prior_exclude | x)
+
+    gapped: list[str] = []
+    third: list = []
+    if bud["gap_round"]:
+        found_gaps = await asyncio.gather(*(_facet_gap(llm, f, accum[f][0]) for f in queries))
+        gaps = {f: g for f, g in zip(queries, found_gaps) if g}
+        gapped = list(gaps)
+        third = await asyncio.gather(*(one(f, gaps[f], accum[f][1], round_n=3) for f in gapped)) if gapped else []
+
+    rounds = first + widened + third
     claims = _merge_facets([c for c, _, _, _ in rounds])
     compared = await relate(llm, claims, embed=embed)
     stats = [s for _, _, s, _ in rounds]
@@ -403,7 +475,7 @@ async def build(llm: Llm, corpus, concept: dict, *, embed=None) -> dict:
             "stats": {"passages": sum(s[0] for s in stats), "unfaithful_dropped": sum(s[1] for s in stats),
                       "repeats_merged": sum(s[2] for s in stats), "off_topic_dropped": sum(s[3] for s in stats),
                       "cross_facet_merged": sum(len(g) for g, _, _, _ in rounds) - len(claims),
-                      "comparisons": compared, "facets_widened": len(thin)},
+                      "comparisons": compared, "facets_widened": len(thin), "facets_gap_researched": len(gapped)},
             "trace": {"coverage": coverage, "budget": bud, "rounds": [r for _, _, _, r in rounds],
                       "claims": len(claims), "papers": len({c.paper for c in claims}),
                       "comparisons": compared, "ms": round((time.time() - t0) * 1000)}}
