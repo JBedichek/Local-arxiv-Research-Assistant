@@ -81,3 +81,17 @@ def test_prompt_carries_certainty_conditions_conflicts_and_prereqs():
     prompt = m.calls[0][1]
     assert "contested; 2024-01-01; conditions: 1B" in prompt and "[c1] vs [c2] (contradict): opposite" in prompt
     assert "Gradient descent" in prompt
+
+
+def test_a_standard_lesson_caps_at_the_strongest_claims_not_everything_found():
+    # A rich retrieval pass can produce far more claims than one flat lesson prompt should try
+    # to teach from in one sitting (see MAX_LESSON_CLAIMS) -- more than the cap, all but a
+    # handful "single-source" so sorting-strongest-first is what has to keep the established
+    # ones in, not just whichever came first.
+    many = [claim(f"c{i}", f"Finding number {i}.", "single-source") for i in range(1, 60)]
+    strong = [claim("c60", "The one established finding.", "established")]
+    m = llm(("CLAIMS:\n[c60]", "## X\nThe established finding [c60]."), ("CLAIM:", "supports"))
+    run(LE.compose(m, CONCEPT, many + strong, [], []))
+    prompt = m.calls[0][1]
+    assert prompt.count("\n[c") <= LE.MAX_LESSON_CLAIMS
+    assert "[c60]" in prompt, "the established claim outranks the single-source ones and survives the cap"

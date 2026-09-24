@@ -13,6 +13,13 @@ from lara.learn import judge as J
 from lara.learn.llm import Llm
 
 MIN_CLAIMS = 2
+#: A standard lesson is one flat prompt and one generation, read in one sitting -- not a
+#: retrieval-depth cap (facets/rounds/citation-walk/full-paper stay as thorough as the corpus
+#: earns, see claims.py), just how much one lesson tries to teach at once. usable() sorts
+#: strongest-first, so this keeps the best claims, not an arbitrary slice. A deep/"thorough"
+#: lesson (depth.py) fans claims out across many sections instead and does not go through
+#: this cap -- it calls usable() itself, not compose()'s capped copy.
+MAX_LESSON_CLAIMS = 40
 
 LESSON_SYSTEM = """You write a lesson on one concept for a learner, using ONLY the numbered \
 claims provided.
@@ -101,7 +108,7 @@ def lessons_of(content: dict) -> dict[str, dict]:
 
 async def compose(llm: Llm, concept: dict, claims: list[dict], conflicts: list[dict],
                   prereq_titles: list[str], *, length_note: str = "") -> dict:
-    claims = usable(claims)
+    claims = usable(claims)[:MAX_LESSON_CLAIMS]
     if len(claims) < MIN_CLAIMS:
         return {"insufficient": True, "sections": [], "generated": time.time(),
                 "message": "The paper corpus holds too little verifiable material on this "
