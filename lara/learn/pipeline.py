@@ -1,6 +1,6 @@
-"""Runs a course: scope -> map, then each concept on demand (claims -> lesson -> quiz ->
-visuals), so a learner never waits on -- or pays for -- concepts they have not reached. A
-concept already built by an earlier course is reused if recent enough."""
+"""Runs a course: scope -> map, then each concept on demand (claims -> lesson -> topics ->
+quiz -> visuals), so a learner never waits on -- or pays for -- concepts they have not reached.
+A concept already built by an earlier course is reused if recent enough."""
 
 from __future__ import annotations
 
@@ -15,13 +15,15 @@ from lara.learn import learner as LN
 from lara.learn import lesson as LE
 from lara.learn import quiz as QZ
 from lara.learn import store
+from lara.learn import topics as TP
 from lara.learn import visuals as VS
 from lara.learn.llm import Llm
 
-STAGES = ("claims", "lesson", "quiz", "visuals")
-#: What a diagnostic needs from a concept -- no lesson or visuals.
+STAGES = ("claims", "lesson", "topics", "quiz", "visuals")
+#: What a diagnostic needs from a concept -- no lesson, topics or visuals.
 PRETEST_STAGES = ("claims", "quiz")
 _building: dict[tuple[str, str], asyncio.Task] = {}
+_building_topic: dict[tuple[str, str, str], asyncio.Task] = {}
 _editing: dict[tuple[str, str], asyncio.Lock] = {}
 _writing: dict[tuple[str, str, str], asyncio.Task] = {}
 #: Quiz items a concept may hold once deeper lessons have added claims to it.
@@ -66,13 +68,17 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
         if stage == "claims":
             content.update(await CL.build(llm, corpus, concept, embed=embed))
             # Claims are renumbered, so answers and extra lesson versions that cite the old
-            # keys would now point at different claims.
+            # keys would now point at different claims. Topics are re-indexed from the new
+            # lesson once it is written, so old ones (and their docs) would not match either.
             content.pop("lessons", None)
             content.pop("expansions", None)
+            content.pop("topic_docs", None)
         elif stage == "lesson":
             content["lesson"] = await LE.compose(llm, concept, content.get("claims", []),
                                                  content.get("conflicts", []),
                                                  [prereqs[p] for p in concept["prereqs"]])
+        elif stage == "topics":
+            content["topics"] = await TP.extract_topics(llm, concept, content.get("lesson"))
         elif stage == "quiz":
             content["quiz"] = await QZ.build(llm, concept, content.get("claims", []))
         elif stage == "visuals":
@@ -105,6 +111,52 @@ def ensure_concept(llm: Llm, corpus, course: dict, cid: str, **kw) -> asyncio.Ta
         _building[key] = task
         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
     return task
+
+
+async def set_familiarity(llm: Llm, corpus, course: dict, learner: dict, cid: str, topic_id: str,
+                          answer: str, explain: str, *, embed=None) -> dict:
+    """Records how familiar the learner says they are with one of the lesson's indexed topics.
+    "no" and "partial" start (or reuse) that topic's background document in the background --
+    "yes" just records the answer, nothing is written for a topic the learner already knows."""
+    LN.set_topic_familiarity(learner, cid, topic_id, answer, explain)
+    store.save_learner(course["id"], learner)
+    if answer in ("no", "partial"):
+        ensure_topic_doc(llm, corpus, course, cid, topic_id, tailor=explain if answer == "partial" else "", embed=embed)
+    return LN.concept_state(learner, cid)
+
+
+def ensure_topic_doc(llm: Llm, corpus, course: dict, cid: str, topic_id: str, *, tailor: str = "",
+                     embed=None) -> asyncio.Task:
+    """The one running build of this topic's document, started if there is none."""
+    key = (course["id"], cid, topic_id)
+    task = _building_topic.get(key)
+    if task is None or task.done():
+        task = asyncio.ensure_future(_build_topic_doc(llm, corpus, course, cid, topic_id, tailor, embed))
+        _building_topic[key] = task
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+    return task
+
+
+async def _build_topic_doc(llm: Llm, corpus, course: dict, cid: str, topic_id: str, tailor: str,
+                           embed) -> None:
+    concept = {**next(c for c in course["concepts"] if c["id"] == cid), "goal": course["goal"]}
+    lock = _editing.setdefault((course["id"], cid), asyncio.Lock())
+    async with lock:
+        content = store.load_concept(course["id"], cid) or {}
+        topic = next((t for t in content.get("topics", []) if t["id"] == topic_id), None)
+        if topic is None:
+            return
+        content.setdefault("topic_docs", {})[topic_id] = {"status": "building", "tailor": tailor, "doc": None}
+        store.save_concept(course["id"], cid, content)
+    try:
+        doc = await TP.build_doc(llm, corpus, concept, topic, tailor=tailor, embed=embed)
+    except Exception as e:                                        # noqa: BLE001
+        doc = {"insufficient": True, "sections": [], "claims": [], "chart": None,
+              "message": f"{type(e).__name__}: {e}"}
+    async with lock:
+        content = store.load_concept(course["id"], cid) or {}
+        content.setdefault("topic_docs", {})[topic_id] = {"status": "done", "tailor": tailor, "doc": doc}
+        store.save_concept(course["id"], cid, content)
 
 
 async def expand_selection(llm: Llm, corpus, course: dict, cid: str, *, selection: str,

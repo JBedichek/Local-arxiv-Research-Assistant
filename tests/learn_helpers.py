@@ -65,7 +65,10 @@ def corpus():
                                passage(2, LONG + " More.", arxiv="2402.2", title="Second paper", date="2024-03-01")])
 
 
-def model():
+def model(*extra):
+    """`extra` rules are appended after the built-in ones (still checked in order, so a built-in
+    needle always wins unless a test's own is more specific) -- lets a test add a topics or
+    topic-doc reply without restating this whole fixture."""
     concepts = [{"id": "a", "title": "Warmup", "summary": "s", "passages": [1, 2], "competencies": ["choose-a-schedule"]},
                 {"id": "b", "title": "Decay", "summary": "d", "passages": [1], "prereqs": ["a"], "competencies": ["choose-a-schedule"]}]
     claims = [{"passage": 1, "claim": "Warmup avoids early loss spikes.", "conditions": "1B", "kind": "finding"},
@@ -81,4 +84,4 @@ def model():
                ("Write quiz items", json.dumps(quiz)),
                ("ONLY the passage", "A"),
                ("pick ONE quantity", "null"), ("small diagram", "null"),
-               ("review a learner", "[]"))
+               ("review a learner", "[]"), *extra)

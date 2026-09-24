@@ -46,6 +46,13 @@ def appcss() -> FileResponse:
     return FileResponse(WEB_ROOT / "style.css", media_type="text/css", headers=_NOCACHE)
 
 
+@router.get("/topic.html")
+def topic_page() -> FileResponse:
+    """The standalone page a lesson's "Background" link opens in its own tab -- one topic's
+    document, read-only, no app shell."""
+    return FileResponse(WEB_ROOT / "topic.html", headers=_NOCACHE)
+
+
 @router.get("/p/{arxiv_id:path}")
 def reader(arxiv_id: str) -> FileResponse:
     """Deep links land here; the client reads the id and fragment from the URL."""

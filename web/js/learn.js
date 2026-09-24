@@ -6,6 +6,7 @@
 
 import { $, escapeHtml } from "./dom.js";
 import { renderMath } from "./tex.js";
+import { chartSvg } from "./chart.js";
 import * as VOICE from "./voice.js";
 
 /* lara's api.js returns parsed JSON and throws the raw response text; the Learn endpoints
@@ -43,6 +44,7 @@ const L = {
   claim: "", item: null, graded: null, pretest: null, error: "", busy: "",
   open: false, requested: new Set(), autostart: false, poll: 0, critique: null, items: {},
   pending: null, ask: null, asking: false, askResult: "", variant: "standard",
+  partialOpen: "",
 };
 
 /* Lesson/claim/quiz text comes from the model, reading real papers -- 66% of chunks
@@ -89,7 +91,8 @@ function schedulePoll() {
 
 function buildingNow(concept) {
   const s = concept.build?.stage;
-  return L.requested.has(concept.id) && s && !["done", "error"].includes(s);
+  const stageBuilding = L.requested.has(concept.id) && s && !["done", "error"].includes(s);
+  return stageBuilding || (concept.topics || []).some((t) => t.doc_status === "building");
 }
 
 async function refresh() {
@@ -342,6 +345,7 @@ async function openConcept(cid) {
   L.conceptId = cid;
   L.claim = "";
   L.critique = null;
+  L.partialOpen = "";
   try {
     L.concept = await fetchConcept(cid);
   } catch (err) {
@@ -648,40 +652,63 @@ function conflictsView(concept) {
     ${rest.length ? `<details><summary>${rest.length} more</summary><ul class="conflicts">${rest.map(row).join("")}</ul></details>` : ""}`;
 }
 
-function chartSvg(v) {
-  const W = 520, H = 220, pad = 40, max = Math.max(...v.points.map((p) => p.value), 0) || 1;
-  const bw = (W - pad * 2) / v.points.length;
-  const bars = v.points.map((p, i) => {
-    const h = Math.max(2, (p.value / max) * (H - pad * 2));
-    const x = pad + i * bw + bw * 0.15, y = H - pad - h;
-    return v.chart === "line"
-      ? `<circle cx="${x + bw * 0.35}" cy="${y}" r="4" class="pt"/>`
-      : `<rect x="${x}" y="${y}" width="${bw * 0.7}" height="${h}" rx="3" class="bar"/>`
-      + `<text x="${x + bw * 0.35}" y="${y - 4}" text-anchor="middle" class="val">${p.value}</text>`
-      + `<text x="${x + bw * 0.35}" y="${H - pad + 14}" text-anchor="middle" class="lab">${escapeHtml(String(p.label).slice(0, 14))}</text>`;
-  }).join("");
-  const line = v.chart === "line" ? `<polyline class="ln" points="${v.points.map((p, i) => `${pad + i * bw + bw * 0.5},${H - pad - Math.max(2, (p.value / max) * (H - pad * 2))}`).join(" ")}"/>`
-    + v.points.map((p, i) => `<text x="${pad + i * bw + bw * 0.5}" y="${H - pad + 14}" text-anchor="middle" class="lab">${escapeHtml(String(p.label).slice(0, 14))}</text>`).join("") : "";
-  return `<div class="learn-card"><p><b>${md(v.title)}</b> <span class="hint">${md(v.y_label || "")} · every number is in its claim: ${v.claims.map(escapeHtml).join(", ")}</span></p>
-    <div class="svg-wrap"><svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img">
-    <line x1="${pad}" y1="${H - pad}" x2="${W - pad}" y2="${H - pad}" class="axis"/>${line}${bars}</svg></div></div>`;
-}
-
 function conceptView(concept) {
   const built = concept.build?.stage === "done" || concept.lesson;
   const notBuilt = !built ? `<div class="learn-card"><p>${buildingNow(concept) ? `Building… <span class="hint">step: ${escapeHtml(concept.build.stage)}</span>` : "This concept has not been built yet."}</p>
     ${buildingNow(concept) ? "" : `<button type="button" data-learn="build" data-id="${escapeHtml(concept.id)}">Build it from the papers</button>`}</div>` : "";
+  const unanswered = (concept.topics || []).filter((t) => !t.answer);
+  const gated = built && unanswered.length > 0;
   const list = concept.claims.map((k) => `<li><span class="ck ${k.key === L.claim ? "on" : ""}" data-learn="claim" data-claim="${escapeHtml(k.key)}">${escapeHtml(k.key)}</span> ${badge(k.certainty)} ${md(k.text)}${k.withdrawn ? ' <span class="err">withdrawn</span>' : ""}</li>`).join("");
   const s = concept.stats || {};
+  const lesson = gated ? "" : `${backgroundLinks(concept)}${concept.lesson ? variantBar(concept) : ""}${lessonBody(concept)}${claimShownInLesson(concept) ? "" : claimCard(concept)}${conflictsView(concept)}
+    ${concept.lesson && !concept.lesson.insufficient ? critiqueBox(concept) : ""}
+    ${concept.lesson ? `<p><button type="button" data-learn="read" data-id="${escapeHtml(concept.id)}">I've read this — start practice</button>
+      <button type="button" class="link" data-learn="build" data-id="${escapeHtml(concept.id)}" data-force="1">Refresh from the corpus</button></p>` : ""}
+    <details><summary>All ${concept.claims.length} claims and their sources${s.unfaithful_dropped ? ` · ${s.unfaithful_dropped} extractions dropped as unfaithful` : ""}</summary><ul class="claims">${list}</ul></details>`;
   return `<div class="learn-concept">
     <button type="button" class="link" data-learn="close-concept">← back to your path</button>
     <h3>${md(concept.title)}</h3><p class="hint">${md(concept.summary)}
       ${concept.reused ? " · reused from an earlier course" : ""}</p>
-    ${notBuilt}${concept.lesson ? variantBar(concept) : ""}${lessonBody(concept)}${claimShownInLesson(concept) ? "" : claimCard(concept)}${conflictsView(concept)}
-    ${concept.lesson && !concept.lesson.insufficient ? critiqueBox(concept) : ""}
-    ${concept.lesson ? `<p><button type="button" data-learn="read" data-id="${escapeHtml(concept.id)}">I've read this — start practice</button>
-      <button type="button" class="link" data-learn="build" data-id="${escapeHtml(concept.id)}" data-force="1">Refresh from the corpus</button></p>` : ""}
-    <details><summary>All ${concept.claims.length} claims and their sources${s.unfaithful_dropped ? ` · ${s.unfaithful_dropped} extractions dropped as unfaithful` : ""}</summary><ul class="claims">${list}</ul></details></div>`;
+    ${notBuilt}${gated ? topicsGate(concept, unanswered) : ""}${lesson}</div>`;
+}
+
+/* The blocking gate: every topic the lesson leans on without teaching gets a yes/no/partial
+ * answer before the lesson prose is shown at all, so a reader never meets an assumption they
+ * cannot place without first saying so. */
+function topicsGate(concept, unanswered) {
+  const rows = unanswered.map((t) => {
+    const open = L.partialOpen === t.id;
+    return `<div class="topic-gate-row">
+      <p><b>${md(t.title)}</b>${t.note ? ` <span class="hint">— ${md(t.note)}</span>` : ""}</p>
+      <div class="topic-gate-buttons">
+        <button type="button" data-learn="familiarity" data-id="${escapeHtml(concept.id)}" data-topic="${escapeHtml(t.id)}" data-answer="yes">I know this</button>
+        <button type="button" data-learn="familiarity" data-id="${escapeHtml(concept.id)}" data-topic="${escapeHtml(t.id)}" data-answer="no">Not familiar</button>
+        <button type="button" class="${open ? "on" : ""}" data-learn="familiarity-partial-open" data-topic="${escapeHtml(t.id)}">Partially…</button>
+      </div>
+      ${open ? `<div class="topic-gate-partial">
+        <textarea id="topic-explain-${escapeHtml(t.id)}" rows="2" required placeholder="What do you already know, and what don't you? (required)"></textarea>
+        <button type="button" data-learn="familiarity" data-id="${escapeHtml(concept.id)}" data-topic="${escapeHtml(t.id)}" data-answer="partial">Submit</button>
+      </div>` : ""}
+    </div>`;
+  }).join("");
+  return `<div class="learn-card topics-gate">
+    <p><b>Before the lesson:</b> it leans on a few things without explaining them. Say what you already know about each, and we'll fill in just what's missing.</p>
+    ${rows}</div>`;
+}
+
+/* Once past the gate, a "no" or "partial" topic's document is either ready to open (in its own
+ * tab, so the lesson's own place is never lost) or still being written -- a "yes" is recorded
+ * but nothing was generated for it, so it gets no link. */
+function backgroundLinks(concept) {
+  const shown = (concept.topics || []).filter((t) => t.answer === "no" || t.answer === "partial");
+  if (!shown.length) return "";
+  const row = (t) => {
+    if (t.doc_status === "building") return `<li>${md(t.title)} <span class="hint">preparing…</span></li>`;
+    const href = `/topic.html?course=${encodeURIComponent(L.id)}&concept=${encodeURIComponent(concept.id)}&topic=${encodeURIComponent(t.id)}`;
+    return `<li><a href="${href}" target="_blank" rel="noopener">${md(t.title)}</a></li>`;
+  };
+  return `<div class="learn-card"><p><b>Background</b> <span class="hint">opens in a new tab, so you keep your place here</span></p>
+    <ul class="background-links">${shown.map(row).join("")}</ul></div>`;
 }
 
 function claimShownInLesson(concept) {
@@ -957,9 +984,20 @@ export function bindLearn() {
     else if (a === "accept") act("Accepting", async () => { await send("POST", `${base()}/accept`, {}); await loadLearn(); });
     else if (a === "map") act("Starting", async () => { await send("POST", `${base()}/map`, {}); await loadLearn(); });
     else if (a === "concept") { openConcept(id); }
-    else if (a === "close-concept") { stopReading(); L.view = "path"; L.conceptId = ""; L.concept = null; L.graded = null; L.ask = null; L.variant = "standard"; renderLearn(); }
+    else if (a === "close-concept") { stopReading(); L.view = "path"; L.conceptId = ""; L.concept = null; L.graded = null; L.ask = null; L.variant = "standard"; L.partialOpen = ""; renderLearn(); }
     else if (a === "claim") { L.claim = L.claim === t.dataset.claim ? "" : t.dataset.claim; renderLearn(); }
-    else if (a === "build") {
+    else if (a === "familiarity-partial-open") { L.partialOpen = L.partialOpen === t.dataset.topic ? "" : t.dataset.topic; renderLearn(); }
+    else if (a === "familiarity") {
+      const topicId = t.dataset.topic;
+      const answer = t.dataset.answer;
+      const explain = answer === "partial" ? (document.getElementById(`topic-explain-${topicId}`)?.value || "").trim() : "";
+      if (answer === "partial" && !explain) return;      // required field; the button does nothing until it is filled
+      act("Saving", async () => {
+        await send("POST", `${base()}/concepts/${encodeURIComponent(id)}/familiarity`, { topic_id: topicId, answer, explain });
+        L.partialOpen = "";
+        L.concept = await fetchConcept(L.conceptId);
+      });
+    } else if (a === "build") {
       L.requested.add(id);
       L.autostart = true;
       act("Building", async () => {

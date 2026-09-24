@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -13,6 +14,7 @@ from learn_helpers import corpus, llm, model
 def _root(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "ROOT", tmp_path / "courses")
     PL._building.clear()
+    PL._building_topic.clear()
 
 
 def run(c):
@@ -172,6 +174,90 @@ def test_critique_updates_mastery_only_when_the_claims_speak_to_the_response():
     learner = LN.blank()
     assert run(PL.submit_critique(m, course, learner, "c1", "my plan")) == []
     assert learner["concepts"] == {}
+
+
+def topics_model():
+    topics_reply = json.dumps([{"title": "Adam's beta_2", "note": "the momentum decay term"}])
+    doc_reply = "Beta_2 controls how quickly the second-moment estimate adapts [c1]."
+    return model(("about to read this lesson", topics_reply), ("background note on ONE topic", doc_reply))
+
+
+def test_building_a_concept_indexes_topics_from_the_finished_lesson():
+    m = topics_model()
+    course = ready_course(m)
+    content = run(PL.build_concept(m, corpus(), course, "c1"))
+    assert content["topics"] == [{"id": "t1", "title": "Adam's beta_2", "note": "the momentum decay term"}]
+    assert "topics" in content["stages"]
+
+
+async def _ready(m):
+    return await PL.map_course(m, corpus(), await SC.begin(m, "learn pretraining"))
+
+
+def test_a_familiarity_answer_of_yes_is_recorded_without_building_a_doc():
+    async def go():
+        m = topics_model()
+        course = await _ready(m)
+        await PL.build_concept(m, corpus(), course, "c1")
+        learner = LN.blank()
+        state = await PL.set_familiarity(m, corpus(), course, learner, "c1", "t1", "yes", "")
+        assert state["topics"]["t1"] == {"answer": "yes", "explain": ""}
+        await asyncio.sleep(0)
+        assert not PL._building_topic
+        assert "topic_docs" not in (store.load_concept(course["id"], "c1") or {})
+    run(go())
+
+
+def test_a_familiarity_answer_of_no_builds_a_grounded_topic_doc():
+    async def go():
+        m = topics_model()
+        course = await _ready(m)
+        await PL.build_concept(m, corpus(), course, "c1")
+        learner = LN.blank()
+        await PL.set_familiarity(m, corpus(), course, learner, "c1", "t1", "no", "")
+        await PL.ensure_topic_doc(m, corpus(), course, "c1", "t1")
+        entry = store.load_concept(course["id"], "c1")["topic_docs"]["t1"]
+        assert entry["status"] == "done" and entry["doc"]["insufficient"] is False
+        assert [s["claims"] for sec in entry["doc"]["sections"] for s in sec["sentences"]] == [["c1"]]
+    run(go())
+
+
+def test_a_partial_answer_passes_the_learners_own_words_to_the_doc():
+    async def go():
+        m = topics_model()
+        course = await _ready(m)
+        await PL.build_concept(m, corpus(), course, "c1")
+        learner = LN.blank()
+        await PL.set_familiarity(m, corpus(), course, learner, "c1", "t1", "partial", "I know it decays.")
+        task = PL._building_topic[(course["id"], "c1", "t1")]
+        await task
+        prompt = next(p for s, p in m.calls if "background note on ONE topic" in s)
+        assert "READER ALREADY KNOWS: I know it decays." in prompt
+        assert store.load_concept(course["id"], "c1")["topic_docs"]["t1"]["tailor"] == "I know it decays."
+    run(go())
+
+
+def test_two_familiarity_answers_for_one_topic_share_a_single_build():
+    async def go():
+        m = topics_model()
+        course = await _ready(m)
+        await PL.build_concept(m, corpus(), course, "c1")
+        a = PL.ensure_topic_doc(m, corpus(), course, "c1", "t1")
+        b = PL.ensure_topic_doc(m, corpus(), course, "c1", "t1")
+        assert a is b
+        await a
+    run(go())
+
+
+def test_rebuilding_a_concepts_claims_drops_stale_topic_docs():
+    m = topics_model()
+    course = ready_course(m)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    content = store.load_concept(course["id"], "c1")
+    content.setdefault("topic_docs", {})["t1"] = {"status": "done", "doc": {"insufficient": False}}
+    store.save_concept(course["id"], "c1", content)
+    run(PL.build_concept(m, corpus(), course, "c1", force=True))
+    assert "topic_docs" not in store.load_concept(course["id"], "c1")
 
 
 def test_concurrent_builds_keep_their_own_progress():

@@ -41,6 +41,24 @@ def test_record_answer_updates_mastery_schedule_and_log():
     assert lr["log"] == [{"item": "c1-q1", "correct": True, "confidence": 2, "ts": 5.0}]
 
 
+def test_topic_familiarity_is_recorded_per_concept():
+    lr = LN.blank()
+    LN.set_topic_familiarity(lr, "c1", "t1", "partial", "I know the gist but not the numbers.")
+    assert lr["concepts"]["c1"]["topics"]["t1"] == {"answer": "partial",
+                                                    "explain": "I know the gist but not the numbers."}
+    LN.set_topic_familiarity(lr, "c1", "t2", "yes")
+    assert lr["concepts"]["c1"]["topics"]["t2"] == {"answer": "yes", "explain": ""}
+    assert lr["concepts"]["c1"]["topics"]["t1"]["answer"] == "partial", "unrelated topic untouched"
+
+
+def test_topic_familiarity_works_on_a_concept_state_saved_before_this_field_existed():
+    lr = LN.blank()
+    lr["concepts"]["c1"] = {"mastery": 0.4, "attempts": 1, "lesson_read": True, "inferred": False, "last": 0}
+    LN.set_topic_familiarity(lr, "c1", "t1", "no")
+    assert lr["concepts"]["c1"]["topics"] == {"t1": {"answer": "no", "explain": ""}}
+    assert lr["concepts"]["c1"]["mastery"] == 0.4, "the rest of the concept state is untouched"
+
+
 def test_concepts_unlock_when_their_prerequisites_are_learned():
     lr = LN.blank()
     assert LN.unlocked(COURSE, lr, "c1") and not LN.unlocked(COURSE, lr, "c2")

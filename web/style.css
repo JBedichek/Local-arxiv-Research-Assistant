@@ -864,6 +864,19 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .expansion .lesson-p { margin: 6px 0; }
 #learn .variant-bar { flex-wrap: wrap; align-items: center; gap: 6px; }
 #learn .variant-bar input { width: 4.5em; }
+/* The blocking familiarity gate (see topicsGate in learn.js): one row per indexed topic, shown
+ * before any lesson content until every row has an answer. */
+#learn .topics-gate { max-width: 78ch; }
+#learn .topic-gate-row { padding: 8px 0; border-top: 1px solid var(--line); }
+#learn .topic-gate-row:first-of-type { border-top: 0; }
+#learn .topic-gate-buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+#learn .topic-gate-buttons button.on { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+#learn .topic-gate-partial { margin-top: 6px; }
+#learn .topic-gate-partial textarea { width: 100%; box-sizing: border-box; margin-bottom: 6px; }
+/* Links to a lesson's sub-lesson documents, once the gate above is answered -- see
+ * backgroundLinks in learn.js. Each opens its own document in a new tab (target="_blank"). */
+#learn .background-links { list-style: none; padding: 0; margin: 4px 0 0; }
+#learn .background-links li { padding: 2px 0; }
 /* Synthesize: a question grown into a graph of researched sub-questions and one cited report.
  * Scoped to #synth; like #learn it derives the few tokens the stylesheet lacks. */
 #synth {

@@ -16,6 +16,7 @@ from learn_helpers import corpus, llm, model
 def _env(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "ROOT", tmp_path / "courses")
     PL._building.clear()
+    PL._building_topic.clear()
     LR._tasks.clear()
     PL._editing.clear()
     PL._writing.clear()
@@ -37,8 +38,9 @@ def body(resp):
 
 
 async def settle():
-    while LR._tasks or any(not t.done() for t in PL._building.values()):
-        await asyncio.gather(*LR._tasks.values(), *PL._building.values(), return_exceptions=True)
+    pending = lambda: [*LR._tasks.values(), *PL._building.values(), *PL._building_topic.values()]
+    while LR._tasks or any(not t.done() for t in pending()):
+        await asyncio.gather(*pending(), return_exceptions=True)
         await asyncio.sleep(0)
 
 
@@ -115,6 +117,57 @@ def test_answering_an_item_grades_it_and_returns_the_new_overview():
         assert out["graded"]["correct"] and out["graded"]["answer"].startswith("A.")
         assert out["overview"]["concepts"][0]["mastery"] > 0
         assert (await LR.answer_item(cid, "c1-q9", LR.ItemAnswer(response="A"))).status_code == 404
+    run(go())
+
+
+def _topics_llm():
+    topics_reply = json.dumps([{"title": "Adam's beta_2", "note": "the momentum decay term"}])
+    doc_reply = "Beta_2 controls how quickly the second-moment estimate adapts [c1]."
+    return model(("about to read this lesson", topics_reply), ("background note on ONE topic", doc_reply))
+
+
+def test_a_built_concept_lists_its_topics_and_a_no_answer_builds_a_doc():
+    async def go():
+        m = _topics_llm()
+
+        async def fake_llm():
+            return m
+
+        LR._llm = fake_llm
+        cid = await ready()
+        await LR.build(cid, "c1", None)
+        await settle()
+        c = body(LR.concept(cid, "c1"))
+        assert c["topics"] == [{"id": "t1", "title": "Adam's beta_2", "note": "the momentum decay term",
+                                "doc_status": "todo"}]
+        resp = await LR.familiarity(cid, "c1", LR.FamiliarityRequest(topic_id="t1", answer="no"))
+        assert resp.status_code == 200 and body(resp)["topics"]["t1"]["answer"] == "no"
+        await settle()
+        c = body(LR.concept(cid, "c1"))
+        assert c["topics"][0]["doc_status"] == "done"
+        doc = body(LR.topic_doc(cid, "c1", "t1"))
+        assert doc["status"] == "done" and doc["doc"]["insufficient"] is False and doc["title"] == "Adam's beta_2"
+    run(go())
+
+
+def test_a_partial_answer_requires_an_explanation_and_a_yes_needs_no_model():
+    async def go():
+        m = _topics_llm()
+
+        async def fake_llm():
+            return m
+
+        LR._llm = fake_llm
+        cid = await ready()
+        await LR.build(cid, "c1", None)
+        await settle()
+        bad = await LR.familiarity(cid, "c1", LR.FamiliarityRequest(topic_id="t1", answer="partial"))
+        assert bad.status_code == 400
+        ok = await LR.familiarity(cid, "c1", LR.FamiliarityRequest(topic_id="t1", answer="yes"))
+        assert ok.status_code == 200
+        assert (await LR.familiarity(cid, "c1", LR.FamiliarityRequest(topic_id="t9", answer="yes"))).status_code == 404
+        assert (await LR.familiarity(cid, "c1", LR.FamiliarityRequest(topic_id="t1", answer="maybe"))).status_code == 400
+        assert LR.topic_doc(cid, "c1", "t9").status_code == 404
     run(go())
 
 
