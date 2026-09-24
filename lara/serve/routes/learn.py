@@ -228,7 +228,8 @@ def concept(course_id: str, cid: str) -> JSONResponse:
         "visuals": content.get("visuals", []),
         "expansions": content.get("expansions", []),
         "topics": topics,
-        "stats": content.get("stats", {}), "reused": bool(content.get("reused")),
+        "stats": content.get("stats", {}), "trace": content.get("trace", {}),
+        "reused": bool(content.get("reused")),
         "quiz": {"items": len(quiz.get("items", [])), "dropped": quiz.get("dropped", 0)},
         "build": store.load_build(course_id, cid), "sources": meta["sources"],
         "state": LN.concept_state(learner, cid)})

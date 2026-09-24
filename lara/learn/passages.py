@@ -58,20 +58,40 @@ class CorpusRetriever:
     def __init__(self, state, figure=None):
         self.retriever = state.retriever
         self._conn = state.conn
+        self._neighbours = state.neighbours
         # Injected rather than reached for directly, the same shape `Llm`/`embed_fn` already
         # are here: lara.learn never imports lara.serve, so resolving an anchor to an actual
         # image -- which needs the raw cached HTML lara.serve.papers owns -- is a capability
         # the caller hands in, not one this module goes looking for.
         self._figure = figure
 
-    def search(self, query: str, k: int = 8) -> list[Passage]:
-        hits = self.retriever.retrieve(query, final_k=k * 2).hits
+    def search(self, query: str, k: int = 8, *, papers: list[str] | None = None) -> list[Passage]:
+        hits = self.retriever.retrieve(query, final_k=k * 2, papers=papers).hits
         hits = [h for h in hits if h.kind not in EXCLUDED_KINDS][:k]
         meta = self._meta({h.arxiv_id for h in hits})
         return [Passage(chunk_id=h.chunk_id, arxiv_id=h.arxiv_id, title=h.paper_title,
                         text=h.text, section=h.section_title, kind=h.kind,
                         anchor=h.anchor_start, version=h.version,
                         **meta.get(h.arxiv_id, {})) for h in hits]
+
+    def coverage(self, query: str) -> dict[str, int]:
+        """{"chunks", "papers"}: how much of the corpus touches `query`, from FTS5 alone --
+        cheap enough to call before deciding how hard to search, unlike `search` itself."""
+        from lara.index.search import count_matches
+
+        try:
+            return count_matches(self._conn(), query)
+        except Exception:                                      # noqa: BLE001
+            return {"chunks": 0, "papers": 0}
+
+    def neighbours(self, arxiv_id: str) -> dict[str, list[str]]:
+        """{"cites", "cited_by"} arxiv ids one hop out in the citation graph, or both empty
+        on any failure -- a citation walk that cannot resolve degrades to no walk, not a
+        broken build."""
+        try:
+            return self._neighbours(arxiv_id)
+        except Exception:                                      # noqa: BLE001
+            return {"cites": [], "cited_by": []}
 
     def figure(self, arxiv_id: str, version: int, anchor: str) -> dict | None:
         """The image and caption of the figure/table float at `anchor`, or None -- no image

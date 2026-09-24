@@ -257,3 +257,88 @@ def test_without_a_goal_nothing_is_dropped_as_off_topic():
     m = llm(("CLAIM:", "supports"), extract_reply([{"passage": 1, "claim": "Anything."}]))
     claims, _, _, off_topic = run(CL.extract(m, concept(), ps))
     assert len(claims) == 1 and off_topic == 0 and not any("Would this claim help" in s for s, _ in m.calls)
+
+
+# ── coverage-probe budget ────────────────────────────────────────────────────────
+
+def test_coverage_tier_buckets_by_papers_count():
+    assert CL.coverage_tier({"papers": 0}) == "thin"
+    assert CL.coverage_tier({"papers": CL.COVERAGE_THIN - 1}) == "thin"
+    assert CL.coverage_tier({"papers": CL.COVERAGE_THIN}) == "typical"
+    assert CL.coverage_tier({"papers": CL.COVERAGE_RICH - 1}) == "typical"
+    assert CL.coverage_tier({"papers": CL.COVERAGE_RICH}) == "rich"
+
+
+def test_budget_researches_a_thin_corpus_less_and_a_rich_one_more():
+    thin = CL.budget({"papers": 1})
+    rich = CL.budget({"papers": 50})
+    assert thin["tier"] == "thin" and thin["citation_walk"] is False
+    assert rich["tier"] == "rich" and rich["citation_walk"] is True
+    assert thin["facets"] < rich["facets"] and thin["per_query"] < rich["per_query"]
+
+
+def test_facets_asks_for_no_more_than_the_budgeted_count():
+    reply = json.dumps([f"facet {i}" for i in range(8)])
+    m = llm(("choosing what a learner needs evidence", reply))
+    assert run(CL.facets(m, concept(), max_facets=2)) == ["facet 0", "facet 1"]
+    assert "FACETS: up to 2" in m.calls[0][1]
+
+
+# ── citation-graph walk ──────────────────────────────────────────────────────────
+
+def test_gather_citation_passages_restricts_search_to_the_given_papers():
+    only_b = passage(2, LONG, arxiv="2402.2")
+    fc = FakeCorpus(default=[passage(1, LONG, arxiv="2401.1")], by_paper=[only_b])
+    out = run(CL.gather_citation_passages(fc, "warmup", ["2402.2"]))
+    assert [p.arxiv_id for p in out] == ["2402.2"]
+    assert fc.queries == ["warmup"]
+
+
+def test_gather_citation_passages_with_no_papers_does_not_search_at_all():
+    fc = FakeCorpus(default=[passage(1, LONG)])
+    assert run(CL.gather_citation_passages(fc, "warmup", [])) == [] and fc.queries == []
+
+
+def test_build_walks_citations_from_a_facets_top_result_when_the_budget_allows_it():
+    top = passage(1, LONG, arxiv="2401.1")
+    neighbour = passage(9, LONG, arxiv="2402.2")
+    fc = FakeCorpus(default=[top], by_paper=[neighbour], coverage={"chunks": 50, "papers": 20},
+                    neighbours={"2401.1": {"cites": ["2402.2"], "cited_by": []}})
+    items = [{"passage": 1, "claim": "Warmup avoids early loss spikes."},
+             {"passage": 2, "claim": "The cited paper reports the same effect."}]
+    m = llm(("choosing what a learner needs evidence", json.dumps(["warmup basics"])),
+            ("extract atomic claims", json.dumps(items)), ("strict fact-checker", "supports"),
+            ("compare two claims", '{"relation": "agree", "note": ""}'))
+    out = run(CL.build(m, fc, concept()))
+    trace = out["trace"]
+    assert trace["budget"]["tier"] == "rich" and trace["budget"]["citation_walk"] is True
+    [round_] = [r for r in trace["rounds"] if not r["widened"]]
+    assert round_["citation_papers_tried"] == 1 and round_["citation_passages_kept"] == 1
+    assert {c["passage"]["arxiv_id"] for c in out["claims"]} == {"2401.1", "2402.2"}
+
+
+def test_build_skips_the_citation_walk_when_the_budget_is_thin():
+    top = passage(1, LONG, arxiv="2401.1")
+    calls = []
+    fc = FakeCorpus(default=[top], coverage={"chunks": 2, "papers": 1},
+                    neighbours={"2401.1": {"cites": ["2402.2"], "cited_by": []}})
+    fc.neighbours = lambda a: calls.append(a) or {"cites": ["2402.2"], "cited_by": []}
+    m = llm(("choosing what a learner needs evidence", json.dumps(["warmup basics"])),
+            ("extract atomic claims", extract_reply([{"passage": 1, "claim": "Warmup avoids early loss spikes."}])[1]),
+            ("strict fact-checker", "supports"))
+    out = run(CL.build(m, fc, concept()))
+    assert out["trace"]["budget"]["tier"] == "thin" and out["trace"]["budget"]["citation_walk"] is False
+    assert calls == [], "a thin budget never even asks the corpus for citation neighbours"
+
+
+def test_build_trace_reports_coverage_budget_and_per_facet_rounds():
+    fc = FakeCorpus(default=[passage(1, LONG, arxiv="2401.1")], coverage={"chunks": 10, "papers": 5})
+    m = llm(("choosing what a learner needs evidence", json.dumps(["warmup basics"])),
+            ("extract atomic claims", extract_reply([{"passage": 1, "claim": "Warmup avoids early loss spikes."}])[1]),
+            ("strict fact-checker", "supports"))
+    out = run(CL.build(m, fc, concept()))
+    trace = out["trace"]
+    assert trace["coverage"] == {"chunks": 10, "papers": 5}
+    assert trace["budget"]["tier"] == "typical"
+    assert trace["rounds"][0]["facet"] == "warmup basics" and trace["rounds"][0]["claims"] == 1
+    assert trace["claims"] == 1 and trace["papers"] == 1 and "ms" in trace

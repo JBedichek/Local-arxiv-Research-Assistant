@@ -664,7 +664,8 @@ function conceptView(concept) {
     ${concept.lesson && !concept.lesson.insufficient ? critiqueBox(concept) : ""}
     ${concept.lesson ? `<p><button type="button" data-learn="read" data-id="${escapeHtml(concept.id)}">I've read this — start practice</button>
       <button type="button" class="link" data-learn="build" data-id="${escapeHtml(concept.id)}" data-force="1">Refresh from the corpus</button></p>` : ""}
-    <details><summary>All ${concept.claims.length} claims and their sources${s.unfaithful_dropped ? ` · ${s.unfaithful_dropped} extractions dropped as unfaithful` : ""}</summary><ul class="claims">${list}</ul></details>`;
+    <details><summary>All ${concept.claims.length} claims and their sources${s.unfaithful_dropped ? ` · ${s.unfaithful_dropped} extractions dropped as unfaithful` : ""}</summary><ul class="claims">${list}</ul></details>
+    ${traceView(concept)}`;
   return `<div class="learn-concept">
     <button type="button" class="link" data-learn="close-concept">← back to your path</button>
     <h3>${md(concept.title)}</h3><p class="hint">${md(concept.summary)}
@@ -709,6 +710,32 @@ function backgroundLinks(concept) {
   };
   return `<div class="learn-card"><p><b>Background</b> <span class="hint">opens in a new tab, so you keep your place here</span></p>
     <ul class="background-links">${shown.map(row).join("")}</ul></div>`;
+}
+
+/* The build's own profiling view: what was searched for each facet, how much of it came from
+ * plain similarity versus a citation-graph walk, and how the coverage probe sized the whole
+ * effort. Reuses Deep Research's round/tag styling (.deep-round, .tag.cit, ...) -- the same
+ * idea (how did the system research this) rendered the same way in both places. */
+function traceView(concept) {
+  const t = concept.trace;
+  if (!t || !t.rounds?.length) return "";
+  const cov = t.coverage || {}, bud = t.budget || {};
+  const rounds = t.rounds.map((r, i) => {
+    const tags = `${r.widened ? '<span class="tag">widened</span>' : ""}${
+      r.citation_passages_kept ? '<span class="tag cit">citation graph</span>' : ""}`;
+    const note = `${r.dense_retrieved} passage${r.dense_retrieved === 1 ? "" : "s"} by similarity` +
+      (r.citation_papers_tried ? ` · ${r.citation_passages_kept} of ${r.citation_papers_tried} citation neighbour(s) added a passage` : "");
+    return `<details class="deep-round"><summary><b>Facet ${i + 1}</b>${tags}<span class="rq">${md(r.facet)}</span>
+      <span class="rstat" style="margin-left:auto;opacity:.7">${r.claims} claim${r.claims === 1 ? "" : "s"}</span></summary>
+      <div class="deep-claims"><div class="deep-note">${note}</div></div></details>`;
+  }).join("");
+  return `<details class="learn-card"><summary><b>How this lesson was built</b></summary>
+    <p class="hint">${cov.papers ?? 0} paper(s) / ${cov.chunks ?? 0} passage(s) touch this in the corpus →
+      researched as <b>${escapeHtml(bud.tier || "")}</b>
+      (${bud.facets || 0} facet(s) planned, ${bud.citation_walk ? "citation walk on" : "citation walk off"})</p>
+    ${rounds}
+    <p class="hint">${t.claims} claim(s) from ${t.papers} paper(s) · ${t.comparisons} pairwise comparison(s) · ${t.ms}ms</p>
+  </details>`;
 }
 
 function claimShownInLesson(concept) {

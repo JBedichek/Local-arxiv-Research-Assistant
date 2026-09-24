@@ -143,6 +143,25 @@ def bm25_search(
         return []
 
 
+def count_matches(conn: sqlite3.Connection, query: str, *, max_terms: int = 4,
+                  df_ceiling_frac: float = 0.02, corpus_size: int | None = None) -> dict[str, int]:
+    """How many chunks, and how many distinct papers, touch `query`'s rarest terms -- an FTS5
+    COUNT(*) only, no dense search, no rerank, no hydration. Cheap enough to run before
+    deciding how much retrieval budget a query deserves, unlike `bm25_search`/the full hybrid
+    pipeline, which both do real work to come back with ranked results."""
+    match = plan_query(conn, query, max_terms, df_ceiling_frac, corpus_size)
+    if not match:
+        return {"chunks": 0, "papers": 0}
+    try:
+        chunks = conn.execute("SELECT COUNT(*) FROM chunks_fts WHERE chunks_fts MATCH ?", (match,)).fetchone()[0]
+        papers = conn.execute(
+            "SELECT COUNT(DISTINCT c.arxiv_id) FROM chunks_fts f JOIN chunks c ON c.chunk_id = f.rowid "
+            "WHERE chunks_fts MATCH ?", (match,)).fetchone()[0]
+    except sqlite3.OperationalError:
+        return {"chunks": 0, "papers": 0}
+    return {"chunks": int(chunks), "papers": int(papers)}
+
+
 _TOKEN = re.compile(r"[0-9a-z]+")
 
 
@@ -206,13 +225,16 @@ def plan_query(
     scored.sort(key=lambda kv: kv[1])
     keep = [t for t, df in scored if df <= ceiling][:max_terms]
     if not keep:
+        # Every term is either common or, if `scored` is empty, absent from the corpus
+        # entirely -- nothing to fall back to either way.
+        if not scored:
+            return ""
         # Every term is common. Falling back to "the rarest few" still ORs several
         # enormous posting lists: a query of only common words measured 704 ms this way.
         # Take just the single rarest, and if even that appears in a large slice of the
         # corpus, skip BM25 entirely — a term that common carries almost no BM25 signal,
         # so the only thing the scan buys is latency. Dense retrieval covers the query.
-        rarest_df = scored[0][1] if scored else 0
-        if rarest_df > corpus_size * 0.05:
+        if scored[0][1] > corpus_size * 0.05:
             return ""
         keep = [scored[0][0]]
     return " OR ".join(f'"{t}"' for t in keep)

@@ -107,6 +107,16 @@ def test_building_a_concept_in_the_background_then_reading_it():
     run(go())
 
 
+def test_a_built_concept_exposes_its_retrieval_trace():
+    async def go():
+        cid = await ready()
+        await LR.build(cid, "c1", None)
+        await settle()
+        trace = body(LR.concept(cid, "c1"))["trace"]
+        assert "coverage" in trace and "budget" in trace and trace["rounds"], "trace is populated, not just present"
+    run(go())
+
+
 def test_answering_an_item_grades_it_and_returns_the_new_overview():
     async def go():
         cid = await ready()

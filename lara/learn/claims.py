@@ -2,17 +2,21 @@
 
 A concept is researched one facet at a time (what it is, how it works, its evidence, its limits,
 ...) rather than by one generic search on its title, so a lesson has more than whatever passages
-happen to be nearest the title to draw on. Each claim is extracted from one passage and
-re-checked against it by the judge, so a claim the model paraphrased beyond its source never
-enters. Claims from different papers are then compared pairwise: agreement corroborates,
-opposite conclusions under the same conditions are a conflict (the newer one supersedes), and
-different conclusions explained by different conditions are a scope difference -- taught as
-such, not as a contradiction."""
+happen to be nearest the title to draw on. How hard each facet is researched is not fixed: a
+cheap coverage probe against the corpus first (see `budget`) sizes it to how much is actually
+there, and a facet's own top result can pull in its citation neighbours -- what it cites and
+what cites it -- not just whatever embeds nearest the query. Each claim is extracted from one
+passage and re-checked against it by the judge, so a claim the model paraphrased beyond its
+source never enters. Claims from different papers are then compared pairwise: agreement
+corroborates, opposite conclusions under the same conditions are a conflict (the newer one
+supersedes), and different conclusions explained by different conditions are a scope difference
+-- taught as such, not as a contradiction."""
 
 from __future__ import annotations
 
 import asyncio
 import re
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import date
 
@@ -40,15 +44,29 @@ DUPLICATE_OVERLAP = 0.8
 #: repeats -- measured on real output, repeats scored 0.73-0.79 and the nearest non-repeat 0.63.
 SAME_PAPER_COSINE = 0.62
 
+#: Coverage tiers (distinct papers a cheap FTS probe finds for the concept+goal) that pick how
+#: hard retrieval tries -- see `budget`. A thin corpus researched as if it were rich just spends
+#: more calls finding the same handful of passages again; a rich one capped as if it were thin
+#: leaves real material unread.
+COVERAGE_THIN = 3
+COVERAGE_RICH = 15
+#: (facets, passages per query, citation walk on?) by coverage tier -- thin/typical/rich.
+BUDGETS = {"thin": {"facets": 3, "per_query": 6, "citation_walk": False},
+          "typical": {"facets": MAX_FACETS, "per_query": 8, "citation_walk": True},
+          "rich": {"facets": 8, "per_query": 12, "citation_walk": True}}
+#: Citation neighbours (of a facet's own top result) tried per facet, at most.
+CITATION_NEIGHBOURS = 6
+
 FACETS_SYSTEM = """You are choosing what a learner needs evidence for, to fully understand one \
 concept from a research-paper corpus, before a lesson on it is written.
 
 Reply with JSON only: ["facet query 1", "facet query 2", ...]
 
-- 4 to 6 short, specific search queries (not sentences), each aimed at a DIFFERENT angle of the \
-concept: what it is, how or why it works, concrete numbers or empirical results, the conditions \
-or limits it holds under, how it compares to alternatives -- adapted to what actually matters \
-for THIS concept and the learner's goal. Skip an angle that does not apply to it.
+- Up to the number of facets asked for, short and specific search queries (not sentences), each \
+aimed at a DIFFERENT angle of the concept: what it is, how or why it works, concrete numbers or \
+empirical results, the conditions or limits it holds under, how it compares to alternatives -- \
+adapted to what actually matters for THIS concept and the learner's goal. Fewer is right when \
+the concept genuinely has fewer distinct angles; skip one that does not apply to it.
 - Each facet should surface different passages than the others -- do not just reword the \
 concept's title several times."""
 
@@ -131,15 +149,34 @@ def _days_apart(a: str, b: str) -> int:
         return 0
 
 
-async def facets(llm: Llm, concept: dict) -> list[str]:
+def coverage_tier(coverage: dict) -> str:
+    papers = coverage.get("papers", 0)
+    if papers < COVERAGE_THIN:
+        return "thin"
+    if papers >= COVERAGE_RICH:
+        return "rich"
+    return "typical"
+
+
+def budget(coverage: dict) -> dict:
+    """How hard to research this concept, from a cheap coverage probe (see
+    `CorpusRetriever.coverage`) rather than one size for every concept: a corpus that barely
+    touches the topic gets fewer, narrower facets -- more would just be more calls spent
+    re-finding the same handful of passages, not more material. A corpus rich in it gets more
+    facets, a wider net per facet, and a citation walk on top of similarity search."""
+    return {"tier": (tier := coverage_tier(coverage)), **BUDGETS[tier]}
+
+
+async def facets(llm: Llm, concept: dict, *, max_facets: int = MAX_FACETS) -> list[str]:
     """Search queries covering the distinct angles a lesson on this concept needs evidence for.
     Falls back to the concept's own title (the old, single-query behaviour) if the model's reply
     cannot be used, so a bad facet call degrades retrieval rather than failing the build."""
     data = await llm.ask_json(FACETS_SYSTEM,
                               f"LEARNER'S GOAL: {concept.get('goal') or '(not given)'}\n"
-                              f"CONCEPT: {concept['title']} -- {concept.get('summary', '')}",
+                              f"CONCEPT: {concept['title']} -- {concept.get('summary', '')}\n"
+                              f"FACETS: up to {max_facets}",
                               default=400, cap=1_200, stage="learn_facets")
-    out = [str(f).strip() for f in data][:MAX_FACETS] if isinstance(data, list) else []
+    out = [str(f).strip() for f in data][:max_facets] if isinstance(data, list) else []
     return [f for f in out if f] or [concept["title"]]
 
 
@@ -167,6 +204,26 @@ async def gather_passages(corpus, concept: dict, *, per_query: int = 8, focus: s
             seen.add(p.key)
             per_paper[p.arxiv_id] = per_paper.get(p.arxiv_id, 0) + 1
             out.append(p)
+    return out
+
+
+async def gather_citation_passages(corpus, focus: str, papers: list[str], *, per_query: int = 8,
+                                   exclude: frozenset = frozenset()) -> list[Passage]:
+    """One search restricted to specific papers -- a facet's citation neighbours (what its own
+    top result cites, and what cites it), not just whatever embeds nearest the query. Same
+    passage-quality filters as `gather_passages` (MAX_PER_PAPER, MIN_PASSAGE_CHARS, exclude);
+    [] straight away if there is nowhere to restrict the search to."""
+    if not papers:
+        return []
+    seen, per_paper, out = set(), {}, []
+    for p in await asyncio.to_thread(corpus.search, focus[:240], per_query, papers=papers):
+        if p.key in seen or len(p.text) < MIN_PASSAGE_CHARS or p.chunk_id in exclude:
+            continue
+        if per_paper.get(p.arxiv_id, 0) >= MAX_PER_PAPER:
+            continue
+        seen.add(p.key)
+        per_paper[p.arxiv_id] = per_paper.get(p.arxiv_id, 0) + 1
+        out.append(p)
     return out
 
 
@@ -296,27 +353,57 @@ def _merge_facets(groups: list[list[Claim]]) -> list[Claim]:
 
 
 async def build(llm: Llm, corpus, concept: dict, *, embed=None) -> dict:
-    """Researches one facet at a time (see `facets`) instead of a single generic search on the
-    concept's title, then widens the search once for any facet that came back thin, so a lesson
-    has more than whatever a handful of passages nearest the title happened to say."""
-    queries = await facets(llm, concept)
+    """Researches one facet at a time (see `facets`), sized by a cheap coverage probe (see
+    `budget`) instead of one fixed effort for every concept, then widens the search once for
+    any facet that came back thin, so a lesson has more than whatever a handful of passages
+    nearest the title happened to say. Also returns a `trace`: the coverage probe, the budget
+    it picked, and a per-facet record of what was searched and found -- for a build's own
+    profiling view, not just its output."""
+    t0 = time.time()
+    coverage = await asyncio.to_thread(
+        corpus.coverage, f"{concept['title']} {concept.get('summary', '')}".strip())
+    bud = budget(coverage)
+    queries = await facets(llm, concept, max_facets=bud["facets"])
 
-    async def one(facet: str, exclude: frozenset) -> tuple[list[Claim], frozenset, tuple[int, int, int, int]]:
-        passages = await gather_passages(corpus, concept, focus=facet, exclude=exclude)
+    async def citation_round(facet: str, dense: list[Passage], exclude: frozenset) -> tuple[list[Passage], dict]:
+        """The facet's own top result's citation neighbours, searched once for this facet --
+        {} straight away when the budget has the citation walk off, or there is nothing to
+        walk from yet."""
+        if not bud["citation_walk"] or not dense:
+            return [], {"tried": 0, "kept": 0}
+        nb = await asyncio.to_thread(corpus.neighbours, dense[0].arxiv_id)
+        have = {p.arxiv_id for p in dense}
+        neighbours = list(dict.fromkeys(
+            a for a in (nb.get("cites", []) + nb.get("cited_by", [])) if a not in have))[:CITATION_NEIGHBOURS]
+        if not neighbours:
+            return [], {"tried": 0, "kept": 0}
+        found = await gather_citation_passages(corpus, facet, neighbours, per_query=bud["per_query"], exclude=exclude)
+        return found, {"tried": len(neighbours), "kept": len(found)}
+
+    async def one(facet: str, exclude: frozenset, *, widened: bool = False):
+        dense = await gather_passages(corpus, concept, focus=facet, exclude=exclude, per_query=bud["per_query"])
+        cited, cite_stats = await citation_round(facet, dense, exclude | frozenset(p.chunk_id for p in dense))
+        passages = dense + cited
         claims, dropped, merged, off_topic = await extract(llm, concept, passages, embed=embed, focus=facet)
-        return claims, frozenset(p.chunk_id for p in passages), (len(passages), dropped, merged, off_topic)
+        round_ = {"facet": facet, "widened": widened, "dense_retrieved": len(dense),
+                 "citation_papers_tried": cite_stats["tried"], "citation_passages_kept": cite_stats["kept"],
+                 "claims": len(claims)}
+        return claims, frozenset(p.chunk_id for p in passages), (len(passages), dropped, merged, off_topic), round_
 
     first = await asyncio.gather(*(one(f, frozenset()) for f in queries))
-    used = frozenset(cid for _, exhausted, _ in first for cid in exhausted)
-    thin = [f for f, (claims, _, _) in zip(queries, first) if len(claims) < MIN_FACET_CLAIMS]
-    widened = await asyncio.gather(*(one(f, used) for f in thin)) if thin else []
+    used = frozenset(cid for _, exhausted, _, _ in first for cid in exhausted)
+    thin = [f for f, (claims, _, _, _) in zip(queries, first) if len(claims) < MIN_FACET_CLAIMS]
+    widened = await asyncio.gather(*(one(f, used, widened=True) for f in thin)) if thin else []
 
     rounds = first + widened
-    claims = _merge_facets([c for c, _, _ in rounds])
+    claims = _merge_facets([c for c, _, _, _ in rounds])
     compared = await relate(llm, claims, embed=embed)
-    stats = [s for _, _, s in rounds]
+    stats = [s for _, _, s, _ in rounds]
     return {"claims": [c.to_dict() for c in claims], "conflicts": conflicts(claims), "facets": queries,
             "stats": {"passages": sum(s[0] for s in stats), "unfaithful_dropped": sum(s[1] for s in stats),
                       "repeats_merged": sum(s[2] for s in stats), "off_topic_dropped": sum(s[3] for s in stats),
-                      "cross_facet_merged": sum(len(g) for g, _, _ in rounds) - len(claims),
-                      "comparisons": compared, "facets_widened": len(thin)}}
+                      "cross_facet_merged": sum(len(g) for g, _, _, _ in rounds) - len(claims),
+                      "comparisons": compared, "facets_widened": len(thin)},
+            "trace": {"coverage": coverage, "budget": bud, "rounds": [r for _, _, _, r in rounds],
+                      "claims": len(claims), "papers": len({c.paper for c in claims}),
+                      "comparisons": compared, "ms": round((time.time() - t0) * 1000)}}
