@@ -56,6 +56,12 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
                                                         "stages": {}}
     if not force and not content.get("claims") and (shared := store.shared_get(concept["title"])):
         content = {**shared, "concept": cid, "reused": True}
+        # Adopted whole and (being shared) already past every stage, so the loop below finds
+        # nothing left to run and never calls run_stage's own save -- without this, this
+        # course's own concept file is never written at all: build.json still ends up saying
+        # "done" (nothing failed), but GET .../concepts/{cid} finds no file and returns empty
+        # claims/lesson, with no way to tell from the page that anything is wrong.
+        store.save_concept(course["id"], cid, content)
     prereqs = {c["id"]: c["title"] for c in course["concepts"]}
     build = store.load_build(course["id"], cid)
     meter = TokenMeter()

@@ -680,7 +680,14 @@ function conflictsView(concept) {
 }
 
 function conceptView(concept) {
-  const built = concept.build?.stage === "done" || concept.lesson;
+  // concept.lesson alone, not build.stage === "done": the lesson stage is what actually sets
+  // it (even an "insufficient" lesson is a real object), and it becomes true the moment that
+  // one stage finishes -- while quiz/topics/visuals may still be building -- which is exactly
+  // when a lesson should start showing. Trusting build.stage instead, as this used to, meant
+  // a concept whose file failed to get written (see build_concept's shared-reuse fix) could
+  // say "done" with nothing to show and no way to retry: notBuilt below never rendered because
+  // built was already true, so the "build it" button had nowhere to appear.
+  const built = Boolean(concept.lesson);
   const notBuilt = !built ? `<div class="learn-card">${buildingNow(concept)
     ? `<p>Building…</p>${buildProgress(concept)}`
     : `<p>This concept has not been built yet.</p><button type="button" data-learn="build" data-id="${escapeHtml(concept.id)}">Build it from the papers</button>`}</div>` : "";

@@ -125,6 +125,11 @@ def test_a_second_course_reuses_a_shared_concept_instead_of_rebuilding_it():
     before = len(m.calls)
     content = run(PL.build_concept(m, corpus(), second, "c1"))
     assert content["reused"] and len(m.calls) == before
+    # A reused concept skips every stage (nothing left to do), so run_stage's own save never
+    # fires for it -- the reuse path has to persist it itself, or this course's own concept
+    # file is silently never written even though build.json says "done".
+    on_disk = store.load_concept(second["id"], "c1")
+    assert on_disk is not None and on_disk["claims"] and on_disk["lesson"]
 
 
 def test_a_failing_stage_is_recorded_on_the_course_and_partial_work_is_kept():
