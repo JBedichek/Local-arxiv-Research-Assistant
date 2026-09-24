@@ -9,15 +9,39 @@
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Literata:opsz,wght@7..72,400;7..72,600&family=Inter:wght@400;600&display=swap">
 <link rel="stylesheet" href="/style.css">
 <style>
-  /* This page is one reading column, not the full app shell. */
-  body { max-width: 640px; margin: 0 auto; padding: 24px 16px 60px; }
+  /* style.css's html/body rules (height: 100%, overflow: hidden, display: flex column) are
+   * the app SHELL's, written so its own panes scroll independently of the page -- exactly
+   * wrong for this one-column reading page, which has no panes and needs the page itself to
+   * scroll. Reset every one of them rather than layer on top: an un-reset overflow: hidden
+   * silently clips everything past one viewport height, and flex-column with no sizing on
+   * its one child is what actually produced the squished, overlapping text. */
+  html, body { height: auto; overflow: visible; }
+  body {
+    display: block; max-width: 640px; margin: 0 auto; padding: 24px 16px 60px;
+    font-family: var(--font-literata), Georgia, serif;
+  }
   h1 { font-size: 1.4rem; margin: 0 0 4px; }
+  /* style.css also has a bare `main { display: grid; grid-template-columns: ... }`, written
+   * for the app shell's 4-pane layout and matching ANY <main> on ANY page -- it was cramming
+   * this page's handful of elements into that grid's narrow gutter tracks, which is what
+   * actually produced the overlapping, word-per-line text. #topic-main is a <div>, not a
+   * <main>, specifically so that selector can never reach it again; this rule is a second,
+   * belt-and-suspenders line of defense, not the fix itself. */
+  #topic-main { display: block; }
+  /* This page's #learn div is here only so descendant rules like #learn .lesson-p and
+   * #learn .ck apply -- it deliberately does NOT want style.css's *bare* #learn rule, which
+   * makes the app's own Learn panel a fixed, full-viewport overlay (position: fixed; inset:
+   * 0; display: flex). Inherited unasked, that took this element out of the page's normal
+   * flow entirely, which is why body's centering (and max-width) had no visible effect on
+   * anything inside it. Resetting just the structural properties, not the color/font
+   * custom-property tokens #learn also defines (those are wanted). */
+  #learn { position: static; inset: auto; z-index: auto; display: block; }
 </style>
 </head>
 <body>
 <!-- id="learn": reuses the Learn lesson styling in style.css (#learn .lesson-p, .ck, ...)
      rather than duplicating it for this one page. -->
-<div id="learn"><main id="topic-main"><p class="hint">Loading…</p></main></div>
+<div id="learn"><div id="topic-main"><p class="hint">Loading…</p></div></div>
 <script type="module" src="/js/topicdoc.js"></script>
 </body>
 </html>
