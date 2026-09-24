@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -49,6 +50,60 @@ def test_building_a_concept_runs_every_stage_and_persists_them():
     assert content["lesson"]["stats"]["grounded_pct"] == 100 and content["quiz"]["items"][0]["validated"]
     assert set(content["stages"]) == set(PL.STAGES) and store.load_build(course["id"], "c1")["stage"] == "done"
     assert store.load_concept(course["id"], "c1")["title"] == "Warmup"
+
+
+def test_the_trace_is_written_incrementally_so_a_build_can_be_watched_live(monkeypatch):
+    m = model()
+    course = ready_course(m)
+    saves = []
+    real_save = store.save_concept
+
+    def spy_save(course_id, cid, content):
+        saves.append(json.loads(json.dumps(content.get("trace") or {})))
+        real_save(course_id, cid, content)
+
+    monkeypatch.setattr(store, "save_concept", spy_save)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    trace_saves = [s for s in saves if s]
+    empties = [i for i, s in enumerate(trace_saves) if s.get("rounds") == []]
+    populated = [i for i, s in enumerate(trace_saves) if s.get("rounds")]
+    assert empties and populated, "both an empty-trace save (build just started) and a populated one exist"
+    assert empties[0] < populated[0], "the empty trace reached disk before the populated one -- genuinely incremental"
+
+
+def test_build_json_gets_a_started_timestamp_and_growing_token_counts():
+    m = model()
+    course = ready_course(m)
+    before = time.time()
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    after = time.time()
+    b = store.load_build(course["id"], "c1")
+    assert before <= b["started"] <= after
+    assert b["tokens_in"] > 0 and b["tokens_out"] > 0, "every stage's own calls added to the running total"
+
+
+def test_tokens_and_started_are_not_reset_by_a_no_op_rebuild():
+    m = model()
+    course = ready_course(m)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    done = store.load_build(course["id"], "c1")
+    run(PL.build_concept(m, corpus(), course, "c1"))          # already fully built; nothing to do
+    still = store.load_build(course["id"], "c1")
+    assert still["started"] == done["started"] and still["tokens_in"] == done["tokens_in"]
+
+
+def test_a_forced_rebuild_starts_the_token_count_over_rather_than_accumulating():
+    m = model()
+    course = ready_course(m)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    first = store.load_build(course["id"], "c1")
+    run(PL.build_concept(m, corpus(), course, "c1", force=True))
+    second = store.load_build(course["id"], "c1")
+    assert second["started"] >= first["started"]
+    # Same scripted calls happen again (force reruns every stage), so a genuine reset-then-
+    # recount lands on the same total -- not first["tokens_in"] + more, which would mean the
+    # old build's tokens were never cleared.
+    assert second["tokens_in"] == first["tokens_in"] > 0
 
 
 def test_built_stages_are_not_rebuilt_and_force_rebuilds():

@@ -450,3 +450,30 @@ def test_build_skips_the_full_paper_read_when_the_budget_is_not_rich():
     assert out["trace"]["budget"]["tier"] == "typical" and out["trace"]["budget"]["full_paper"] is False
     [round1] = [r for r in out["trace"]["rounds"] if r["round"] == 1]
     assert round1["full_paper_read"] == ""
+
+
+# ── live trace events ─────────────────────────────────────────────────────────────
+
+def test_build_reports_a_start_event_then_one_round_event_per_round():
+    fc = FakeCorpus(default=[passage(1, LONG, arxiv="2401.1")], coverage={"chunks": 10, "papers": 5})
+    m = llm(("choosing what a learner needs evidence", json.dumps(["warmup basics"])),
+            ("extract atomic claims", extract_reply([{"passage": 1, "claim": "Warmup avoids early loss spikes."}])[1]),
+            ("strict fact-checker", "supports"))
+    events = []
+
+    async def on_event(name, payload):
+        events.append((name, payload))
+
+    out = run(CL.build(m, fc, concept(), on_event=on_event))
+    assert events[0] == ("start", {"coverage": {"chunks": 10, "papers": 5},
+                                   "budget": out["trace"]["budget"], "facets": ["warmup basics"]})
+    rounds = [p for n, p in events if n == "round"]
+    assert rounds == out["trace"]["rounds"], "every round reported live matches the final trace exactly"
+
+
+def test_build_works_with_no_on_event_given():
+    fc = FakeCorpus(default=[passage(1, LONG, arxiv="2401.1")], coverage={"chunks": 10, "papers": 5})
+    m = llm(("choosing what a learner needs evidence", json.dumps(["warmup basics"])),
+            ("extract atomic claims", extract_reply([{"passage": 1, "claim": "Warmup avoids early loss spikes."}])[1]),
+            ("strict fact-checker", "supports"))
+    assert run(CL.build(m, fc, concept()))["trace"]["rounds"]

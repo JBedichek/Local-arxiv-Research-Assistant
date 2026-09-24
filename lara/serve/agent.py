@@ -456,7 +456,7 @@ class AskRequest(BaseModel):
     scope: str = "corpus"
     hits: list[dict] | None = None       # reuse speculative retrieval; skip re-retrieving
     model: str | None = None
-    temperature: float = 0.2
+    temperature: float = 1.0
     max_tokens: int = 1024
     breadth: str | None = None           # instant | fast | balanced | thorough | exhaustive
 

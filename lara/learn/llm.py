@@ -6,7 +6,7 @@ import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 
@@ -56,6 +56,38 @@ class Llm:
         """The parsed JSON in the reply, or None -- a malformed reply is a failed step the
         caller decides about, not an exception."""
         return parse_json(await self.ask(system, prompt, **kw))
+
+
+@dataclass
+class TokenMeter:
+    """A running (tokens_in, tokens_out) tally for one build, estimated the same way
+    `reply_room` already estimates prompt size -- chars / CHARS_PER_TOKEN. Not exact (that
+    would need vLLM's own usage counts threaded through every completion call, a much larger
+    change to the shared generation path every other feature also calls through); close enough
+    to show real, moving numbers rather than none at all."""
+    tokens_in: int = 0
+    tokens_out: int = 0
+
+
+def metered(llm: Llm, meter: TokenMeter) -> Llm:
+    """A copy of `llm` whose calls also add to `meter` as they complete. Transparent to every
+    caller -- still just an `Llm`, `.ask()`/`.ask_json()` unchanged -- so nothing downstream
+    (claims, lesson, quiz, visuals, topics, judge, ...) needs to know metering is happening;
+    a build only has to wrap `llm` once, before its first stage, to meter all of them.
+
+    Creates `llm`'s concurrency semaphore up front if it does not exist yet, rather than
+    leaving `Llm.ask` to lazily create one on `self` (the wrapped copy) later -- that would
+    give the wrapped copy its own semaphore, separate from the shared one every other caller
+    of the original `llm` is limited by, quietly doubling the real concurrency cap."""
+    if llm._sem is None:
+        llm._sem = asyncio.Semaphore(llm.limit)
+
+    async def wrapped(cfg, prompt, *, system="", model=None, max_tokens=0):
+        text = await llm.complete(cfg, prompt, system=system, model=model, max_tokens=max_tokens)
+        meter.tokens_in += round((len(system) + len(prompt)) / CHARS_PER_TOKEN)
+        meter.tokens_out += round(len(text or "") / CHARS_PER_TOKEN)
+        return text
+    return replace(llm, complete=wrapped)
 
 
 def _literal_backslashes(text: str) -> str:

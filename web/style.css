@@ -877,6 +877,14 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
  * backgroundLinks in learn.js. Each opens its own document in a new tab (target="_blank"). */
 #learn .background-links { list-style: none; padding: 0; margin: 4px 0 0; }
 #learn .background-links li { padding: 2px 0; }
+/* Build progress: the 5 pipeline stages (see BUILD_STAGES in learn.js), done/current/pending --
+ * elapsed time and token counts are text, not part of the bar (see buildProgress). */
+#learn .build-progress { margin-top: 8px; }
+#learn .build-bar { display: flex; gap: 3px; height: 6px; margin-bottom: 6px; }
+#learn .build-seg { flex: 1; background: var(--panel-2); border-radius: 3px; }
+#learn .build-seg.done { background: var(--ok); }
+#learn .build-seg.current { background: var(--accent); animation: build-pulse 1.4s ease-in-out infinite; }
+@keyframes build-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
 /* Synthesize: a question grown into a graph of researched sub-questions and one cited report.
  * Scoped to #synth; like #learn it derives the few tokens the stylesheet lacks. */
 #synth {

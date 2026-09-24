@@ -382,7 +382,7 @@ def _merge_facets(groups: list[list[Claim]]) -> list[Claim]:
     return out
 
 
-async def build(llm: Llm, corpus, concept: dict, *, embed=None) -> dict:
+async def build(llm: Llm, corpus, concept: dict, *, embed=None, on_event=None) -> dict:
     """Researches one facet at a time (see `facets`), sized by a cheap coverage probe (see
     `budget`) instead of one fixed effort for every concept. A facet with too few claims is
     widened against a broader slice of the corpus; the richest budget goes further still,
@@ -391,12 +391,22 @@ async def build(llm: Llm, corpus, concept: dict, *, embed=None) -> dict:
     reading a round's one dominant paper whole (see `CorpusRetriever.full_paper`) when its
     passages turn out to come from nowhere else. Also returns a `trace`: the coverage probe,
     the budget it picked, and a per-round record of what was searched and found -- for a
-    build's own profiling view, not just its output."""
+    build's own profiling view, not just its output.
+
+    `on_event`, if given, is awaited as `on_event("start", {...})` once the budget is chosen
+    and again as `on_event("round", round_record)` as each round finishes -- so a caller that
+    persists it (see pipeline.build_concept) can let the trace be watched live, round by
+    round, rather than only appearing once the whole build is done."""
+    async def ev(name: str, payload: dict) -> None:
+        if on_event is not None:
+            await on_event(name, payload)
+
     t0 = time.time()
     coverage = await asyncio.to_thread(
         corpus.coverage, f"{concept['title']} {concept.get('summary', '')}".strip())
     bud = budget(coverage)
     queries = await facets(llm, concept, max_facets=bud["facets"])
+    await ev("start", {"coverage": coverage, "budget": bud, "facets": queries})
 
     async def citation_round(query: str, dense: list[Passage], exclude: frozenset) -> tuple[list[Passage], dict]:
         """The round's own top result's citation neighbours, searched once -- {} straight away
@@ -443,6 +453,7 @@ async def build(llm: Llm, corpus, concept: dict, *, embed=None) -> dict:
         round_ = {"facet": facet, "round": round_n, "query": query, "dense_retrieved": len(dense),
                  "citation_papers_tried": cite_stats["tried"], "citation_passages_kept": cite_stats["kept"],
                  "full_paper_read": full_paper_id, "claims": len(claims)}
+        await ev("round", round_)
         return claims, frozenset(p.chunk_id for p in passages), (len(passages), dropped, merged, off_topic), round_
 
     first = await asyncio.gather(*(one(f, f, frozenset(), round_n=1) for f in queries))

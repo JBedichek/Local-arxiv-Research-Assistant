@@ -17,7 +17,7 @@ from lara.learn import quiz as QZ
 from lara.learn import store
 from lara.learn import topics as TP
 from lara.learn import visuals as VS
-from lara.learn.llm import Llm
+from lara.learn.llm import Llm, TokenMeter, metered
 
 STAGES = ("claims", "lesson", "topics", "quiz", "visuals")
 #: What a diagnostic needs from a concept -- no lesson, topics or visuals.
@@ -58,6 +58,8 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
         content = {**shared, "concept": cid, "reused": True}
     prereqs = {c["id"]: c["title"] for c in course["concepts"]}
     build = store.load_build(course["id"], cid)
+    meter = TokenMeter()
+    llm = metered(llm, meter)
 
     def note(**kw) -> None:
         build.update(kw)
@@ -66,7 +68,27 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
     async def run_stage(stage: str) -> None:
         note(stage=stage, error="")
         if stage == "claims":
-            content.update(await CL.build(llm, corpus, concept, embed=embed))
+
+            async def on_event(name: str, payload: dict) -> None:
+                # Written straight to disk as it happens, under the same lock every other
+                # in-place concept edit uses -- so a build can be watched live, poll by poll,
+                # instead of only showing its trace once the whole stage is done. `content`
+                # (the closure's own copy) is not touched here; run_stage's own save below,
+                # once CL.build returns, is what makes it authoritative.
+                async with _editing.setdefault((course["id"], cid), asyncio.Lock()):
+                    live = store.load_concept(course["id"], cid) or content
+                    if name == "start":
+                        live["trace"] = {**payload, "rounds": []}
+                    elif name == "round":
+                        live.setdefault("trace", {"coverage": {}, "budget": {}, "facets": [], "rounds": []})
+                        live["trace"]["rounds"].append(payload)
+                    store.save_concept(course["id"], cid, live)
+                # tokens_in/out ride the same live cadence as the trace -- a poll during the
+                # (usually longest) claims stage sees them climb round by round, not just once
+                # the whole build finishes.
+                note(tokens_in=meter.tokens_in, tokens_out=meter.tokens_out)
+
+            content.update(await CL.build(llm, corpus, concept, embed=embed, on_event=on_event))
             # Claims are renumbered, so answers and extra lesson versions that cite the old
             # keys would now point at different claims. Topics are re-indexed from the new
             # lesson once it is written, so old ones (and their docs) would not match either.
@@ -86,7 +108,13 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
                                                lesson=content.get("lesson"), corpus=corpus)
         content.setdefault("stages", {})[stage] = time.time()
         store.save_concept(course["id"], cid, content)
+        # Every stage's own tokens count too, not just claims' -- this is what keeps the
+        # total honest once lesson/topics/quiz/visuals have also spent some.
+        note(tokens_in=meter.tokens_in, tokens_out=meter.tokens_out)
 
+    pending = [s for s in STAGES if s in stages and (force or not _stage_done(content, s))]
+    if pending:
+        note(started=time.time(), tokens_in=0, tokens_out=0)
     try:
         for stage in STAGES:
             if stage in stages and (force or not _stage_done(content, stage)):
