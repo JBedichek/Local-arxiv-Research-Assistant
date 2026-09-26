@@ -26,7 +26,14 @@ def blank() -> dict:
 
 def concept_state(learner: dict, cid: str) -> dict:
     return learner["concepts"].setdefault(cid, {"mastery": 0.0, "attempts": 0, "lesson_read": False,
-                                                "inferred": False, "last": 0})
+                                                "inferred": False, "last": 0, "topics": {}})
+
+
+def set_topic_familiarity(learner: dict, cid: str, topic_id: str, answer: str, explain: str = "") -> None:
+    """`answer` is "yes", "no" or "partial"; `explain` is the learner's own words on what they
+    already know, required for "partial" by the route, stored either way for the record."""
+    cs = concept_state(learner, cid)
+    cs.setdefault("topics", {})[topic_id] = {"answer": answer, "explain": explain}
 
 
 def mastery_after(p: float, correct: bool, confidence: int, kind: str) -> float:

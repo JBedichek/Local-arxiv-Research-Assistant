@@ -864,6 +864,50 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .expansion .lesson-p { margin: 6px 0; }
 #learn .variant-bar { flex-wrap: wrap; align-items: center; gap: 6px; }
 #learn .variant-bar input { width: 4.5em; }
+/* The blocking familiarity gate (see topicsGate in learn.js): one row per indexed topic, shown
+ * before any lesson content until every row has an answer. */
+#learn .topics-gate { max-width: 78ch; }
+#learn .topic-gate-row { padding: 8px 0; border-top: 1px solid var(--line); }
+#learn .topic-gate-row:first-of-type { border-top: 0; }
+#learn .topic-gate-buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+#learn .topic-gate-buttons button.on { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+#learn .topic-gate-partial { margin-top: 6px; }
+#learn .topic-gate-partial textarea { width: 100%; box-sizing: border-box; margin-bottom: 6px; }
+/* Links to a lesson's sub-lesson documents, once the gate above is answered -- see
+ * backgroundLinks in learn.js. Each opens its own document in a new tab (target="_blank"). */
+#learn .background-links { list-style: none; padding: 0; margin: 4px 0 0; }
+#learn .background-links li { padding: 2px 0; }
+/* Build progress: the 5 pipeline stages (see BUILD_STAGES in learn.js), done/current/pending --
+ * elapsed time and token counts are text, not part of the bar (see buildProgress). */
+#learn .build-progress { margin-top: 8px; }
+#learn .build-bar { display: flex; gap: 3px; height: 6px; margin-bottom: 6px; }
+#learn .build-seg { flex: 1; background: var(--panel-2); border-radius: 3px; }
+#learn .build-seg.done { background: var(--ok); }
+#learn .build-seg.current { background: var(--accent); animation: build-pulse 1.4s ease-in-out infinite; }
+@keyframes build-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+/* Profile tab: the prompts, retrieval and tool calls behind one concept's build. */
+#learn .learn-tabs { display: flex; gap: 6px; margin: 8px 0 14px; }
+#learn .learn-tabs button { padding: 3px 12px; border: 1px solid var(--line); border-radius: 999px;
+                     background: none; color: var(--dim); cursor: pointer; font-size: 0.8571em; }
+#learn .learn-tabs button.on { background: var(--accent); color: var(--bg); border-color: var(--accent); }
+#learn .trace-phase { margin: 0 0 18px; }
+#learn .trace-phase h4 { margin: 0 0 6px; }
+#learn .trace-row { border: 1px solid var(--line); border-left: 3px solid var(--line); border-radius: 6px;
+            margin: 0 0 6px; padding: 6px 10px; }
+#learn .trace-row summary { cursor: pointer; display: flex; gap: 8px; align-items: baseline; font-size: 0.8571em; }
+#learn .trace-row summary > :first-child { flex: 1; }
+#learn .trace-row pre { margin: 8px 0 0; font-size: 0.8em; white-space: pre-wrap; word-break: break-word;
+                background: var(--panel-2); padding: 6px 10px; border-radius: 4px; }
+/* Sources bibliography + the Profile tab's retrieved-passage lists -- neither existed here
+ * before: claims/citations were shown per-claim (learn-card.claim) or not surfaced as a list
+ * at all. */
+#learn .refs { list-style: none; padding: 0; margin: 8px 0; display: flex; flex-direction: column; gap: 6px; }
+#learn .refs li.ref { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+              padding: 8px 10px; max-width: 84ch; }
+#learn .ref-title { font-weight: 600; margin: 0 0 3px; }
+#learn .ref-title a { color: inherit; }
+#learn .ref-body { color: var(--dim); font-size: 0.9286em; }
+#learn .ref-where { color: var(--faint); font-size: 0.7857em; margin-top: 4px; font-family: var(--mono); }
 /* Synthesize: a question grown into a graph of researched sub-questions and one cited report.
  * Scoped to #synth; like #learn it derives the few tokens the stylesheet lacks. */
 #synth {

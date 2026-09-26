@@ -58,20 +58,64 @@ class CorpusRetriever:
     def __init__(self, state, figure=None):
         self.retriever = state.retriever
         self._conn = state.conn
+        self._neighbours = state.neighbours
         # Injected rather than reached for directly, the same shape `Llm`/`embed_fn` already
         # are here: lara.learn never imports lara.serve, so resolving an anchor to an actual
         # image -- which needs the raw cached HTML lara.serve.papers owns -- is a capability
         # the caller hands in, not one this module goes looking for.
         self._figure = figure
 
-    def search(self, query: str, k: int = 8) -> list[Passage]:
-        hits = self.retriever.retrieve(query, final_k=k * 2).hits
+    def search(self, query: str, k: int = 8, *, papers: list[str] | None = None) -> list[Passage]:
+        hits = self.retriever.retrieve(query, final_k=k * 2, papers=papers).hits
         hits = [h for h in hits if h.kind not in EXCLUDED_KINDS][:k]
         meta = self._meta({h.arxiv_id for h in hits})
         return [Passage(chunk_id=h.chunk_id, arxiv_id=h.arxiv_id, title=h.paper_title,
                         text=h.text, section=h.section_title, kind=h.kind,
                         anchor=h.anchor_start, version=h.version,
                         **meta.get(h.arxiv_id, {})) for h in hits]
+
+    def coverage(self, query: str) -> dict[str, int]:
+        """{"chunks", "papers"}: how much of the corpus touches `query`, from FTS5 alone --
+        cheap enough to call before deciding how hard to search, unlike `search` itself."""
+        from lara.index.search import count_matches
+
+        try:
+            return count_matches(self._conn(), query)
+        except Exception:                                      # noqa: BLE001
+            return {"chunks": 0, "papers": 0}
+
+    def neighbours(self, arxiv_id: str) -> dict[str, list[str]]:
+        """{"cites", "cited_by"} arxiv ids one hop out in the citation graph, or both empty
+        on any failure -- a citation walk that cannot resolve degrades to no walk, not a
+        broken build."""
+        try:
+            return self._neighbours(arxiv_id)
+        except Exception:                                      # noqa: BLE001
+            return {"cites": [], "cited_by": []}
+
+    def full_paper(self, arxiv_id: str, version: int, *, max_chunks: int = 30) -> list[Passage]:
+        """Every chunk of one paper's given version, in reading order -- not just the handful
+        a query happened to retrieve. For a facet that turns out to be anchored to one clearly
+        dominant paper, reading it whole finds what similarity search over isolated chunks
+        missed. `max_chunks` bounds one very long paper from blowing the extraction prompt's
+        budget; [] on any failure, same as a paper this reader has nothing more to offer."""
+        try:
+            rows = self._conn().execute(
+                "SELECT c.chunk_id, c.arxiv_id, c.version, c.anchor_start, c.kind, c.text, "
+                "p.title AS paper_title, s.title AS section_title "
+                "FROM chunks c JOIN papers p ON p.arxiv_id = c.arxiv_id "
+                "LEFT JOIN sections s ON s.arxiv_id = c.arxiv_id AND s.version = c.version "
+                "                     AND s.anchor = c.section_anchor "
+                "WHERE c.arxiv_id = ? AND c.version = ? ORDER BY c.ordinal LIMIT ?",
+                (arxiv_id, version, max_chunks)).fetchall()
+        except Exception:                                      # noqa: BLE001
+            return []
+        meta = self._meta({arxiv_id})
+        return [Passage(chunk_id=r["chunk_id"], arxiv_id=r["arxiv_id"], title=r["paper_title"],
+                        text=r["text"], section=r["section_title"] or "", kind=r["kind"] or "",
+                        anchor=r["anchor_start"] or "", version=r["version"],
+                        **meta.get(arxiv_id, {}))
+                for r in rows if (r["kind"] or "") not in EXCLUDED_KINDS]
 
     def figure(self, arxiv_id: str, version: int, anchor: str) -> dict | None:
         """The image and caption of the figure/table float at `anchor`, or None -- no image

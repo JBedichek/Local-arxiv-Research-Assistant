@@ -6,6 +6,7 @@
 
 import { $, escapeHtml } from "./dom.js";
 import { renderMath } from "./tex.js";
+import { chartSvg } from "./chart.js";
 import * as VOICE from "./voice.js";
 
 /* lara's api.js returns parsed JSON and throws the raw response text; the Learn endpoints
@@ -43,6 +44,9 @@ const L = {
   claim: "", item: null, graded: null, pretest: null, error: "", busy: "",
   open: false, requested: new Set(), autostart: false, poll: 0, critique: null, items: {},
   pending: null, ask: null, asking: false, askResult: "", variant: "standard",
+  partialOpen: "",
+  showProfile: false, trace: [], traceCursor: 0, traceConceptId: "", traceTimer: 0,
+  traceOpen: new Set(),
 };
 
 /* Lesson/claim/quiz text comes from the model, reading real papers -- 66% of chunks
@@ -89,7 +93,35 @@ function schedulePoll() {
 
 function buildingNow(concept) {
   const s = concept.build?.stage;
-  return L.requested.has(concept.id) && s && !["done", "error"].includes(s);
+  const stageBuilding = L.requested.has(concept.id) && s && !["done", "error"].includes(s);
+  return stageBuilding || (concept.topics || []).some((t) => t.doc_status === "building");
+}
+
+/* Mirrors lara.learn.pipeline.STAGES -- the order a concept actually builds in. */
+const BUILD_STAGES = ["claims", "lesson", "topics", "quiz", "visuals"];
+
+/* A real progress bar (which of the 5 pipeline stages is done/current/pending, plus -- while
+ * on claims, the usually-longest one -- how many of the planned facets have finished their
+ * first pass) and elapsed time, rather than a predicted ETA: round 2/3 of a facet only happen
+ * if the model finds a reason, so a confident "~Ns left" would just be a guess dressed as a
+ * fact. tokens_in/out are an estimate (see TokenMeter in lara/learn/llm.py), not vLLM's own
+ * count -- flagged with "~" rather than presented as exact. Refreshed every poll (2.5s, see
+ * schedulePoll), the same cadence every other "live" number in this page already updates on. */
+function buildProgress(concept) {
+  const b = concept.build || {};
+  const idx = BUILD_STAGES.indexOf(b.stage);
+  if (idx < 0) return "";
+  const segs = BUILD_STAGES.map((name, i) =>
+    `<span class="build-seg ${i < idx ? "done" : i === idx ? "current" : ""}" title="${name}"></span>`).join("");
+  const elapsed = b.started ? Math.max(0, Math.round(Date.now() / 1000 - b.started)) : 0;
+  const mins = Math.floor(elapsed / 60);
+  const elapsedText = mins ? `${mins}m ${elapsed % 60}s` : `${elapsed}s`;
+  const t = concept.trace;
+  const facetNote = (b.stage === "claims" && t?.budget?.facets)
+    ? ` · facet ${new Set((t.rounds || []).map((r) => r.facet)).size} of ${t.budget.facets} researched` : "";
+  const tokens = (b.tokens_in || b.tokens_out) ? ` · ~${b.tokens_in || 0} tokens in, ~${b.tokens_out || 0} out` : "";
+  return `<div class="build-progress"><div class="build-bar">${segs}</div>
+    <p class="hint">Step ${idx + 1} of ${BUILD_STAGES.length} (${escapeHtml(b.stage)})${facetNote} · ${elapsedText} elapsed${tokens}</p></div>`;
 }
 
 async function refresh() {
@@ -342,10 +374,42 @@ async function openConcept(cid) {
   L.conceptId = cid;
   L.claim = "";
   L.critique = null;
+  L.partialOpen = "";
+  L.showProfile = false;
+  watchTrace(false);
   try {
     L.concept = await fetchConcept(cid);
   } catch (err) {
     L.error = err.message;
+  }
+  renderLearn();
+}
+
+/* The Profile tab: every prompt, retrieval and tool call behind a concept's build, polled
+ * only while that tab is open, appending only what's new via a `seq` cursor. */
+function watchTrace(on) {
+  clearInterval(L.traceTimer);
+  L.traceTimer = 0;
+  if (on) L.traceTimer = setInterval(() => { if (L.showProfile) loadTrace(); }, 2500);
+}
+
+async function loadTrace() {
+  if (!L.conceptId) return;
+  if (L.traceConceptId !== L.conceptId) {
+    L.traceConceptId = L.conceptId;
+    L.trace = [];
+    L.traceCursor = 0;
+    L.traceOpen.clear();
+  }
+  const body = await get(`/api/learn/courses/${encodeURIComponent(L.id)}/concepts/${encodeURIComponent(L.conceptId)}/trace?since=${L.traceCursor}`);
+  const rows = body.events || [];
+  if (rows.length) {
+    // A rebuild truncates the file server-side, so its first row is seq 1 again -- a cursor
+    // built on the old build's higher numbers would otherwise see nothing new forever, and
+    // an old row's "open" state would otherwise wrongly attach to a new row reusing its seq.
+    if (rows[0].seq <= L.traceCursor) { L.trace = []; L.traceOpen.clear(); }
+    L.trace.push(...rows);
+    L.traceCursor = rows[rows.length - 1].seq;
   }
   renderLearn();
 }
@@ -363,6 +427,120 @@ function sourceLine(p) {
 
 function allClaims(concept) {
   return concept.claims.concat((concept.expansions || []).flatMap((e) => e.claims || []));
+}
+
+/* The keys actually cited on the page right now -- the lesson being read plus whichever
+ * expansions are shown under it -- in the order a reader meets them. Not every claim the
+ * concept ever extracted: a paper the corpus turned up but that lost out to a stronger
+ * source (or was cut for length) never made it into what the learner is reading. */
+function citedKeys(concept) {
+  const keys = [];
+  const add = (k) => { if (!keys.includes(k)) keys.push(k); };
+  for (const sec of activeLesson(concept)?.sections || []) for (const s of sec.sentences) s.claims.forEach(add);
+  for (const e of shownExpansions(concept)) for (const s of expansionSentences(e)) s.claims.forEach(add);
+  return keys;
+}
+
+/* One line per paper actually cited, arXiv-linked, in the order the lesson first cites it --
+ * a reader's own "what did this rest on", not a claim-by-claim audit trail (that is what the
+ * "All claims" list below is for). */
+function bibliography(concept) {
+  const by = new Map(allClaims(concept).map((c) => [c.key, c]));
+  const seen = new Set();
+  const papers = [];
+  for (const key of citedKeys(concept)) {
+    const p = by.get(key)?.passage;
+    if (!p || seen.has(p.arxiv_id)) continue;
+    seen.add(p.arxiv_id);
+    papers.push(p);
+  }
+  if (!papers.length) return "";
+  return `<h4>Sources</h4><ul class="refs">${papers.map((p) => `<li class="ref paper">
+    <div class="ref-title"><a href="https://arxiv.org/abs/${escapeHtml(p.arxiv_id)}" target="_blank" rel="noopener">${escapeHtml(p.title)}</a></div>
+    <div class="ref-where">${sourceLine(p)} · arXiv:${escapeHtml(p.arxiv_id)}</div></li>`).join("")}</ul>`;
+}
+
+/* Profile tab: every prompt, retrieval and tool call behind this concept's build ---------- */
+
+function offsetLabel(ts, t0) {
+  const s = Math.max(0, ts - t0);
+  return s < 60 ? `+${s.toFixed(1)}s` : `+${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
+}
+
+function passageRefLi(p) {
+  return `<li class="ref paper"><div class="ref-title">${escapeHtml(p.title || p.arxiv_id || "(untitled)")}</div>
+    <div class="ref-body">${escapeHtml(p.preview || "")}</div>
+    <div class="ref-where">arXiv:${escapeHtml(p.arxiv_id || "")}${p.section ? " · " + escapeHtml(p.section) : ""}</div></li>`;
+}
+
+/* (one-line summary shown always, HTML shown only once the row is expanded) per event type --
+ * a type this file does not know about (e.g. the pipeline grows a new one) still renders,
+ * as raw JSON, rather than disappearing silently. */
+function traceDetail(r) {
+  if (r.type === "llm_call") {
+    return { summary: `${escapeHtml(r.purpose || "")} <span class="hint">${r.duration_ms ?? "?"}ms</span>`,
+      detail: `<p class="hint">System prompt</p><pre>${escapeHtml(r.system || "")}</pre>
+        <p class="hint">Prompt</p><pre>${escapeHtml(r.prompt || "")}</pre>
+        <p class="hint">Response</p><pre>${escapeHtml(r.response || "(nothing survived verification)")}</pre>` };
+  }
+  if (r.type === "search") {
+    return { summary: `search “${escapeHtml((r.query || "").slice(0, 90))}” <span class="hint">${(r.kept || []).length} of ${r.hits ?? "?"} kept</span>`,
+      detail: `<ul class="refs">${(r.kept || []).map(passageRefLi).join("") || `<li class="hint">nothing kept from this search</li>`}</ul>` };
+  }
+  if (r.type === "coverage_probe") {
+    const cov = r.coverage || {};
+    return { summary: `coverage probe <span class="hint">${cov.papers ?? "?"} paper(s) / ${cov.chunks ?? "?"} chunk(s) — ${escapeHtml(r.tier || "")}</span>`,
+      detail: `<p class="hint">Query: ${escapeHtml(r.query || "")}</p>` };
+  }
+  if (r.type === "facets") {
+    return { summary: `facets chosen <span class="hint">${(r.queries || []).length}, budget "${escapeHtml(r.budget?.tier || "")}"</span>`,
+      detail: `<ul class="refs">${(r.queries || []).map((q) => `<li class="ref">${escapeHtml(q)}</li>`).join("")}</ul>` };
+  }
+  if (r.type === "citation_walk") {
+    return { summary: `citation-graph walk <span class="hint">${(r.candidates || []).length} paper(s) → ${(r.kept || []).length} passage(s)</span>`,
+      detail: `<p class="hint">Seed paper(s): ${(r.seed_papers ? r.seed_papers : [r.seed_paper]).filter(Boolean).map(escapeHtml).join(", ") || "(none)"}</p>
+        <p class="hint">Neighbour papers searched: ${(r.candidates || []).map(escapeHtml).join(", ") || "(none)"}</p>
+        <ul class="refs">${(r.kept || []).map(passageRefLi).join("") || `<li class="hint">nothing kept</li>`}</ul>` };
+  }
+  if (r.type === "full_paper_read") {
+    return { summary: `full-paper read <span class="hint">${escapeHtml(r.arxiv_id || "")} — ${r.chunks ?? "?"} chunk(s)</span>`, detail: "" };
+  }
+  return { summary: escapeHtml(r.type || "event"), detail: `<pre>${escapeHtml(JSON.stringify(r, null, 1))}</pre>` };
+}
+
+/* `renderLearn()` fully replaces this DOM subtree on every poll tick while a build is live
+ * (every 2.5s -- watchTrace), which would otherwise re-collapse a row the moment someone
+ * opened it to read a prompt. `L.traceOpen` (keyed by each event's own `seq`, unique within
+ * a build) survives the re-render; the capture-phase `toggle` listener in bindLearn keeps it
+ * in sync with what the reader actually has open. */
+function traceRow(r, t0) {
+  const { summary, detail } = traceDetail(r);
+  return `<details class="trace-row" data-seq="${r.seq}" ${L.traceOpen.has(r.seq) ? "open" : ""}>
+    <summary>${summary} <span class="hint">${offsetLabel(r.ts, t0)}</span></summary>
+    ${detail}</details>`;
+}
+
+/* Grouped by phase, not left in raw arrival order: concurrent per-facet rounds (claims.build's
+ * `one`) and per-section research/writing (depth.py's `research`/`write_section`, each its own
+ * gathered task) interleave their events in the file by timestamp, which would otherwise
+ * scatter one facet's or section's story across the page. Phases appear in the order the
+ * build first reached them. */
+function profileView(concept) {
+  const rows = L.trace;
+  const started = rows.find((r) => r.type === "build_start");
+  const t0 = rows.find((r) => r.type !== "build_start")?.ts ?? started?.ts ?? 0;
+  const groups = [];
+  const index = new Map();
+  for (const r of rows) {
+    if (r.type === "build_start") continue;
+    if (!index.has(r.phase)) { index.set(r.phase, groups.length); groups.push({ phase: r.phase, rows: [] }); }
+    groups[index.get(r.phase)].rows.push(r);
+  }
+  const header = `<p class="hint">${started ? `Building the <b>${escapeHtml(started.variant)}</b> lesson${started.forced ? " (forced rebuild)" : ""} — ` : ""}${rows.length - (started ? 1 : 0)} event(s) so far.</p>`;
+  const body = groups.length
+    ? groups.map((g) => `<section class="trace-phase"><h4>${escapeHtml(g.phase)}</h4>${g.rows.map((r) => traceRow(r, t0)).join("")}</section>`).join("")
+    : `<p class="hint">${rows.length ? "Nothing matches that filter." : "Nothing traced yet — build or refresh this concept to see its prompts, retrieval and tool calls here."}</p>`;
+  return header + body;
 }
 
 /* Versions of the lesson ------------------------------------------------------------ */
@@ -499,10 +677,16 @@ function lessonBody(concept) {
   if (!lesson) return concept.lesson ? writeCard(concept) : `<p class="hint">Not built yet.</p>`;
   if (lesson.insufficient) return `<div class="learn-card"><p class="warn">${md(lesson.message)}</p></div>`;
   const s = lesson.stats;
-  const length = lesson.target_pages
+  // The standard lesson researches an outline just like a "thorough" or N-page one, but it
+  // never asked for a page count -- a reader who didn't request a length should not be told
+  // how it compares to one. `dropped_sections` stays visible either way: a section the corpus
+  // could not support is worth knowing about regardless of how the lesson was requested.
+  const isVariant = lesson.variant && lesson.variant !== "standard";
+  const length = (isVariant && lesson.target_pages
     ? `<p class="hint">About ${lesson.achieved_pages} page(s), for the ${lesson.target_pages} asked for.
-        ${lesson.shortfall ? `<span class="warn">${md(lesson.shortfall)}</span>` : ""}
-        ${lesson.dropped_sections?.length ? `Not enough sources for: ${lesson.dropped_sections.map(escapeHtml).join("; ")}.` : ""}</p>` : "";
+        ${lesson.shortfall ? `<span class="warn">${md(lesson.shortfall)}</span>` : ""}</p>` : "")
+    + (lesson.dropped_sections?.length
+      ? `<p class="hint">Not enough sources for: ${lesson.dropped_sections.map(escapeHtml).join("; ")}.</p>` : "");
   const trust = length + `<p class="hint trust" title="Every sentence is re-checked against the claims it cites; ones that fail are rewritten once, then dropped.">
     ${s.grounded_pct}% of sentences verified on the first pass · ${s.repaired} rewritten · ${s.dropped} dropped
     ${lesson.stale ? ' · <span class="warn">a source was withdrawn — rewrite this version to refresh</span>' : ""}</p>`;
@@ -648,40 +832,128 @@ function conflictsView(concept) {
     ${rest.length ? `<details><summary>${rest.length} more</summary><ul class="conflicts">${rest.map(row).join("")}</ul></details>` : ""}`;
 }
 
-function chartSvg(v) {
-  const W = 520, H = 220, pad = 40, max = Math.max(...v.points.map((p) => p.value), 0) || 1;
-  const bw = (W - pad * 2) / v.points.length;
-  const bars = v.points.map((p, i) => {
-    const h = Math.max(2, (p.value / max) * (H - pad * 2));
-    const x = pad + i * bw + bw * 0.15, y = H - pad - h;
-    return v.chart === "line"
-      ? `<circle cx="${x + bw * 0.35}" cy="${y}" r="4" class="pt"/>`
-      : `<rect x="${x}" y="${y}" width="${bw * 0.7}" height="${h}" rx="3" class="bar"/>`
-      + `<text x="${x + bw * 0.35}" y="${y - 4}" text-anchor="middle" class="val">${p.value}</text>`
-      + `<text x="${x + bw * 0.35}" y="${H - pad + 14}" text-anchor="middle" class="lab">${escapeHtml(String(p.label).slice(0, 14))}</text>`;
-  }).join("");
-  const line = v.chart === "line" ? `<polyline class="ln" points="${v.points.map((p, i) => `${pad + i * bw + bw * 0.5},${H - pad - Math.max(2, (p.value / max) * (H - pad * 2))}`).join(" ")}"/>`
-    + v.points.map((p, i) => `<text x="${pad + i * bw + bw * 0.5}" y="${H - pad + 14}" text-anchor="middle" class="lab">${escapeHtml(String(p.label).slice(0, 14))}</text>`).join("") : "";
-  return `<div class="learn-card"><p><b>${md(v.title)}</b> <span class="hint">${md(v.y_label || "")} · every number is in its claim: ${v.claims.map(escapeHtml).join(", ")}</span></p>
-    <div class="svg-wrap"><svg viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="img">
-    <line x1="${pad}" y1="${H - pad}" x2="${W - pad}" y2="${H - pad}" class="axis"/>${line}${bars}</svg></div></div>`;
-}
-
 function conceptView(concept) {
-  const built = concept.build?.stage === "done" || concept.lesson;
-  const notBuilt = !built ? `<div class="learn-card"><p>${buildingNow(concept) ? `Building… <span class="hint">step: ${escapeHtml(concept.build.stage)}</span>` : "This concept has not been built yet."}</p>
-    ${buildingNow(concept) ? "" : `<button type="button" data-learn="build" data-id="${escapeHtml(concept.id)}">Build it from the papers</button>`}</div>` : "";
+  // concept.lesson alone, not build.stage === "done": the lesson stage is what actually sets
+  // it (even an "insufficient" lesson is a real object), and it becomes true the moment that
+  // one stage finishes -- while quiz/topics/visuals may still be building -- which is exactly
+  // when a lesson should start showing. Trusting build.stage instead, as this used to, meant
+  // a concept whose file failed to get written (see build_concept's shared-reuse fix) could
+  // say "done" with nothing to show and no way to retry: notBuilt below never rendered because
+  // built was already true, so the "build it" button had nowhere to appear.
+  const built = Boolean(concept.lesson);
+  const notBuilt = !built ? `<div class="learn-card">${buildingNow(concept)
+    ? `<p>Building…</p>${buildProgress(concept)}`
+    : `<p>This concept has not been built yet.</p><button type="button" data-learn="build" data-id="${escapeHtml(concept.id)}">Build it from the papers</button>`}</div>` : "";
+  const unanswered = (concept.topics || []).filter((t) => !t.answer);
+  const gated = built && unanswered.length > 0;
   const list = concept.claims.map((k) => `<li><span class="ck ${k.key === L.claim ? "on" : ""}" data-learn="claim" data-claim="${escapeHtml(k.key)}">${escapeHtml(k.key)}</span> ${badge(k.certainty)} ${md(k.text)}${k.withdrawn ? ' <span class="err">withdrawn</span>' : ""}</li>`).join("");
   const s = concept.stats || {};
+  const lesson = gated ? "" : `${backgroundLinks(concept)}${concept.lesson ? variantBar(concept) : ""}${lessonBody(concept)}${claimShownInLesson(concept) ? "" : claimCard(concept)}${conflictsView(concept)}${bibliography(concept)}
+    ${concept.lesson && !concept.lesson.insufficient ? critiqueBox(concept) : ""}
+    ${concept.lesson ? `<p><button type="button" data-learn="read" data-id="${escapeHtml(concept.id)}">I've read this — start practice</button>
+      <button type="button" class="link" data-learn="build" data-id="${escapeHtml(concept.id)}" data-force="1">Refresh from the corpus</button></p>` : ""}
+    <details><summary>All ${concept.claims.length} claims and their sources${s.unfaithful_dropped ? ` · ${s.unfaithful_dropped} extractions dropped as unfaithful` : ""}</summary><ul class="claims">${list}</ul></details>`;
+  // The Profile tab (full prompt/response and retrieval detail) is separate from the
+  // existing "How this lesson was built" trace card above (traceView): that one is the
+  // claims stage's own coarse, always-visible summary; this is the deep, opt-in view across
+  // every stage. Shown whenever there is anything to build from -- a concept mid-build has
+  // claims (or at least a claims-stage in progress) before it has a lesson.
+  const tabs = built || concept.claims.length || buildingNow(concept) ? `<div class="learn-tabs">
+    <button type="button" class="${L.showProfile ? "" : "on"}" data-learn="profile-off">Lesson</button>
+    <button type="button" class="${L.showProfile ? "on" : ""}" data-learn="profile-on">Profile</button></div>` : "";
+  if (L.showProfile) {
+    return `<div class="learn-concept">
+      <button type="button" class="link" data-learn="close-concept">← back to your path</button>
+      <h3>${md(concept.title)}</h3>${tabs}${profileView(concept)}</div>`;
+  }
+  // Not gated behind `built`/`gated`: the trace is written round by round as the claims stage
+  // runs (see pipeline.build_concept's on_event), so it is worth showing -- open by default --
+  // the moment a poll picks up the first of it, well before the lesson itself exists.
   return `<div class="learn-concept">
     <button type="button" class="link" data-learn="close-concept">← back to your path</button>
     <h3>${md(concept.title)}</h3><p class="hint">${md(concept.summary)}
       ${concept.reused ? " · reused from an earlier course" : ""}</p>
-    ${notBuilt}${concept.lesson ? variantBar(concept) : ""}${lessonBody(concept)}${claimShownInLesson(concept) ? "" : claimCard(concept)}${conflictsView(concept)}
-    ${concept.lesson && !concept.lesson.insufficient ? critiqueBox(concept) : ""}
-    ${concept.lesson ? `<p><button type="button" data-learn="read" data-id="${escapeHtml(concept.id)}">I've read this — start practice</button>
-      <button type="button" class="link" data-learn="build" data-id="${escapeHtml(concept.id)}" data-force="1">Refresh from the corpus</button></p>` : ""}
-    <details><summary>All ${concept.claims.length} claims and their sources${s.unfaithful_dropped ? ` · ${s.unfaithful_dropped} extractions dropped as unfaithful` : ""}</summary><ul class="claims">${list}</ul></details></div>`;
+    ${tabs}${notBuilt}${traceView(concept)}${gated ? topicsGate(concept, unanswered) : ""}${lesson}</div>`;
+}
+
+/* The blocking gate: every topic the lesson leans on without teaching gets a yes/no/partial
+ * answer before the lesson prose is shown at all, so a reader never meets an assumption they
+ * cannot place without first saying so. */
+function topicsGate(concept, unanswered) {
+  const rows = unanswered.map((t) => {
+    const open = L.partialOpen === t.id;
+    return `<div class="topic-gate-row">
+      <p><b>${md(t.title)}</b>${t.note ? ` <span class="hint">— ${md(t.note)}</span>` : ""}</p>
+      <div class="topic-gate-buttons">
+        <button type="button" data-learn="familiarity" data-id="${escapeHtml(concept.id)}" data-topic="${escapeHtml(t.id)}" data-answer="yes">I know this</button>
+        <button type="button" data-learn="familiarity" data-id="${escapeHtml(concept.id)}" data-topic="${escapeHtml(t.id)}" data-answer="no">Not familiar</button>
+        <button type="button" class="${open ? "on" : ""}" data-learn="familiarity-partial-open" data-topic="${escapeHtml(t.id)}">Partially…</button>
+      </div>
+      ${open ? `<div class="topic-gate-partial">
+        <textarea id="topic-explain-${escapeHtml(t.id)}" rows="2" required placeholder="What do you already know, and what don't you? (required)"></textarea>
+        <button type="button" data-learn="familiarity" data-id="${escapeHtml(concept.id)}" data-topic="${escapeHtml(t.id)}" data-answer="partial">Submit</button>
+      </div>` : ""}
+    </div>`;
+  }).join("");
+  return `<div class="learn-card topics-gate">
+    <p><b>Before the lesson:</b> it leans on a few things without explaining them. Say what you already know about each, and we'll fill in just what's missing.</p>
+    ${rows}</div>`;
+}
+
+/* Once past the gate, a "no" or "partial" topic's document is either ready to open (in its own
+ * tab, so the lesson's own place is never lost) or still being written -- a "yes" is recorded
+ * but nothing was generated for it, so it gets no link. */
+function backgroundLinks(concept) {
+  const shown = (concept.topics || []).filter((t) => t.answer === "no" || t.answer === "partial");
+  if (!shown.length) return "";
+  const row = (t) => {
+    if (t.doc_status === "building") return `<li>${md(t.title)} <span class="hint">preparing…</span></li>`;
+    const href = `/topic.html?course=${encodeURIComponent(L.id)}&concept=${encodeURIComponent(concept.id)}&topic=${encodeURIComponent(t.id)}`;
+    return `<li><a href="${href}" target="_blank" rel="noopener">${md(t.title)}</a></li>`;
+  };
+  return `<div class="learn-card"><p><b>Background</b> <span class="hint">opens in a new tab, so you keep your place here</span></p>
+    <ul class="background-links">${shown.map(row).join("")}</ul></div>`;
+}
+
+/* The build's own profiling view: what was searched for each facet, how much of it came from
+ * plain similarity versus a citation-graph walk, and how the coverage probe sized the whole
+ * effort. Reuses Deep Research's round/tag styling (.deep-round, .tag.cit, ...) -- the same
+ * idea (how did the system research this) rendered the same way in both places. */
+/* Written round by round as the claims stage runs (see pipeline.build_concept's on_event), so
+ * this can show up while the concept is still building, not only once it is done -- the panel
+ * opens itself and says "live" while that is happening, and a poll (already running every
+ * 2.5s during a build, see schedulePoll) is what makes it grow without the learner doing
+ * anything. `t.ms` (and the rest of the closing summary) only exists once the whole claims
+ * stage has actually returned; its absence is exactly the signal that this is still live. */
+function traceView(concept) {
+  const t = concept.trace;
+  if (!t || !t.coverage) return "";
+  const cov = t.coverage, bud = t.budget || {};
+  const rounds = t.rounds || [];
+  const live = buildingNow(concept) && concept.build?.stage === "claims";
+  const facetOrder = [];
+  rounds.forEach((r) => { if (!facetOrder.includes(r.facet)) facetOrder.push(r.facet); });
+  const roundCards = rounds.map((r) => {
+    const tags = `${r.round > 1 ? `<span class="tag">round ${r.round}</span>` : ""}${
+      r.citation_passages_kept ? '<span class="tag cit">citation graph</span>' : ""}${
+      r.full_paper_read ? '<span class="tag cit">full paper</span>' : ""}`;
+    const note = [`${r.dense_retrieved} passage${r.dense_retrieved === 1 ? "" : "s"} by similarity`,
+      r.citation_papers_tried ? `${r.citation_passages_kept} of ${r.citation_papers_tried} citation neighbour(s) added a passage` : "",
+      r.full_paper_read ? `read the whole of ${escapeHtml(r.full_paper_read)} -- one paper anchored this round` : ""]
+      .filter(Boolean).join(" · ");
+    return `<details class="deep-round"><summary><b>Facet ${facetOrder.indexOf(r.facet) + 1}</b>${tags}<span class="rq">${md(r.query)}</span>
+      <span class="rstat" style="margin-left:auto;opacity:.7">${r.claims} claim${r.claims === 1 ? "" : "s"}</span></summary>
+      <div class="deep-claims"><div class="deep-note">${note}</div></div></details>`;
+  }).join("");
+  const depth = [bud.citation_walk ? "citation walk on" : "citation walk off",
+    bud.gap_round ? "follow-up round on" : "", bud.full_paper ? "full-paper read on" : ""].filter(Boolean).join(", ");
+  const waiting = live && !rounds.length ? `<p class="hint">Searching…</p>` : "";
+  const done = t.ms != null ? `<p class="hint">${t.claims} claim(s) from ${t.papers} paper(s) · ${t.comparisons} pairwise comparison(s) · ${t.ms}ms</p>` : "";
+  return `<details class="learn-card" ${live ? "open" : ""}><summary><b>How this lesson was built</b>${live ? ' <span class="hint">· live</span>' : ""}</summary>
+    <p class="hint">${cov.papers ?? 0} paper(s) / ${cov.chunks ?? 0} passage(s) touch this in the corpus →
+      researched as <b>${escapeHtml(bud.tier || "")}</b> (${bud.facets || 0} facet(s) planned, ${depth})</p>
+    ${waiting}${roundCards}${done}
+  </details>`;
 }
 
 function claimShownInLesson(concept) {
@@ -900,6 +1172,16 @@ export function bindLearn() {
     if (e.target.id !== "learn-pop") setTimeout(checkSelection, 0);
   });
   document.addEventListener("keyup", (e) => { if (e.key === "Shift" || e.key.startsWith("Arrow")) checkSelection(); });
+
+  // `toggle` does not bubble, so this listens in the capture phase -- the only way to
+  // delegate it from one handler instead of binding one per `<details>`, which a poll-driven
+  // re-render would just have to redo every 2.5 seconds anyway. Keeps a Profile row's
+  // expanded/collapsed state across the live poll -- see loadTrace/traceRow.
+  document.addEventListener("toggle", (e) => {
+    const seq = Number(e.target?.dataset?.seq);
+    if (!e.target.classList?.contains("trace-row") || !seq) return;
+    if (e.target.open) L.traceOpen.add(seq); else L.traceOpen.delete(seq);
+  }, true);
   // "error" does not bubble, so this has to capture -- the only way to catch it from one
   // listener rather than one per <img>, which a re-render would leak more of every time.
   document.addEventListener("error", (e) => {
@@ -957,9 +1239,22 @@ export function bindLearn() {
     else if (a === "accept") act("Accepting", async () => { await send("POST", `${base()}/accept`, {}); await loadLearn(); });
     else if (a === "map") act("Starting", async () => { await send("POST", `${base()}/map`, {}); await loadLearn(); });
     else if (a === "concept") { openConcept(id); }
-    else if (a === "close-concept") { stopReading(); L.view = "path"; L.conceptId = ""; L.concept = null; L.graded = null; L.ask = null; L.variant = "standard"; renderLearn(); }
+    else if (a === "close-concept") { stopReading(); L.view = "path"; L.conceptId = ""; L.concept = null; L.graded = null; L.ask = null; L.variant = "standard"; L.partialOpen = ""; L.showProfile = false; watchTrace(false); renderLearn(); }
+    else if (a === "profile-on") { L.showProfile = true; renderLearn(); watchTrace(true); loadTrace(); }
+    else if (a === "profile-off") { L.showProfile = false; watchTrace(false); renderLearn(); }
     else if (a === "claim") { L.claim = L.claim === t.dataset.claim ? "" : t.dataset.claim; renderLearn(); }
-    else if (a === "build") {
+    else if (a === "familiarity-partial-open") { L.partialOpen = L.partialOpen === t.dataset.topic ? "" : t.dataset.topic; renderLearn(); }
+    else if (a === "familiarity") {
+      const topicId = t.dataset.topic;
+      const answer = t.dataset.answer;
+      const explain = answer === "partial" ? (document.getElementById(`topic-explain-${topicId}`)?.value || "").trim() : "";
+      if (answer === "partial" && !explain) return;      // required field; the button does nothing until it is filled
+      act("Saving", async () => {
+        await send("POST", `${base()}/concepts/${encodeURIComponent(id)}/familiarity`, { topic_id: topicId, answer, explain });
+        L.partialOpen = "";
+        L.concept = await fetchConcept(L.conceptId);
+      });
+    } else if (a === "build") {
       L.requested.add(id);
       L.autostart = true;
       act("Building", async () => {

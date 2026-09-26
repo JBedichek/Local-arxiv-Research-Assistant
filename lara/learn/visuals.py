@@ -17,6 +17,7 @@ import asyncio
 import re
 
 from lara.learn import judge as J
+from lara.learn import trace as TR
 from lara.learn.llm import Llm
 
 MIN_POINTS = 2
@@ -77,6 +78,7 @@ def _live(claims: list[dict]) -> list[dict]:
 
 
 async def chart(llm: Llm, concept: dict, claims: list[dict]) -> dict | None:
+    TR.set_phase("visuals: chart")            # its own task, gathered alongside diagram/pseudocode
     live = _live(claims)
     if len(live) < 2:
         return None
@@ -101,6 +103,7 @@ async def chart(llm: Llm, concept: dict, claims: list[dict]) -> dict | None:
 
 
 async def diagram(llm: Llm, concept: dict, claims: list[dict]) -> dict | None:
+    TR.set_phase("visuals: diagram")          # its own task, gathered alongside chart/pseudocode
     live = _live(claims)
     if not live:
         return None
@@ -129,6 +132,7 @@ async def diagram(llm: Llm, concept: dict, claims: list[dict]) -> dict | None:
 
 
 async def pseudocode(llm: Llm, concept: dict, claims: list[dict]) -> dict | None:
+    TR.set_phase("visuals: pseudocode")       # its own task, gathered alongside chart/diagram
     live = _live(claims)
     if not live:
         return None

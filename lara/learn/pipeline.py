@@ -1,6 +1,6 @@
-"""Runs a course: scope -> map, then each concept on demand (claims -> lesson -> quiz ->
-visuals), so a learner never waits on -- or pays for -- concepts they have not reached. A
-concept already built by an earlier course is reused if recent enough."""
+"""Runs a course: scope -> map, then each concept on demand (claims -> lesson -> topics ->
+quiz -> visuals), so a learner never waits on -- or pays for -- concepts they have not reached.
+A concept already built by an earlier course is reused if recent enough."""
 
 from __future__ import annotations
 
@@ -15,13 +15,16 @@ from lara.learn import learner as LN
 from lara.learn import lesson as LE
 from lara.learn import quiz as QZ
 from lara.learn import store
+from lara.learn import topics as TP
+from lara.learn import trace as TR
 from lara.learn import visuals as VS
-from lara.learn.llm import Llm
+from lara.learn.llm import Llm, TokenMeter, metered
 
-STAGES = ("claims", "lesson", "quiz", "visuals")
-#: What a diagnostic needs from a concept -- no lesson or visuals.
+STAGES = ("claims", "lesson", "topics", "quiz", "visuals")
+#: What a diagnostic needs from a concept -- no lesson, topics or visuals.
 PRETEST_STAGES = ("claims", "quiz")
 _building: dict[tuple[str, str], asyncio.Task] = {}
+_building_topic: dict[tuple[str, str, str], asyncio.Task] = {}
 _editing: dict[tuple[str, str], asyncio.Lock] = {}
 _writing: dict[tuple[str, str, str], asyncio.Task] = {}
 #: Quiz items a concept may hold once deeper lessons have added claims to it.
@@ -54,8 +57,16 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
                                                         "stages": {}}
     if not force and not content.get("claims") and (shared := store.shared_get(concept["title"])):
         content = {**shared, "concept": cid, "reused": True}
+        # Adopted whole and (being shared) already past every stage, so the loop below finds
+        # nothing left to run and never calls run_stage's own save -- without this, this
+        # course's own concept file is never written at all: build.json still ends up saying
+        # "done" (nothing failed), but GET .../concepts/{cid} finds no file and returns empty
+        # claims/lesson, with no way to tell from the page that anything is wrong.
+        store.save_concept(course["id"], cid, content)
     prereqs = {c["id"]: c["title"] for c in course["concepts"]}
     build = store.load_build(course["id"], cid)
+    meter = TokenMeter()
+    llm = metered(llm, meter)
 
     def note(**kw) -> None:
         build.update(kw)
@@ -64,23 +75,66 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
     async def run_stage(stage: str) -> None:
         note(stage=stage, error="")
         if stage == "claims":
-            content.update(await CL.build(llm, corpus, concept, embed=embed))
+
+            async def on_event(name: str, payload: dict) -> None:
+                # Written straight to disk as it happens, under the same lock every other
+                # in-place concept edit uses -- so a build can be watched live, poll by poll,
+                # instead of only showing its trace once the whole stage is done. `content`
+                # (the closure's own copy) is not touched here; run_stage's own save below,
+                # once CL.build returns, is what makes it authoritative.
+                async with _editing.setdefault((course["id"], cid), asyncio.Lock()):
+                    live = store.load_concept(course["id"], cid) or content
+                    if name == "start":
+                        live["trace"] = {**payload, "rounds": []}
+                    elif name == "round":
+                        live.setdefault("trace", {"coverage": {}, "budget": {}, "facets": [], "rounds": []})
+                        live["trace"]["rounds"].append(payload)
+                    store.save_concept(course["id"], cid, live)
+                # tokens_in/out ride the same live cadence as the trace -- a poll during the
+                # (usually longest) claims stage sees them climb round by round, not just once
+                # the whole build finishes.
+                note(tokens_in=meter.tokens_in, tokens_out=meter.tokens_out)
+
+            content.update(await CL.build(llm, corpus, concept, embed=embed, on_event=on_event))
             # Claims are renumbered, so answers and extra lesson versions that cite the old
-            # keys would now point at different claims.
+            # keys would now point at different claims. Topics are re-indexed from the new
+            # lesson once it is written, so old ones (and their docs) would not match either.
             content.pop("lessons", None)
             content.pop("expansions", None)
+            content.pop("topic_docs", None)
         elif stage == "lesson":
-            content["lesson"] = await LE.compose(llm, concept, content.get("claims", []),
-                                                 content.get("conflicts", []),
-                                                 [prereqs[p] for p in concept["prereqs"]])
+            # The default reading path researches a small outline section by section, the
+            # same machinery a "thorough" or N-page request uses (`depth.deepen`), rather
+            # than one flat pass over a fixed pull of passages -- see DP.STANDARD_PAGES.
+            lesson, changes = await DP.deepen(llm, corpus, concept, content, DP.STANDARD_PAGES,
+                                              embed=embed, quiet_shortfall=True)
+            lesson["variant"] = "standard"
+            if changes:
+                content["claims"], content["conflicts"] = changes["claims"], changes["conflicts"]
+            content["lesson"] = lesson
+        elif stage == "topics":
+            TR.set_phase("topics")
+            content["topics"] = await TP.extract_topics(llm, concept, content.get("lesson"))
         elif stage == "quiz":
+            TR.set_phase("quiz")
             content["quiz"] = await QZ.build(llm, concept, content.get("claims", []))
         elif stage == "visuals":
             content["visuals"] = await VS.build(llm, concept, content.get("claims", []),
                                                lesson=content.get("lesson"), corpus=corpus)
         content.setdefault("stages", {})[stage] = time.time()
         store.save_concept(course["id"], cid, content)
+        # Every stage's own tokens count too, not just claims' -- this is what keeps the
+        # total honest once lesson/topics/quiz/visuals have also spent some.
+        note(tokens_in=meter.tokens_in, tokens_out=meter.tokens_out)
 
+    pending = [s for s in STAGES if s in stages and (force or not _stage_done(content, s))]
+    if pending:
+        note(started=time.time(), tokens_in=0, tokens_out=0)
+    # A fresh trace for this build only: `ensure_concept` runs each build in its own asyncio
+    # task, which gets its own copy of this context, so concurrent builds' tracers never
+    # collide even though the tracer itself is "global" state -- see trace.py's docstring.
+    TR.start(store.trace_path(course["id"], cid))
+    TR.emit("build_start", variant="standard", forced=force)
     try:
         for stage in STAGES:
             if stage in stages and (force or not _stage_done(content, stage)):
@@ -92,6 +146,8 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
     except Exception as e:                                     # noqa: BLE001
         note(stage="error", error=f"{type(e).__name__}: {e}")
         raise
+    finally:
+        TR.stop()
     return content
 
 
@@ -105,6 +161,52 @@ def ensure_concept(llm: Llm, corpus, course: dict, cid: str, **kw) -> asyncio.Ta
         _building[key] = task
         task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
     return task
+
+
+async def set_familiarity(llm: Llm, corpus, course: dict, learner: dict, cid: str, topic_id: str,
+                          answer: str, explain: str, *, embed=None) -> dict:
+    """Records how familiar the learner says they are with one of the lesson's indexed topics.
+    "no" and "partial" start (or reuse) that topic's background document in the background --
+    "yes" just records the answer, nothing is written for a topic the learner already knows."""
+    LN.set_topic_familiarity(learner, cid, topic_id, answer, explain)
+    store.save_learner(course["id"], learner)
+    if answer in ("no", "partial"):
+        ensure_topic_doc(llm, corpus, course, cid, topic_id, tailor=explain if answer == "partial" else "", embed=embed)
+    return LN.concept_state(learner, cid)
+
+
+def ensure_topic_doc(llm: Llm, corpus, course: dict, cid: str, topic_id: str, *, tailor: str = "",
+                     embed=None) -> asyncio.Task:
+    """The one running build of this topic's document, started if there is none."""
+    key = (course["id"], cid, topic_id)
+    task = _building_topic.get(key)
+    if task is None or task.done():
+        task = asyncio.ensure_future(_build_topic_doc(llm, corpus, course, cid, topic_id, tailor, embed))
+        _building_topic[key] = task
+        task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+    return task
+
+
+async def _build_topic_doc(llm: Llm, corpus, course: dict, cid: str, topic_id: str, tailor: str,
+                           embed) -> None:
+    concept = {**next(c for c in course["concepts"] if c["id"] == cid), "goal": course["goal"]}
+    lock = _editing.setdefault((course["id"], cid), asyncio.Lock())
+    async with lock:
+        content = store.load_concept(course["id"], cid) or {}
+        topic = next((t for t in content.get("topics", []) if t["id"] == topic_id), None)
+        if topic is None:
+            return
+        content.setdefault("topic_docs", {})[topic_id] = {"status": "building", "tailor": tailor, "doc": None}
+        store.save_concept(course["id"], cid, content)
+    try:
+        doc = await TP.build_doc(llm, corpus, concept, topic, tailor=tailor, embed=embed)
+    except Exception as e:                                        # noqa: BLE001
+        doc = {"insufficient": True, "sections": [], "claims": [], "chart": None,
+              "message": f"{type(e).__name__}: {e}"}
+    async with lock:
+        content = store.load_concept(course["id"], cid) or {}
+        content.setdefault("topic_docs", {})[topic_id] = {"status": "done", "tailor": tailor, "doc": doc}
+        store.save_concept(course["id"], cid, content)
 
 
 async def expand_selection(llm: Llm, corpus, course: dict, cid: str, *, selection: str,
@@ -174,6 +276,8 @@ async def write_variant(llm: Llm, corpus, course: dict, cid: str, variant: str, 
         def note(**kw) -> None:
             store.save_build(course["id"], cid, {"variant": key, "error": "", **kw})
 
+        TR.start(store.trace_path(course["id"], cid))
+        TR.emit("build_start", variant=key, forced=False)
         try:
             note(stage=f"writing {key}", detail="starting")
             if key == "tldr":
@@ -199,6 +303,8 @@ async def write_variant(llm: Llm, corpus, course: dict, cid: str, variant: str, 
         except Exception as e:                                 # noqa: BLE001
             note(stage="error", error=f"{type(e).__name__}: {e}")
             raise
+        finally:
+            TR.stop()
     return lesson
 
 

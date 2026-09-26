@@ -39,22 +39,49 @@ def passage(i=1, text="text", *, arxiv="2401.00001", title="A Paper", date="2024
 
 
 class FakeCorpus:
-    """search() returns the passages registered for the first matching substring."""
+    """search() returns the passages registered for the first matching substring. `coverage`
+    defaults generous (rich) so existing tests that never call it keep today's unthrottled
+    facet/budget behaviour; `neighbours` defaults to no citation edges, so the citation walk
+    is a no-op unless a test wires some in. A `papers=` search draws from `by_paper` instead
+    of the query-matched set, regardless of query text -- restricting to specific papers is
+    what the real retriever's own `papers=` does too (Retriever.retrieve): it narrows the
+    candidate pool, it does not change which query text matched it. `full_papers` is what
+    full_paper() returns per arxiv_id -- every chunk of that paper, not just what a query
+    would surface."""
 
-    def __init__(self, by_query=None, default=()):
+    def __init__(self, by_query=None, default=(), coverage=None, neighbours=None, by_paper=(),
+                full_papers=None):
         self.by_query = by_query or {}
         self.default = list(default)
         self.queries = []
+        self._coverage = {"chunks": 100, "papers": 20} if coverage is None else coverage
+        self._neighbours = neighbours or {}
+        self._by_paper = {p.arxiv_id: p for p in by_paper}
+        self._full_papers = full_papers or {}
 
-    def search(self, query, k=8):
+    def search(self, query, k=8, papers=None):
         self.queries.append(query)
+        if papers is not None:
+            return [self._by_paper[a] for a in papers if a in self._by_paper][:k]
+        out = self.default
         for needle, found in self.by_query.items():
             if needle in query:
-                return list(found)[:k]
-        return self.default[:k]
+                out = list(found)
+                break
+        return out[:k]
 
     def relevance(self, pairs):
         return None
+
+    def coverage(self, query):
+        return dict(self._coverage)
+
+    def full_paper(self, arxiv_id, version, *, max_chunks=30):
+        return list(self._full_papers.get(arxiv_id, ()))[:max_chunks]
+
+    def neighbours(self, arxiv_id):
+        found = self._neighbours.get(arxiv_id, {})
+        return {"cites": list(found.get("cites", [])), "cited_by": list(found.get("cited_by", []))}
 
 
 LONG = "warmup avoids loss spikes early in training. " * 6
@@ -65,20 +92,29 @@ def corpus():
                                passage(2, LONG + " More.", arxiv="2402.2", title="Second paper", date="2024-03-01")])
 
 
-def model():
+def model(*extra):
+    """`extra` rules are appended after the built-in ones (still checked in order, so a built-in
+    needle always wins unless a test's own is more specific) -- lets a test add a topics or
+    topic-doc reply without restating this whole fixture."""
     concepts = [{"id": "a", "title": "Warmup", "summary": "s", "passages": [1, 2], "competencies": ["choose-a-schedule"]},
                 {"id": "b", "title": "Decay", "summary": "d", "passages": [1], "prereqs": ["a"], "competencies": ["choose-a-schedule"]}]
     claims = [{"passage": 1, "claim": "Warmup avoids early loss spikes.", "conditions": "1B", "kind": "finding"},
               {"passage": 2, "claim": "Warmup avoids loss spikes early in training.", "conditions": "", "kind": "finding"}]
     quiz = [{"type": "mcq", "question": "What does warmup avoid?", "choices": ["spikes", "x", "y", "z"], "answer": "A",
              "claim": "c1", "explanation": "Early spikes."}]
+    # The standard lesson researches an outline section by section (`depth.deepen`), not one
+    # flat pass: the fixed 2-passage fake corpus is already fully used by the claims stage, so
+    # each section's own research finds nothing new -- the same 2 claims are what gets written.
+    outline = json.dumps({"sections": [{"heading": "Warmup", "focus": "warmup schedules and loss spikes"}]})
     return llm(("design the scope", json.dumps({"competencies": [{"text": "choose a schedule"}], "question": None})),
                ("concept map", json.dumps({"concepts": concepts})),
                ("extract atomic claims", json.dumps(claims)),
                ("strict fact-checker", "supports"),
                ("compare two claims", '{"relation": "agree", "note": ""}'),
+               ("plan a self-study lesson", outline),
+               ("write ONE section", "Warmup avoids early loss spikes [c1].\nIt is corroborated [c1, c2]."),
                ("write a lesson", "## Warmup\nWarmup avoids early loss spikes [c1].\nIt is corroborated [c1, c2]."),
                ("Write quiz items", json.dumps(quiz)),
                ("ONLY the passage", "A"),
                ("pick ONE quantity", "null"), ("small diagram", "null"),
-               ("review a learner", "[]"))
+               ("review a learner", "[]"), *extra)

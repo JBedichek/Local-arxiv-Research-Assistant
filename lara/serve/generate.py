@@ -365,7 +365,7 @@ async def stream_answer(
     *,
     selection: str | None = None,
     model: str | None = None,
-    temperature: float = 0.2,
+    temperature: float = 1.0,
     max_tokens: int = 1024,
     system: str | None = None,
     raw_user: bool = False,

@@ -89,6 +89,13 @@ def load_build(course_id: str, concept_id: str) -> dict:
     return _read(course_dir(course_id) / "concepts" / f"{slug(concept_id)}.build.json") or {}
 
 
+def trace_path(course_id: str, concept_id: str) -> Path:
+    """Where the Profile tab's event log for one concept's build lives -- see `trace.py`.
+    Plain JSONL, not `_write`'s JSON-with-tmp-and-replace: a trace is appended to as the build
+    runs, not rewritten whole."""
+    return course_dir(course_id) / "concepts" / f"{slug(concept_id)}.trace.jsonl"
+
+
 def save_learner(course_id: str, learner: dict) -> None:
     _write(course_dir(course_id) / "learner.json", learner)
 

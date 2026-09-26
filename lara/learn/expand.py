@@ -59,13 +59,17 @@ async def _answer(llm: Llm, selection: str, request: str, claims: list[dict]):
     return (sections, stats) if sum(len(s["sentences"]) for s in sections) else None
 
 
-def _adds_something(answer, selection_claims: set[str], specific: bool) -> bool:
-    """Unless the learner asked something specific, the answer must draw on at least one claim
-    the highlighted text did not already cite -- otherwise it is pure restatement, however long."""
+def _adds_something(answer, selection_claims: set[str]) -> bool:
+    """The answer must draw on at least one claim the highlighted text did not already cite --
+    otherwise it is pure restatement, however long, whether or not the learner phrased their
+    ask as a specific question. A specific question used to skip this check entirely, which is
+    what let "why does it avoid spikes?" come back as the same sentence the highlighted text
+    already made, with no search and nothing new: the question narrowed what the model was
+    asked to answer, not what it was allowed to answer *from*."""
     if answer is None:
         return False
     sentences = [s for sec in answer[0] for s in sec["sentences"]]
-    return specific or any(k not in selection_claims for s in sentences for k in s["claims"])
+    return any(k not in selection_claims for s in sentences for k in s["claims"])
 
 
 def _next_id(expansions: list[dict]) -> int:
@@ -100,7 +104,7 @@ async def expand(llm: Llm, corpus, concept: dict, content: dict, *, selection: s
     context = rank(live, focus, embed)
     answer = await _answer(llm, selection, request, context)
     searched, new = False, []
-    if not _adds_something(answer, set(selection_claims), bool(question)):
+    if not _adds_something(answer, set(selection_claims)):
         searched = True
         n = _next_id(content.get("expansions", []))
         new = await _new_claims(llm, corpus, concept, live, focus, n, embed)

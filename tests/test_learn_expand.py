@@ -61,8 +61,8 @@ def test_a_generic_answer_that_only_restates_the_highlighted_claims_falls_back_t
     assert [x["key"] for x in out["claims"]] == ["x1c1"] and out["claims"][0]["passage"]["arxiv_id"] == "2409.9"
 
 
-def test_a_specific_question_may_be_answered_from_claims_the_text_already_cites():
-    reply = ("Warmup avoids early loss spikes [c1].\nIt was needed from the first steps [c1]."
+def test_a_specific_question_may_be_answered_from_broader_concept_claims_without_a_search():
+    reply = ("Warmup avoids early loss spikes [c1].\nA 1000-step warmup was used for the 1B model [c2]."
              "\nThe mechanism is a gradual learning-rate ramp-up [c1].\nWithout it, spikes occur in early batches [c1]."
              "\nThis holds regardless of batch size [c1].")
     m = llm((ANSWER, reply), ("strict fact-checker", "supports"))
@@ -71,6 +71,24 @@ def test_a_specific_question_may_be_answered_from_claims_the_text_already_cites(
                         selection_claims=["c1"]))
     assert out["searched"] is False and c.queries == [] and out["question"] == "Why does it avoid spikes?"
     assert "REQUEST: Why does it avoid spikes?" in m.calls[0][1]
+
+
+def test_a_specific_question_answered_only_by_restating_the_highlighted_claim_still_searches():
+    """A question narrows what the model is asked -- not what it may answer *from*. An answer
+    that just restates the same claim the highlighted text already cites has not actually
+    addressed anything new, question or not, so it must still trigger a search."""
+    only_seen = ("Warmup avoids early loss spikes [c1].\nIt was needed from the first steps [c1]."
+                "\nThe mechanism is a gradual learning-rate ramp-up [c1].\nWithout it, spikes occur in early batches [c1]."
+                "\nThis holds regardless of batch size [c1].")
+    extracted = json.dumps([{"passage": 1, "claim": "Warmup of 2000 steps stabilised the 7B run.", "conditions": "7B"}])
+    grounded = "A 2000-step warmup stabilised the 7B run [x1c1]."
+    replies = iter([only_seen, grounded])
+    m = llm((ANSWER, lambda s, p: next(replies)), ("extract atomic claims", extracted), ("strict fact-checker", "supports"),
+            ("Would this claim help", "yes"), ("compare two claims", '{"relation": "agree", "note": ""}'))
+    c = FakeCorpus(default=[passage(9, LONG, arxiv="2409.9")])
+    out = run(EX.expand(m, c, CONCEPT, content(), selection="Warmup avoids spikes", question="Why does it avoid spikes?",
+                        selection_claims=["c1"]))
+    assert out["searched"] is True and c.queries
 
 
 def test_when_nothing_can_be_supported_the_learner_is_told_and_nothing_is_stored():

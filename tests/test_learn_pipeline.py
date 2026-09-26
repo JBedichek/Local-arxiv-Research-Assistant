@@ -1,4 +1,6 @@
 import asyncio
+import json
+import time
 
 import pytest
 
@@ -13,6 +15,7 @@ from learn_helpers import corpus, llm, model
 def _root(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "ROOT", tmp_path / "courses")
     PL._building.clear()
+    PL._building_topic.clear()
 
 
 def run(c):
@@ -49,6 +52,60 @@ def test_building_a_concept_runs_every_stage_and_persists_them():
     assert store.load_concept(course["id"], "c1")["title"] == "Warmup"
 
 
+def test_the_trace_is_written_incrementally_so_a_build_can_be_watched_live(monkeypatch):
+    m = model()
+    course = ready_course(m)
+    saves = []
+    real_save = store.save_concept
+
+    def spy_save(course_id, cid, content):
+        saves.append(json.loads(json.dumps(content.get("trace") or {})))
+        real_save(course_id, cid, content)
+
+    monkeypatch.setattr(store, "save_concept", spy_save)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    trace_saves = [s for s in saves if s]
+    empties = [i for i, s in enumerate(trace_saves) if s.get("rounds") == []]
+    populated = [i for i, s in enumerate(trace_saves) if s.get("rounds")]
+    assert empties and populated, "both an empty-trace save (build just started) and a populated one exist"
+    assert empties[0] < populated[0], "the empty trace reached disk before the populated one -- genuinely incremental"
+
+
+def test_build_json_gets_a_started_timestamp_and_growing_token_counts():
+    m = model()
+    course = ready_course(m)
+    before = time.time()
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    after = time.time()
+    b = store.load_build(course["id"], "c1")
+    assert before <= b["started"] <= after
+    assert b["tokens_in"] > 0 and b["tokens_out"] > 0, "every stage's own calls added to the running total"
+
+
+def test_tokens_and_started_are_not_reset_by_a_no_op_rebuild():
+    m = model()
+    course = ready_course(m)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    done = store.load_build(course["id"], "c1")
+    run(PL.build_concept(m, corpus(), course, "c1"))          # already fully built; nothing to do
+    still = store.load_build(course["id"], "c1")
+    assert still["started"] == done["started"] and still["tokens_in"] == done["tokens_in"]
+
+
+def test_a_forced_rebuild_starts_the_token_count_over_rather_than_accumulating():
+    m = model()
+    course = ready_course(m)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    first = store.load_build(course["id"], "c1")
+    run(PL.build_concept(m, corpus(), course, "c1", force=True))
+    second = store.load_build(course["id"], "c1")
+    assert second["started"] >= first["started"]
+    # Same scripted calls happen again (force reruns every stage), so a genuine reset-then-
+    # recount lands on the same total -- not first["tokens_in"] + more, which would mean the
+    # old build's tokens were never cleared.
+    assert second["tokens_in"] == first["tokens_in"] > 0
+
+
 def test_built_stages_are_not_rebuilt_and_force_rebuilds():
     m = model()
     course = ready_course(m)
@@ -68,6 +125,11 @@ def test_a_second_course_reuses_a_shared_concept_instead_of_rebuilding_it():
     before = len(m.calls)
     content = run(PL.build_concept(m, corpus(), second, "c1"))
     assert content["reused"] and len(m.calls) == before
+    # A reused concept skips every stage (nothing left to do), so run_stage's own save never
+    # fires for it -- the reuse path has to persist it itself, or this course's own concept
+    # file is silently never written even though build.json says "done".
+    on_disk = store.load_concept(second["id"], "c1")
+    assert on_disk is not None and on_disk["claims"] and on_disk["lesson"]
 
 
 def test_a_failing_stage_is_recorded_on_the_course_and_partial_work_is_kept():
@@ -75,7 +137,7 @@ def test_a_failing_stage_is_recorded_on_the_course_and_partial_work_is_kept():
     course = ready_course(m)
 
     async def boom(cfg, prompt, *, system="", **kw):
-        if "write a lesson" in system:
+        if "plan a self-study lesson" in system:
             raise RuntimeError("model down")
         return await m.complete(cfg, prompt, system=system, **kw)
 
@@ -161,7 +223,12 @@ def test_a_stale_lesson_is_regenerated_without_redoing_the_other_stages():
     store.save_concept(course["id"], "c1", content)
     m.calls.clear()
     run(PL.build_concept(m, corpus(), course, "c1"))
-    assert any("write a lesson" in s for s, _ in m.calls) and not any("extract atomic" in s for s, _ in m.calls)
+    # The standard lesson researches its own outline section by section, so regenerating it
+    # does re-plan and re-write -- but the concept's fixed passages are already fully used by
+    # the claims stage, so no section's own research actually finds (or extracts) anything new.
+    assert any("plan a self-study lesson" in s for s, _ in m.calls)
+    assert any("write ONE section" in s for s, _ in m.calls)
+    assert not any("extract atomic" in s for s, _ in m.calls)
     assert not store.load_concept(course["id"], "c1")["lesson"].get("stale")
 
 
@@ -172,6 +239,90 @@ def test_critique_updates_mastery_only_when_the_claims_speak_to_the_response():
     learner = LN.blank()
     assert run(PL.submit_critique(m, course, learner, "c1", "my plan")) == []
     assert learner["concepts"] == {}
+
+
+def topics_model():
+    topics_reply = json.dumps([{"title": "Adam's beta_2", "note": "the momentum decay term"}])
+    doc_reply = "Beta_2 controls how quickly the second-moment estimate adapts [c1]."
+    return model(("about to read this lesson", topics_reply), ("background note on ONE topic", doc_reply))
+
+
+def test_building_a_concept_indexes_topics_from_the_finished_lesson():
+    m = topics_model()
+    course = ready_course(m)
+    content = run(PL.build_concept(m, corpus(), course, "c1"))
+    assert content["topics"] == [{"id": "t1", "title": "Adam's beta_2", "note": "the momentum decay term"}]
+    assert "topics" in content["stages"]
+
+
+async def _ready(m):
+    return await PL.map_course(m, corpus(), await SC.begin(m, "learn pretraining"))
+
+
+def test_a_familiarity_answer_of_yes_is_recorded_without_building_a_doc():
+    async def go():
+        m = topics_model()
+        course = await _ready(m)
+        await PL.build_concept(m, corpus(), course, "c1")
+        learner = LN.blank()
+        state = await PL.set_familiarity(m, corpus(), course, learner, "c1", "t1", "yes", "")
+        assert state["topics"]["t1"] == {"answer": "yes", "explain": ""}
+        await asyncio.sleep(0)
+        assert not PL._building_topic
+        assert "topic_docs" not in (store.load_concept(course["id"], "c1") or {})
+    run(go())
+
+
+def test_a_familiarity_answer_of_no_builds_a_grounded_topic_doc():
+    async def go():
+        m = topics_model()
+        course = await _ready(m)
+        await PL.build_concept(m, corpus(), course, "c1")
+        learner = LN.blank()
+        await PL.set_familiarity(m, corpus(), course, learner, "c1", "t1", "no", "")
+        await PL.ensure_topic_doc(m, corpus(), course, "c1", "t1")
+        entry = store.load_concept(course["id"], "c1")["topic_docs"]["t1"]
+        assert entry["status"] == "done" and entry["doc"]["insufficient"] is False
+        assert [s["claims"] for sec in entry["doc"]["sections"] for s in sec["sentences"]] == [["c1"]]
+    run(go())
+
+
+def test_a_partial_answer_passes_the_learners_own_words_to_the_doc():
+    async def go():
+        m = topics_model()
+        course = await _ready(m)
+        await PL.build_concept(m, corpus(), course, "c1")
+        learner = LN.blank()
+        await PL.set_familiarity(m, corpus(), course, learner, "c1", "t1", "partial", "I know it decays.")
+        task = PL._building_topic[(course["id"], "c1", "t1")]
+        await task
+        prompt = next(p for s, p in m.calls if "background note on ONE topic" in s)
+        assert "READER ALREADY KNOWS: I know it decays." in prompt
+        assert store.load_concept(course["id"], "c1")["topic_docs"]["t1"]["tailor"] == "I know it decays."
+    run(go())
+
+
+def test_two_familiarity_answers_for_one_topic_share_a_single_build():
+    async def go():
+        m = topics_model()
+        course = await _ready(m)
+        await PL.build_concept(m, corpus(), course, "c1")
+        a = PL.ensure_topic_doc(m, corpus(), course, "c1", "t1")
+        b = PL.ensure_topic_doc(m, corpus(), course, "c1", "t1")
+        assert a is b
+        await a
+    run(go())
+
+
+def test_rebuilding_a_concepts_claims_drops_stale_topic_docs():
+    m = topics_model()
+    course = ready_course(m)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    content = store.load_concept(course["id"], "c1")
+    content.setdefault("topic_docs", {})["t1"] = {"status": "done", "doc": {"insufficient": False}}
+    store.save_concept(course["id"], "c1", content)
+    run(PL.build_concept(m, corpus(), course, "c1", force=True))
+    assert "topic_docs" not in store.load_concept(course["id"], "c1")
 
 
 def test_concurrent_builds_keep_their_own_progress():

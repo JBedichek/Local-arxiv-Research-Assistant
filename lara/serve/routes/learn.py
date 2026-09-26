@@ -17,6 +17,7 @@ from lara.learn import lesson as LE
 from lara.learn import pipeline as PL
 from lara.learn import scope as SC
 from lara.learn import store
+from lara.learn import trace as TR
 from lara.learn.llm import Llm
 from lara.learn.passages import CorpusRetriever, embed_fn
 from lara.serve import generate as G
@@ -65,6 +66,12 @@ class ExpandRequest(BaseModel):
 class LessonRequest(BaseModel):
     variant: str                # "tldr", "thorough" or "pages"
     pages: int | None = None
+
+
+class FamiliarityRequest(BaseModel):
+    topic_id: str
+    answer: str                 # "yes", "no" or "partial"
+    explain: str = ""
 
 
 def _err(message: str, status: int) -> JSONResponse:
@@ -210,16 +217,39 @@ def concept(course_id: str, cid: str) -> JSONResponse:
     content = store.load_concept(course_id, cid) or {}
     learner = store.load_learner(course_id) or LN.blank()
     quiz = content.get("quiz") or {}
+    familiarity = LN.concept_state(learner, cid).get("topics", {})
+    docs = content.get("topic_docs") or {}
+    topics = [{**t, **familiarity.get(t["id"], {}),
+              "doc_status": (docs.get(t["id"]) or {}).get("status", "todo")}
+             for t in content.get("topics", [])]
     return JSONResponse({
         "id": cid, "title": meta["title"], "summary": meta["summary"], "prereqs": meta["prereqs"],
         "claims": content.get("claims", []), "conflicts": content.get("conflicts", []),
         "lesson": content.get("lesson"), "lessons": LE.lessons_of(content),
         "visuals": content.get("visuals", []),
         "expansions": content.get("expansions", []),
-        "stats": content.get("stats", {}), "reused": bool(content.get("reused")),
+        "topics": topics,
+        "stats": content.get("stats", {}), "trace": content.get("trace", {}),
+        "reused": bool(content.get("reused")),
         "quiz": {"items": len(quiz.get("items", [])), "dropped": quiz.get("dropped", 0)},
         "build": store.load_build(course_id, cid), "sources": meta["sources"],
         "state": LN.concept_state(learner, cid)})
+
+
+@router.get("/api/learn/courses/{course_id}/concepts/{cid}/trace")
+def concept_trace(course_id: str, cid: str, since: int = 0) -> JSONResponse:
+    """Every prompt, retrieval and tool call behind this concept's most recent build -- the
+    Profile tab. `since` is the last `seq` the caller already has, so polling only sends what
+    is new; the file itself is overwritten at the start of each build, so a poll spanning a
+    rebuild sees a gap rather than a mix of two builds' events (the client restarts from 0
+    when a returned `seq` is not strictly increasing from what it last saw)."""
+    course = _course(course_id)
+    if course is None:
+        return _err(f"no course {course_id}", 404)
+    if not any(c["id"] == cid for c in course["concepts"]):
+        return _err(f"no concept {cid}", 404)
+    rows = TR.read(store.trace_path(course_id, cid), since=since)
+    return JSONResponse({"events": rows})
 
 
 @router.post("/api/learn/courses/{course_id}/concepts/{cid}/build")
@@ -255,6 +285,48 @@ async def expand(course_id: str, cid: str, req: ExpandRequest) -> JSONResponse:
     except ValueError as e:
         return _err(str(e), 409)
     return JSONResponse(result)
+
+
+@router.post("/api/learn/courses/{course_id}/concepts/{cid}/familiarity")
+async def familiarity(course_id: str, cid: str, req: FamiliarityRequest) -> JSONResponse:
+    """The learner's yes/no/partial answer on one of the lesson's indexed topics. A "no" or
+    "partial" starts that topic's background document in the background; the page polls the
+    concept (each topic carries its own `doc_status`) or the topic's own endpoint below."""
+    course = _course(course_id)
+    if course is None or not any(c["id"] == cid for c in course["concepts"]):
+        return _err("no such course or concept", 404)
+    if req.answer not in ("yes", "no", "partial"):
+        return _err("answer must be yes, no or partial", 400)
+    if req.answer == "partial" and not req.explain.strip():
+        return _err("say what you already know for a partial answer", 400)
+    content = store.load_concept(course_id, cid) or {}
+    if not any(t["id"] == req.topic_id for t in content.get("topics", [])):
+        return _err(f"no topic {req.topic_id}", 404)
+    llm = await _llm() if req.answer != "yes" else None
+    if llm is None and req.answer != "yes":
+        return _err("no generator replica was reachable", 503)
+    corpus, embed = await _corpus()
+    learner = store.load_learner(course_id) or LN.blank()
+    state = await PL.set_familiarity(llm, corpus, course, learner, cid, req.topic_id, req.answer,
+                                     req.explain.strip(), embed=embed)
+    return JSONResponse(state)
+
+
+@router.get("/api/learn/courses/{course_id}/concepts/{cid}/topics/{topic_id}")
+def topic_doc(course_id: str, cid: str, topic_id: str) -> JSONResponse:
+    """A sub-lesson's own content -- what the standalone tab it opens in polls and renders."""
+    course = _course(course_id)
+    if course is None:
+        return _err(f"no course {course_id}", 404)
+    meta = next((c for c in course["concepts"] if c["id"] == cid), None)
+    content = store.load_concept(course_id, cid) or {}
+    topic = next((t for t in content.get("topics", []) if t["id"] == topic_id), None)
+    if meta is None or topic is None:
+        return _err(f"no topic {topic_id}", 404)
+    entry = (content.get("topic_docs") or {}).get(topic_id) or {"status": "todo", "doc": None}
+    return JSONResponse({"id": topic_id, "title": topic["title"], "note": topic.get("note", ""),
+                         "concept_title": meta["title"], "status": entry.get("status", "todo"),
+                         "doc": entry.get("doc")})
 
 
 @router.post("/api/learn/courses/{course_id}/concepts/{cid}/lesson")
