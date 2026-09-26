@@ -10,6 +10,7 @@ import re
 import time
 
 from lara.learn import judge as J
+from lara.learn import trace as TR
 from lara.learn.llm import Llm
 
 MIN_CLAIMS = 2
@@ -31,11 +32,24 @@ A sentence with no key is not allowed.
 - Do not add any fact that is not in the claims. Connecting or explaining claims is fine only \
 if every part is supported by a claim you cite.
 - State each idea once, even when several claims support it -- cite them together.
+- Group claims about the same sub-topic together, in the order a learner should meet them -- \
+not the order they were given in. When several claims describe alternative methods, results or \
+conditions for the same thing, write a sentence that says how they relate (agree, differ by \
+scale, trade one property for another) and cite all of them, rather than one flat sentence per \
+claim with no relation drawn between them. A run of same-shape sentences with no connective \
+tissue reads as a list of index cards, not a lesson.
+- The first time a sentence uses a technical term, acronym or named method that is not one of \
+the prerequisites, briefly say what it means as part of that sentence (still only from what the \
+claims say) -- do not use unfamiliar jargon as if the reader already has it defined.
 - Order for a learner: what the concept is, then how it works, then what is known about using it.
 - Convey certainty as marked: say when a point rests on one paper, is only a hypothesis, or was \
 replaced by later work.
 - Where CONFLICTS are listed, give a section "## Where sources disagree" stating both sides with \
-their conditions and dates. Do not pick a winner.
+their conditions and dates. Name what each side actually found (the method, the result) so the \
+section reads on its own -- never write the bare word "Claim" as a stand-in for one (e.g. not \
+"Claim [c3] finds X"): the citation bracket already marks which claim a sentence rests on, so \
+referring back to it by name in the prose is redundant and, once a reader's tools show the \
+bracket separately from the running text, leaves a dangling word behind. Do not pick a winner.
 - The learner already knows the prerequisites listed; do not re-teach them."""
 
 REPAIR_SYSTEM = """Each numbered sentence below was NOT fully supported by the claims it cites. \
@@ -99,6 +113,41 @@ def tldr_note(n_claims: int) -> str:
             "points, in one section, no background. Shorter is right if the claims say less.")
 
 
+DISAGREE_SYSTEM = """You write one section, "## Where sources disagree", for a lesson that has \
+already covered a concept -- from CONFLICTS between numbered claims.
+
+Format: ONE SENTENCE PER LINE (no heading), each ending -- before its full stop -- with the keys \
+of the claims it rests on in brackets, like [c1] or [c2, c5]. A sentence with no key is not \
+allowed. Do not write the section heading; the caller adds it.
+
+- State each side of each disagreement: name what it actually found (the method, the result, \
+the conditions), not the bare word "claim" -- a reader's tools already mark which claim each \
+sentence rests on, so naming it again in the prose ("Claim X finds...") is redundant filler.
+- Give the conditions and dates for each side, from CONFLICTS, so a reader can see whether the \
+disagreement is likely a real contradiction or a difference of setting.
+- Do not pick a winner and do not add any fact the claims do not state."""
+
+
+async def write_disagreements(llm: Llm, concept: dict, claims: list[dict],
+                              conflicts: list[dict]) -> dict | None:
+    """The "Where sources disagree" section for a lesson built section-by-section (`depth.py`),
+    where no single call sees every claim at once the way `compose` does. None when nothing in
+    the lesson's own claims actually conflicts -- most lessons have nothing to put here."""
+    by_key = {c["key"]: c for c in claims}
+    live = [x for x in conflicts if x["a"] in by_key and x["b"] in by_key]
+    if not live:
+        return None
+    disputes = "\n".join(f"- [{x['a']}] vs [{x['b']}] ({x['relation']}): {x['note']}" for x in live)
+    keys = dict.fromkeys(k for x in live for k in (x["a"], x["b"]))
+    listing = "\n".join(line(by_key[k]) for k in keys)
+    prompt = f"CONCEPT: {concept['title']}\n\nCLAIMS:\n{listing}\n\nCONFLICTS:\n{disputes}"
+    text = await llm.ask(DISAGREE_SYSTEM, prompt, default=800, cap=3_000, stage="learn_disagree")
+    sections = parse(text, set(by_key))
+    flat = [s for _, sents in sections for s in sents]
+    out, stats = await verify(llm, [("Where sources disagree", flat)], by_key)
+    return {**out[0], "stats": stats} if out and out[0]["sentences"] else None
+
+
 def lessons_of(content: dict) -> dict[str, dict]:
     """Every written version of a concept's lesson, by variant: the standard one plus any
     TL;DR, thorough or custom-length ones."""
@@ -108,6 +157,7 @@ def lessons_of(content: dict) -> dict[str, dict]:
 
 async def compose(llm: Llm, concept: dict, claims: list[dict], conflicts: list[dict],
                   prereq_titles: list[str], *, length_note: str = "") -> dict:
+    TR.set_phase("tldr" if length_note else "compose")
     claims = usable(claims)[:MAX_LESSON_CLAIMS]
     if len(claims) < MIN_CLAIMS:
         return {"insufficient": True, "sections": [], "generated": time.time(),

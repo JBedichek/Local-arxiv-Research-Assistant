@@ -102,11 +102,17 @@ def model(*extra):
               {"passage": 2, "claim": "Warmup avoids loss spikes early in training.", "conditions": "", "kind": "finding"}]
     quiz = [{"type": "mcq", "question": "What does warmup avoid?", "choices": ["spikes", "x", "y", "z"], "answer": "A",
              "claim": "c1", "explanation": "Early spikes."}]
+    # The standard lesson researches an outline section by section (`depth.deepen`), not one
+    # flat pass: the fixed 2-passage fake corpus is already fully used by the claims stage, so
+    # each section's own research finds nothing new -- the same 2 claims are what gets written.
+    outline = json.dumps({"sections": [{"heading": "Warmup", "focus": "warmup schedules and loss spikes"}]})
     return llm(("design the scope", json.dumps({"competencies": [{"text": "choose a schedule"}], "question": None})),
                ("concept map", json.dumps({"concepts": concepts})),
                ("extract atomic claims", json.dumps(claims)),
                ("strict fact-checker", "supports"),
                ("compare two claims", '{"relation": "agree", "note": ""}'),
+               ("plan a self-study lesson", outline),
+               ("write ONE section", "Warmup avoids early loss spikes [c1].\nIt is corroborated [c1, c2]."),
                ("write a lesson", "## Warmup\nWarmup avoids early loss spikes [c1].\nIt is corroborated [c1, c2]."),
                ("Write quiz items", json.dumps(quiz)),
                ("ONLY the passage", "A"),

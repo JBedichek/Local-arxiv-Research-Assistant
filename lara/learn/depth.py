@@ -1,11 +1,16 @@
-"""Longer lessons by researching deeper, not by writing more.
+"""Lessons by researching deeper, not by writing more.
 
 A lesson is limited by what the corpus can support, so a request for N pages plans an outline
 of about N sections, runs a focused corpus search for each, and writes each section only from
 the claims found for it -- every sentence cited and re-judged, as in any lesson. Each claim is
 used in exactly one section, so sections do not repeat each other. A section the corpus cannot
 support is dropped, and the lesson says how much of the requested length it could stand behind
-rather than padding to it."""
+rather than padding to it.
+
+This is not only for an explicit "thorough" or N-page request: `pipeline.run_stage` calls
+`deepen` for the standard lesson too, at `STANDARD_PAGES` -- one flat pass over a fixed pull
+of passages read less into a concept than a short outline and a few section-scoped searches
+do, so the default reading path earns the research, not just the long ones."""
 
 from __future__ import annotations
 
@@ -14,6 +19,7 @@ import time
 
 from lara.learn import claims as CL
 from lara.learn import lesson as LE
+from lara.learn import trace as TR
 from lara.learn.llm import Llm, parse_json
 
 WORDS_PER_PAGE = 450
@@ -28,6 +34,11 @@ OUTLINE_ATTEMPTS = 2
 SEARCH_BREADTH = 12
 MIN_PAGES, MAX_PAGES = 1, 20
 THOROUGH_PAGES = 5
+#: The default lesson -- not a request for extra depth, this *is* now the standard reading
+#: path. Small enough to stay fast, but an outline and per-section research beat one flat
+#: pass at any size: see `pipeline.run_stage`, which calls `deepen` for the standard lesson
+#: too, not only for "thorough" and custom-length requests.
+STANDARD_PAGES = 2
 MIN_SECTIONS, MAX_SECTIONS = 3, 16
 MIN_SECTION_CLAIMS = 2
 MAX_SECTION_CLAIMS = 24
@@ -54,6 +65,13 @@ write a heading.
 - Do not add any fact that is not in the claims. Connecting or explaining claims is fine only if \
 every part is supported by a claim you cite.
 - State each idea once, even when several claims support it -- cite them together.
+- When several claims describe alternative methods, results or conditions for the same thing, \
+write a sentence that says how they relate (agree, differ by scale, trade one property for \
+another) and cite all of them, rather than one flat sentence per claim with no relation between \
+them.
+- The first time this section uses a technical term, acronym or named method not already \
+established, briefly say what it means as part of that sentence, still only from what the \
+claims say.
 - Convey certainty as marked: one paper, a hypothesis, replaced by later work.
 - Aim for about the length asked for, but never go beyond what the claims support: fewer \
 sentences is right when the claims are few."""
@@ -98,31 +116,35 @@ def _key_number(key: str) -> int:
 
 
 async def research(llm: Llm, corpus, concept: dict, existing: list[dict], outline: list[dict],
-                   *, embed=None) -> list[CL.Claim]:
+                   *, embed=None) -> tuple[list[CL.Claim], list[dict]]:
     """New claims for every section, searched in parallel and merged once: repeats of what
     the concept already had (or of each other) are dropped, and the rest are numbered on from
-    the concept's own keys."""
+    the concept's own keys. Each section's research widens via the citation graph, and
+    escalates to a full-paper read, exactly when `CL.research_topic` decides that section's
+    pull looks thin -- most sections do not need either. Returns (claims, per-section trace)."""
     used = frozenset(c["passage"]["chunk_id"] for c in existing)
 
-    async def one(sec: dict) -> list[CL.Claim]:
+    async def one(sec: dict) -> tuple[list[CL.Claim], dict]:
+        # Its own gathered task, so labelling this task's context does not bleed into any
+        # sibling section's events -- see trace.py's module docstring.
+        TR.set_phase(f"research: {sec['heading']}")
         focus = f"{sec['heading']}. {sec['focus']}".strip()
-        passages = await CL.gather_passages(corpus, concept, focus=focus, exclude=used,
-                                            per_query=SEARCH_BREADTH)
-        found, *_ = await CL.extract(llm, concept, passages, embed=embed, focus=focus)
-        return found
+        found, *_rest, topic_trace = await CL.research_topic(
+            llm, corpus, concept, focus=focus, exclude=used, per_query=SEARCH_BREADTH, embed=embed)
+        return found, {**topic_trace, "heading": sec["heading"]}
 
     per_section = await asyncio.gather(*(one(s) for s in outline))
     seen = [c["text"] for c in existing]
     fresh: list[CL.Claim] = []
     next_key = max((_key_number(c["key"]) for c in existing), default=0) + 1
-    for found in per_section:
+    for found, _ in per_section:
         for c in found:
             if all(CL.overlap(c.text, t) < CL.DUPLICATE_OVERLAP for t in seen):
                 c.key = f"c{next_key}"
                 next_key += 1
                 seen.append(c.text)
                 fresh.append(c)
-    return fresh
+    return fresh, [t for _, t in per_section]
 
 
 def assign(claims: list[dict], outline: list[dict], embed=None) -> list[list[dict]]:
@@ -145,6 +167,7 @@ def assign(claims: list[dict], outline: list[dict], embed=None) -> list[list[dic
 async def write_section(llm: Llm, concept: dict, sec: dict, claims: list[dict],
                         words: int) -> tuple[list[dict], dict]:
     """(verified sentences, stats) for one section."""
+    TR.set_phase(f"write: {sec['heading']}")           # its own gathered task, see `research`
     by_key = {c["key"]: c for c in claims}
     words = min(words, WORDS_PER_CLAIM * len(claims))
     prompt = (f"CONCEPT: {concept['title']}\nSECTION: {sec['heading']} -- {sec['focus']}\n"
@@ -178,17 +201,25 @@ def _merge_back(existing: list[dict], updated: list[CL.Claim]) -> list[dict]:
 
 
 async def deepen(llm: Llm, corpus, concept: dict, content: dict, pages: int, *, embed=None,
-                 progress=None) -> tuple[dict, dict]:
+                 progress=None, quiet_shortfall: bool = False) -> tuple[dict, dict]:
     """(lesson, changes): the lesson, and what it added to the concept -- `claims` (the full
-    merged list), `conflicts`, and `new_claims` (just the additions)."""
+    merged list), `conflicts`, and `new_claims` (just the additions).
+
+    `quiet_shortfall` is for the standard lesson, which calls this with a page target of its
+    own choosing rather than one the learner asked for: a concept that is genuinely short at
+    its natural length is not a shortfall, and saying so would read as an apology for nothing.
+    An explicit "thorough" or N-page request keeps the message -- there, the learner did ask
+    for a length, and deserves to know when the corpus could not support it."""
     note = progress or (lambda detail: None)
     existing = [c for c in content.get("claims", []) if not c.get("withdrawn")]
+    TR.set_phase("outline")
     outline, reply = await plan_outline(llm, concept, LE.usable(existing), pages)
     if not outline:
         return _empty(f"the outline could not be planned (the model replied: {reply[:160]!r})", pages), {}
     note(f"planned {len(outline)} sections; searching the papers for each")
-    fresh = await research(llm, corpus, concept, existing, outline, embed=embed)
+    fresh, section_trace = await research(llm, corpus, concept, existing, outline, embed=embed)
     everything = [CL.Claim.from_dict(c) for c in content.get("claims", [])] + fresh
+    TR.set_phase("relate")
     await CL.relate(llm, everything, embed=embed, involving={c.key for c in fresh})
     merged = _merge_back(content.get("claims", []), everything)
     usable = LE.usable(merged)
@@ -204,16 +235,27 @@ async def deepen(llm: Llm, corpus, concept: dict, content: dict, pages: int, *, 
     for _, st in written:
         for k in stats:
             stats[k] += st[k]
-    stats["grounded_pct"] = round(100 * stats["kept_first_pass"] / stats["written"]) if stats["written"] else 0
     conflicts = CL.conflicts([CL.Claim.from_dict(c) for c in merged if not c.get("withdrawn")])
+    # A lesson built section-by-section never had one call see every claim at once the way
+    # `compose` does, so its "Where sources disagree" section is written separately, from
+    # only the claims that actually conflict -- most lessons have none.
+    if sections:
+        TR.set_phase("disagreements")
+        disagreement = await LE.write_disagreements(llm, concept, usable, conflicts)
+        if disagreement is not None:
+            sections.append({k: v for k, v in disagreement.items() if k != "stats"})
+            for k in ("written", "kept_first_pass", "repaired", "dropped"):
+                stats[k] += disagreement["stats"][k]
+    stats["grounded_pct"] = round(100 * stats["kept_first_pass"] / stats["written"]) if stats["written"] else 0
     achieved = round(count_words(sections) / WORDS_PER_PAGE, 1)
+    widened = [t["heading"] for t in section_trace if t["widened"] or t["full_paper"]]
     lesson = {"insufficient": not sections, "sections": sections, "generated": time.time(),
               "target_pages": pages, "achieved_pages": achieved, "stats": stats,
-              "outline": [s["heading"] for s in outline],
+              "outline": [s["heading"] for s in outline], "widened_sections": widened,
               "dropped_sections": [s["heading"] for s, b in zip(outline, buckets) if len(b) < MIN_SECTION_CLAIMS]}
     if not sections:
         lesson["message"] = "The paper corpus held too little to write this lesson responsibly."
-    elif achieved < pages * SHORTFALL_BELOW:
+    elif not quiet_shortfall and achieved < pages * SHORTFALL_BELOW:
         lesson["shortfall"] = (f"The corpus supported about {achieved:g} of the {pages} page(s) asked for; "
                                "the rest would have been padding.")
     return lesson, {"claims": merged, "conflicts": conflicts, "new_claims": [c.to_dict() for c in fresh]}
@@ -221,7 +263,7 @@ async def deepen(llm: Llm, corpus, concept: dict, content: dict, pages: int, *, 
 
 def _empty(reason: str, pages: int) -> dict:
     return {"insufficient": True, "sections": [], "generated": time.time(), "target_pages": pages,
-            "achieved_pages": 0, "outline": [], "dropped_sections": [],
+            "achieved_pages": 0, "outline": [], "dropped_sections": [], "widened_sections": [],
             "message": f"Could not write this lesson: {reason}.",
             "stats": {"written": 0, "kept_first_pass": 0, "repaired": 0, "dropped": 0, "grounded_pct": 0}}
 

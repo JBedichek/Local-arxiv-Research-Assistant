@@ -21,6 +21,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date
 
 from lara.learn import judge as J
+from lara.learn import trace as TR
 from lara.learn.llm import Llm
 from lara.learn.passages import Passage
 
@@ -62,6 +63,14 @@ CITATION_NEIGHBOURS = 6
 #: Claims shown to the gap check, at most -- enough to judge coverage without an unbounded
 #: prompt once a facet has accumulated a couple of rounds.
 MAX_GAP_LISTING = 12
+#: `research_topic`'s own dominant-paper trigger (see `_dominant_paper`): a thin pull needs
+#: at least this many passages before "one paper supplied most of them" is worth acting on.
+#: `gather_passages` never returns more than `MAX_PER_PAPER` from one paper, so this is
+#: deliberately low: two passages, both from the one paper a thin topic turned up, is itself
+#: the signal -- there was nothing else to spread across.
+FULL_PAPER_MIN_PASSAGES = 2
+#: ...and that one paper must supply at least this share of them.
+FULL_PAPER_DOMINANCE = 0.6
 
 FACETS_SYSTEM = """You are choosing what a learner needs evidence for, to fully understand one \
 concept from a research-paper corpus, before a lesson on it is written.
@@ -119,6 +128,16 @@ def cosine(a: list[float], b: list[float]) -> float:
     dot = sum(x * y for x, y in zip(a, b))
     na, nb = sum(x * x for x in a) ** 0.5, sum(y * y for y in b) ** 0.5
     return dot / (na * nb) if na and nb else 0.0
+
+
+#: How much of a passage's text a trace event keeps -- enough to recognise, not the whole
+#: chunk (a claim built from it, and its full source, already show elsewhere).
+TRACE_PREVIEW_CHARS = 240
+
+
+def _passage_refs(passages: list[Passage]) -> list[dict]:
+    return [{"chunk_id": p.chunk_id, "arxiv_id": p.arxiv_id, "title": p.title, "section": p.section,
+             "preview": p.text[:TRACE_PREVIEW_CHARS]} for p in passages]
 
 
 @dataclass
@@ -210,14 +229,24 @@ async def facets(llm: Llm, concept: dict, *, max_facets: int = MAX_FACETS) -> li
     return [f for f in out if f] or [concept["title"]]
 
 
+#: Two passages this close (embedding cosine) are treated as the same point made twice --
+#: an abstract and its conclusion restating one number, typically -- and only the first is
+#: kept. Diversity across *papers*, not just the `MAX_PER_PAPER` count within one: three
+#: near-duplicate chunks from three different papers would otherwise each burn a separate
+#: extraction call to (most likely) re-derive the same claim.
+DIVERSITY_COSINE = 0.93
+
+
 async def gather_passages(corpus, concept: dict, *, per_query: int = 8, focus: str = "",
-                          exclude: frozenset = frozenset()) -> list[Passage]:
+                          exclude: frozenset = frozenset(), embed=None) -> list[Passage]:
     """Distinct, substantial passages for a concept, at most `MAX_PER_PAPER` from one paper so
     corroboration means independent papers. `focus` (a facet query, or a highlighted passage and
     question) steers the search toward it; `exclude` holds chunk ids already used, so a follow-up
     search finds something new. No cap on how many come back -- that is `MAX_PER_PAPER` and
-    however many facets are searched, not a fixed number picked in advance."""
-    seen, per_paper, out = set(), {}, []
+    however many facets are searched, not a fixed number picked in advance. `embed`, when given,
+    also drops a passage that says essentially the same thing as one already kept, regardless of
+    which paper it is from."""
+    seen, per_paper, out, vecs = set(), {}, [], []
     goal = concept.get("goal", "")[:160]
     if focus:
         queries = [focus[:240], f"{focus[:140]} {concept['title']}"]
@@ -226,14 +255,23 @@ async def gather_passages(corpus, concept: dict, *, per_query: int = 8, focus: s
     if goal:
         queries.append(f"{concept['title']} for {goal}")
     for query in queries:
-        for p in await asyncio.to_thread(corpus.search, query, per_query):
+        hits = await asyncio.to_thread(corpus.search, query, per_query)
+        kept: list[Passage] = []
+        for p in hits:
             if p.key in seen or len(p.text) < MIN_PASSAGE_CHARS or p.chunk_id in exclude:
                 continue
             if per_paper.get(p.arxiv_id, 0) >= MAX_PER_PAPER:
                 continue
+            vec = embed(p.text) if embed else []
+            if vec and any(cosine(vec, v) >= DIVERSITY_COSINE for v in vecs):
+                continue
             seen.add(p.key)
             per_paper[p.arxiv_id] = per_paper.get(p.arxiv_id, 0) + 1
             out.append(p)
+            kept.append(p)
+            if vec:
+                vecs.append(vec)
+        TR.emit("search", query=query, k=per_query, hits=len(hits), kept=_passage_refs(kept))
     return out
 
 
@@ -405,7 +443,10 @@ async def build(llm: Llm, corpus, concept: dict, *, embed=None, on_event=None) -
     coverage = await asyncio.to_thread(
         corpus.coverage, f"{concept['title']} {concept.get('summary', '')}".strip())
     bud = budget(coverage)
+    TR.emit("coverage_probe", query=f"{concept['title']} {concept.get('summary', '')}".strip(),
+           coverage=coverage, tier=bud["tier"])
     queries = await facets(llm, concept, max_facets=bud["facets"])
+    TR.emit("facets", queries=queries, budget=bud)
     await ev("start", {"coverage": coverage, "budget": bud, "facets": queries})
 
     async def citation_round(query: str, dense: list[Passage], exclude: frozenset) -> tuple[list[Passage], dict]:
@@ -420,6 +461,8 @@ async def build(llm: Llm, corpus, concept: dict, *, embed=None, on_event=None) -
         if not neighbours:
             return [], {"tried": 0, "kept": 0}
         found = await gather_citation_passages(corpus, query, neighbours, per_query=bud["per_query"], exclude=exclude)
+        TR.emit("citation_walk", seed_paper=dense[0].arxiv_id, candidates=neighbours,
+               kept=_passage_refs(found))
         return found, {"tried": len(neighbours), "kept": len(found)}
 
     async def full_paper_round(passages: list[Passage], exclude: frozenset) -> tuple[list[Passage], str]:
@@ -435,13 +478,19 @@ async def build(llm: Llm, corpus, concept: dict, *, embed=None, on_event=None) -
         whole = [p for p in whole if p.chunk_id not in exclude]
         if len(whole) <= len(passages):
             return passages, ""
+        TR.emit("full_paper_read", arxiv_id=only, chunks=len(whole))
         return whole, only
 
     async def one(facet: str, query: str, exclude: frozenset, *, round_n: int) -> tuple:
         """One research round on `query` (the facet itself for round 1, or a later round's
         named gap); citation walk and full-paper read only apply to a facet's first round,
         where "the round's own top result" still means the facet as a whole."""
-        dense = await gather_passages(corpus, concept, focus=query, exclude=exclude, per_query=bud["per_query"])
+        # Its own gathered task (queries/thin/gapped all fan out through asyncio.gather), so
+        # labelling this task's context does not bleed into any sibling facet's or round's
+        # events -- see trace.py's module docstring.
+        TR.set_phase(f"facet: {facet} (round {round_n})")
+        dense = await gather_passages(corpus, concept, focus=query, exclude=exclude,
+                                      per_query=bud["per_query"], embed=embed)
         cited, cite_stats = ([], {"tried": 0, "kept": 0})
         if round_n == 1:
             cited, cite_stats = await citation_round(query, dense, exclude | frozenset(p.chunk_id for p in dense))
@@ -490,3 +539,71 @@ async def build(llm: Llm, corpus, concept: dict, *, embed=None, on_event=None) -
             "trace": {"coverage": coverage, "budget": bud, "rounds": [r for _, _, _, r in rounds],
                       "claims": len(claims), "papers": len({c.paper for c in claims}),
                       "comparisons": compared, "ms": round((time.time() - t0) * 1000)}}
+
+
+def _dominant_paper(passages: list[Passage]) -> str | None:
+    """The paper behind most of a thin topic's passages, when there plainly is one -- worth
+    reading in full precisely because the corpus is otherwise offering little else on the
+    topic to corroborate or contradict it against."""
+    if len(passages) < FULL_PAPER_MIN_PASSAGES:
+        return None
+    counts: dict[str, int] = {}
+    for p in passages:
+        counts[p.arxiv_id] = counts.get(p.arxiv_id, 0) + 1
+    arxiv_id, n = max(counts.items(), key=lambda kv: kv[1])
+    return arxiv_id if n / len(passages) >= FULL_PAPER_DOMINANCE else None
+
+
+async def research_topic(llm: Llm, corpus, concept: dict, *, focus: str, exclude: frozenset,
+                         per_query: int = 8, embed=None, first_key: int = 1
+                         ) -> tuple[list[Claim], int, int, int, dict]:
+    """One narrow topic's research -- a lesson section, whose heading+focus is already a single
+    specific angle, unlike `build`'s concept-wide facets. Still widens via the citation graph,
+    and reads a dominant paper whole, exactly when a coverage probe says the topic's own pull
+    looks thin -- the same escalation `build`'s per-facet rounds use (`citation_round`/
+    `full_paper_round`, nested there), standalone here so `depth.py`'s per-section research
+    gets it too without running a whole concept's worth of facets for one section.
+
+    Returns what `extract` does, plus a `trace` a caller may show or log:
+    {"coverage": {...}, "tier": ..., "passages": n, "widened": bool,
+    "full_paper": arxiv_id|None}."""
+    passages = await gather_passages(corpus, concept, focus=focus, exclude=exclude,
+                                     per_query=per_query, embed=embed)
+    coverage = await asyncio.to_thread(corpus.coverage, focus)
+    tier = coverage_tier(coverage)
+    trace = {"coverage": coverage, "tier": tier, "widened": False, "full_paper": None}
+    TR.emit("coverage_probe", query=focus, coverage=coverage, tier=tier)
+    if tier == "thin":
+        papers = list(dict.fromkeys(p.arxiv_id for p in passages))
+        if papers:
+            hops = await asyncio.gather(*(asyncio.to_thread(corpus.neighbours, a) for a in papers))
+            seen_papers = set(papers)
+            neighbours: list[str] = []
+            for hop in hops:
+                for a in (hop.get("cites", []) or []) + (hop.get("cited_by", []) or []):
+                    if a not in seen_papers and a not in neighbours:
+                        neighbours.append(a)
+            neighbours = neighbours[:CITATION_NEIGHBOURS]
+            if neighbours:
+                more = await gather_citation_passages(
+                    corpus, focus, neighbours, per_query=per_query,
+                    exclude=exclude | frozenset(p.chunk_id for p in passages))
+                if more:
+                    TR.emit("citation_walk", seed_papers=papers, candidates=neighbours,
+                           kept=_passage_refs(more))
+                    passages = passages + more
+                    trace["widened"] = True
+        dominant = _dominant_paper(passages)
+        if dominant:
+            version = next((p.version for p in passages if p.arxiv_id == dominant), 0)
+            whole = await asyncio.to_thread(corpus.full_paper, dominant, version)
+            have = exclude | {p.chunk_id for p in passages}
+            whole = [p for p in whole if p.chunk_id not in have]
+            if whole:
+                TR.emit("full_paper_read", arxiv_id=dominant, chunks=len(whole))
+                passages = passages + whole
+                trace["full_paper"] = dominant
+    trace["passages"] = len(passages)
+    claims, dropped, merged, off_topic = await extract(llm, concept, passages, embed=embed,
+                                                        focus=focus, first_key=first_key)
+    return claims, dropped, merged, off_topic, trace

@@ -477,3 +477,52 @@ def test_build_works_with_no_on_event_given():
             ("extract atomic claims", extract_reply([{"passage": 1, "claim": "Warmup avoids early loss spikes."}])[1]),
             ("strict fact-checker", "supports"))
     assert run(CL.build(m, fc, concept()))["trace"]["rounds"]
+
+
+# ── diversity dedup, dominant-paper read, and the standalone single-topic researcher ────────
+
+def test_near_duplicate_passages_from_different_papers_are_deduplicated_when_embed_is_given():
+    ps = [passage(1, LONG, arxiv="2401.1"), passage(2, LONG, arxiv="2402.2")]
+    corpus = FakeCorpus(default=ps)
+    same = lambda t: [1.0, 0.0]
+    got = run(CL.gather_passages(corpus, concept(), embed=same))
+    assert len(got) == 1
+
+
+def test_dominant_paper_needs_both_enough_passages_and_a_clear_majority():
+    assert CL._dominant_paper([passage(1, LONG, arxiv="2401.1")]) is None  # below FULL_PAPER_MIN_PASSAGES
+    ps = [passage(i, LONG, arxiv="2401.1") for i in range(1, 3)] + [passage(3, LONG, arxiv="2402.2")]
+    assert CL._dominant_paper(ps) == "2401.1"
+    even = [passage(1, LONG, arxiv="a"), passage(2, LONG, arxiv="b"), passage(3, LONG, arxiv="c")]
+    assert CL._dominant_paper(even) is None
+
+
+def test_research_topic_leaves_a_typical_pull_alone():
+    ps = [passage(1, "a " + LONG, arxiv="2401.1")]
+    fc = FakeCorpus(default=ps, coverage={"chunks": 20, "papers": 8})
+    m = llm(("CLAIM:", "supports"), extract_reply([{"passage": 1, "claim": "Warmup avoids early loss spikes."}]))
+    claims, *_rest, trace = run(CL.research_topic(m, fc, concept(), focus="warmup", exclude=frozenset()))
+    assert trace["tier"] == "typical" and not trace["widened"] and trace["full_paper"] is None
+    assert len(claims) == 1
+
+
+def test_research_topic_widens_a_thin_pull_via_the_citation_graph():
+    seed = passage(1, LONG, arxiv="2401.1")
+    neighbour = passage(2, LONG, arxiv="2401.2")
+    # The generic gather query only ever finds the seed paper; the neighbour is reachable only
+    # through the papers-filtered widen search (FakeCorpus.search(papers=...) draws from by_paper).
+    fc = FakeCorpus(default=[seed], coverage={"chunks": 2, "papers": 1},
+                    by_paper=[seed, neighbour], neighbours={"2401.1": {"cites": ["2401.2"], "cited_by": []}})
+    m = llm(("CLAIM:", "supports"), extract_reply([]))
+    *_rest, trace = run(CL.research_topic(m, fc, concept(), focus="warmup", exclude=frozenset()))
+    assert trace["tier"] == "thin" and trace["widened"] is True
+
+
+def test_research_topic_reads_the_full_paper_when_one_dominates_a_thin_pull():
+    ps = [passage(i, LONG, arxiv="2401.1") for i in range(1, 3)]  # capped at MAX_PER_PAPER=2
+    whole = [passage(1, LONG, arxiv="2401.1"), passage(2, LONG, arxiv="2401.1"), passage(99, "more " + LONG, arxiv="2401.1")]
+    fc = FakeCorpus(default=ps, coverage={"chunks": 2, "papers": 1}, full_papers={"2401.1": whole})
+    m = llm(("CLAIM:", "supports"), extract_reply([]))
+    *_rest, trace = run(CL.research_topic(m, fc, concept(), focus="warmup", exclude=frozenset()))
+    assert trace["full_paper"] == "2401.1"
+    assert trace["passages"] == len(ps) + 1, "only the one genuinely new chunk from the full read"

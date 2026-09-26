@@ -17,6 +17,7 @@ from lara.learn import lesson as LE
 from lara.learn import pipeline as PL
 from lara.learn import scope as SC
 from lara.learn import store
+from lara.learn import trace as TR
 from lara.learn.llm import Llm
 from lara.learn.passages import CorpusRetriever, embed_fn
 from lara.serve import generate as G
@@ -233,6 +234,22 @@ def concept(course_id: str, cid: str) -> JSONResponse:
         "quiz": {"items": len(quiz.get("items", [])), "dropped": quiz.get("dropped", 0)},
         "build": store.load_build(course_id, cid), "sources": meta["sources"],
         "state": LN.concept_state(learner, cid)})
+
+
+@router.get("/api/learn/courses/{course_id}/concepts/{cid}/trace")
+def concept_trace(course_id: str, cid: str, since: int = 0) -> JSONResponse:
+    """Every prompt, retrieval and tool call behind this concept's most recent build -- the
+    Profile tab. `since` is the last `seq` the caller already has, so polling only sends what
+    is new; the file itself is overwritten at the start of each build, so a poll spanning a
+    rebuild sees a gap rather than a mix of two builds' events (the client restarts from 0
+    when a returned `seq` is not strictly increasing from what it last saw)."""
+    course = _course(course_id)
+    if course is None:
+        return _err(f"no course {course_id}", 404)
+    if not any(c["id"] == cid for c in course["concepts"]):
+        return _err(f"no concept {cid}", 404)
+    rows = TR.read(store.trace_path(course_id, cid), since=since)
+    return JSONResponse({"events": rows})
 
 
 @router.post("/api/learn/courses/{course_id}/concepts/{cid}/build")

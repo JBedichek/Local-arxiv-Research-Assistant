@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
-
+from lara.learn import trace as TR
 
 CHARS_PER_TOKEN = 3.8
 WINDOW_MARGIN_TOKENS = 1_500
@@ -47,10 +48,19 @@ class Llm:
         room = reply_room(self.window, prompt, system, default=default, cap=cap)
         if self._sem is None:
             self._sem = asyncio.Semaphore(self.limit)
+        t0 = time.perf_counter()
         async with self._sem:
             text = await self.complete(self.cfg, prompt, system=system, model=self.model,
                                        max_tokens=room)
-        return (text or "").strip()
+        text = (text or "").strip()
+        # Every LLM call in the Learn engine passes through here already tagged with a
+        # `stage` purpose, so this one line is what makes the whole pipeline's prompts and
+        # responses visible to the Profile tab -- see trace.py. A no-op when nothing is
+        # tracing. Independent of `metered()`'s wrap of `.complete` below -- both can be
+        # active on the same `Llm` at once.
+        TR.emit("llm_call", purpose=stage, system=system, prompt=prompt, response=text,
+                duration_ms=round((time.perf_counter() - t0) * 1000))
+        return text
 
     async def ask_json(self, system: str, prompt: str, **kw) -> Any:
         """The parsed JSON in the reply, or None -- a malformed reply is a failed step the

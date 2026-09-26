@@ -16,6 +16,7 @@ from lara.learn import lesson as LE
 from lara.learn import quiz as QZ
 from lara.learn import store
 from lara.learn import topics as TP
+from lara.learn import trace as TR
 from lara.learn import visuals as VS
 from lara.learn.llm import Llm, TokenMeter, metered
 
@@ -102,12 +103,20 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
             content.pop("expansions", None)
             content.pop("topic_docs", None)
         elif stage == "lesson":
-            content["lesson"] = await LE.compose(llm, concept, content.get("claims", []),
-                                                 content.get("conflicts", []),
-                                                 [prereqs[p] for p in concept["prereqs"]])
+            # The default reading path researches a small outline section by section, the
+            # same machinery a "thorough" or N-page request uses (`depth.deepen`), rather
+            # than one flat pass over a fixed pull of passages -- see DP.STANDARD_PAGES.
+            lesson, changes = await DP.deepen(llm, corpus, concept, content, DP.STANDARD_PAGES,
+                                              embed=embed, quiet_shortfall=True)
+            lesson["variant"] = "standard"
+            if changes:
+                content["claims"], content["conflicts"] = changes["claims"], changes["conflicts"]
+            content["lesson"] = lesson
         elif stage == "topics":
+            TR.set_phase("topics")
             content["topics"] = await TP.extract_topics(llm, concept, content.get("lesson"))
         elif stage == "quiz":
+            TR.set_phase("quiz")
             content["quiz"] = await QZ.build(llm, concept, content.get("claims", []))
         elif stage == "visuals":
             content["visuals"] = await VS.build(llm, concept, content.get("claims", []),
@@ -121,6 +130,11 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
     pending = [s for s in STAGES if s in stages and (force or not _stage_done(content, s))]
     if pending:
         note(started=time.time(), tokens_in=0, tokens_out=0)
+    # A fresh trace for this build only: `ensure_concept` runs each build in its own asyncio
+    # task, which gets its own copy of this context, so concurrent builds' tracers never
+    # collide even though the tracer itself is "global" state -- see trace.py's docstring.
+    TR.start(store.trace_path(course["id"], cid))
+    TR.emit("build_start", variant="standard", forced=force)
     try:
         for stage in STAGES:
             if stage in stages and (force or not _stage_done(content, stage)):
@@ -132,6 +146,8 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
     except Exception as e:                                     # noqa: BLE001
         note(stage="error", error=f"{type(e).__name__}: {e}")
         raise
+    finally:
+        TR.stop()
     return content
 
 
@@ -260,6 +276,8 @@ async def write_variant(llm: Llm, corpus, course: dict, cid: str, variant: str, 
         def note(**kw) -> None:
             store.save_build(course["id"], cid, {"variant": key, "error": "", **kw})
 
+        TR.start(store.trace_path(course["id"], cid))
+        TR.emit("build_start", variant=key, forced=False)
         try:
             note(stage=f"writing {key}", detail="starting")
             if key == "tldr":
@@ -285,6 +303,8 @@ async def write_variant(llm: Llm, corpus, course: dict, cid: str, variant: str, 
         except Exception as e:                                 # noqa: BLE001
             note(stage="error", error=f"{type(e).__name__}: {e}")
             raise
+        finally:
+            TR.stop()
     return lesson
 
 

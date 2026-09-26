@@ -137,7 +137,7 @@ def test_a_failing_stage_is_recorded_on_the_course_and_partial_work_is_kept():
     course = ready_course(m)
 
     async def boom(cfg, prompt, *, system="", **kw):
-        if "write a lesson" in system:
+        if "plan a self-study lesson" in system:
             raise RuntimeError("model down")
         return await m.complete(cfg, prompt, system=system, **kw)
 
@@ -223,7 +223,12 @@ def test_a_stale_lesson_is_regenerated_without_redoing_the_other_stages():
     store.save_concept(course["id"], "c1", content)
     m.calls.clear()
     run(PL.build_concept(m, corpus(), course, "c1"))
-    assert any("write a lesson" in s for s, _ in m.calls) and not any("extract atomic" in s for s, _ in m.calls)
+    # The standard lesson researches its own outline section by section, so regenerating it
+    # does re-plan and re-write -- but the concept's fixed passages are already fully used by
+    # the claims stage, so no section's own research actually finds (or extracts) anything new.
+    assert any("plan a self-study lesson" in s for s, _ in m.calls)
+    assert any("write ONE section" in s for s, _ in m.calls)
+    assert not any("extract atomic" in s for s, _ in m.calls)
     assert not store.load_concept(course["id"], "c1")["lesson"].get("stale")
 
 
