@@ -393,3 +393,11 @@ speech:
     # for the full list (af_* = American female, am_* = American male, bf_*/bm_* = British).
     voice: af_heart
     device: auto
+
+learn:
+  # After a Learn lesson is written, have a simulated reader who knows exactly what the
+  # learner profile says read it, and rewrite (from the same sources, re-checked) the
+  # sentences it could not follow -- lara/learn/reader.py. Off by default: one more model
+  # call per section, and its flags are unproven until checked against real "explain
+  # this" highlights.
+  simulated_reader: false

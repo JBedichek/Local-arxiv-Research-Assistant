@@ -397,6 +397,22 @@ def test_complete_returns_empty_string_on_error(monkeypatch):
     assert asyncio.run(GEN.complete(None, "p", system="s")) == ""
 
 
+def test_complete_on_token_sees_every_chunk_and_still_matches_the_return(monkeypatch):
+    # `on_token` is additive: the accumulated `buf` GEN.complete returns must still equal
+    # the joined chunks on_token was called with, not some other view of the stream.
+    monkeypatch.setattr(GEN, "stream_answer", _fake_stream("hello world"))
+    seen = []
+    out = asyncio.run(GEN.complete(None, "p", system="s", on_token=seen.append))
+    assert "".join(seen) == out == "hello world"
+
+
+def test_complete_without_on_token_is_unaffected(monkeypatch):
+    # The default (None) must be a no-op change for the ~19 existing call sites that
+    # never pass it.
+    monkeypatch.setattr(GEN, "stream_answer", _fake_stream("unaffected"))
+    assert asyncio.run(GEN.complete(None, "p", system="s")) == "unaffected"
+
+
 # ── sampling reaches the server, or the caller hears why not ──────────────────────
 
 def _capturing_stream(seen):
@@ -1200,6 +1216,76 @@ def test_the_window_and_threshold_are_configurable():
 def test_the_round_cap_is_still_a_hard_ceiling():
     assert round_limit_reached(10, 10) and not round_limit_reached(9, 10)
     assert not round_limit_reached(999, 0), "0 disables the cap"
+
+
+# ── synthesis: formulating a search query ─────────────────────────────────────────
+#
+# A goal's own text was used verbatim as the first round's query, and repeated verbatim
+# on a dry round that found nothing at all -- see formulate_query's own docstring for the
+# regression this replaces.
+
+
+def test_formulate_query_asks_for_the_first_attempt_system_prompt(monkeypatch):
+    seen = {}
+
+    async def fake_complete_json(cfg, prompt, *, system, **kw):
+        seen["system"] = system
+        seen["prompt"] = prompt
+        return {"query": "K-center greedy diverse subset selection"}
+
+    monkeypatch.setattr(GEN, "complete_json", fake_complete_json)
+    q = asyncio.run(_SY.formulate_query(
+        None, "how does K-center greedy compare to random sampling for diversity", None))
+    assert q == "K-center greedy diverse subset selection"
+    assert seen["system"] == _SY.QUERY_SYSTEM
+    assert "K-center greedy" in seen["prompt"]
+
+
+def test_formulate_query_falls_back_to_the_raw_question_when_the_call_fails(monkeypatch):
+    async def fake_complete_json(cfg, prompt, *, system, **kw):
+        return None
+
+    monkeypatch.setattr(GEN, "complete_json", fake_complete_json)
+    q = asyncio.run(_SY.formulate_query(None, "what is a Vendi score", None))
+    assert q == "what is a Vendi score"
+
+
+def test_formulate_query_falls_back_to_the_raw_question_on_an_empty_reply(monkeypatch):
+    async def fake_complete_json(cfg, prompt, *, system, **kw):
+        return {"query": "   "}
+
+    monkeypatch.setattr(GEN, "complete_json", fake_complete_json)
+    q = asyncio.run(_SY.formulate_query(None, "what is a Vendi score", None))
+    assert q == "what is a Vendi score"
+
+
+def test_formulate_query_retry_uses_the_retry_system_prompt_and_names_the_failure(monkeypatch):
+    seen = {}
+
+    async def fake_complete_json(cfg, prompt, *, system, **kw):
+        seen["system"] = system
+        seen["prompt"] = prompt
+        return {"query": "coreset selection diverse pretraining data"}
+
+    monkeypatch.setattr(GEN, "complete_json", fake_complete_json)
+    q = asyncio.run(_SY.formulate_query(
+        None, "diversity-aware data selection", None,
+        failed_query="K-center greedy diverse subset selection"))
+    assert q == "coreset selection diverse pretraining data"
+    assert seen["system"] == _SY.RETRY_QUERY_SYSTEM
+    assert "K-center greedy diverse subset selection" in seen["prompt"]
+
+
+def test_formulate_query_retry_falls_back_to_the_question_not_the_failed_query(monkeypatch):
+    # Falling back to `failed_query` would retry the exact string already known to find
+    # nothing -- see formulate_query's own docstring on why the fallback is `question`.
+    async def fake_complete_json(cfg, prompt, *, system, **kw):
+        return None
+
+    monkeypatch.setattr(GEN, "complete_json", fake_complete_json)
+    q = asyncio.run(_SY.formulate_query(
+        None, "diversity-aware data selection", None, failed_query="a query that found nothing"))
+    assert q == "diversity-aware data selection"
 
 
 # ── the thorough-answer token budget ───────────────────────────────────────────────

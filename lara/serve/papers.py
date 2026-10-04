@@ -33,9 +33,6 @@ STRIP = " | ".join([
     "//*[@id='selectedTextModalDescription']",
 ])
 
-_dctx = zstd.ZstdDecompressor()
-
-
 def _resolve(url: str, origin: str, doc_base: str, html_root: str, arxiv_id: str) -> str:
     """Turn one relative reference into an absolute one.
 
@@ -85,8 +82,14 @@ def _absolutize(root, arxiv_id: str, version: int = 1, source: str = "arxiv_html
 
 @functools.lru_cache(maxsize=32)
 def render(path_str: str, arxiv_id: str, version: int = 1) -> str:
-    """Decompress, sanitise and return the paper body. Cached — re-opens are free."""
-    raw = _dctx.decompress(Path(path_str).read_bytes())
+    """Decompress, sanitise and return the paper body. Cached — re-opens are free.
+
+    A fresh `ZstdDecompressor` per call, not a shared module-level one: concurrent
+    requests run this via a thread pool, and a decompressor instance shared across
+    threads is exactly the kind of thing that segfaults under a race rather than
+    raising a catchable Python exception — construction is cheap, so there is no real
+    cost to giving every call its own."""
+    raw = zstd.ZstdDecompressor().decompress(Path(path_str).read_bytes())
     root = LH.fromstring(raw)
 
     for el in root.xpath(STRIP):

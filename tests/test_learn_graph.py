@@ -66,3 +66,74 @@ def test_skeleton_prefers_overview_papers_and_caps_per_paper():
          [passage(10, LONG, arxiv="2401.8", title="A Survey of Things")]
     got = run(G.skeleton(FakeCorpus(default=ps), "goal", []))
     assert got[0].arxiv_id == "2401.8" and sum(p.arxiv_id == "2401.9" for p in got) == G.MAX_PER_PAPER
+
+
+# ── the research-driven path: subjects grouping concepts, not a flat list ──────────
+
+def _refs(*keys):
+    return {k: {"chunk_id": int(k), "arxiv_id": "2401.1", "title": "A paper"} for k in keys}
+
+
+async def _synth_result(objective: str) -> dict:
+    return {"subjects": [
+        {"title": "Fundamentals", "summary": "The basics.",
+         "concepts": [{"title": "Warmup", "summary": "Warmup helps [1].",
+                      "prereqs_text": "", "competencies": ["sched"]},
+                     {"title": "Decay", "summary": "Decay too [2].",
+                      "prereqs_text": "after Warmup", "competencies": ["sched"]}]},
+        {"title": "No sources", "summary": "",
+         "concepts": [{"title": "Unsupported", "summary": "Nothing cited here.",
+                      "prereqs_text": "", "competencies": []}]},
+    ], "references": _refs("1", "2"), "degraded": False, "tokens_in": 9, "tokens_out": 4,
+           "rounds": 2}
+
+
+def test_build_from_research_flattens_subjects_into_the_same_concepts_pipeline_expects():
+    out = run(G.build_from_research(course(), synth=_synth_result))
+    assert [c["title"] for c in out["concepts"]] == ["Warmup", "Decay"]
+    assert out["dropped"] == 1, "the uncited 'Unsupported' concept is dropped, like G.build's own"
+
+
+def test_build_from_research_keeps_subject_grouping_alongside_the_flat_list():
+    out = run(G.build_from_research(course(), synth=_synth_result))
+    assert len(out["subjects"]) == 1, "the empty 'No sources' subject drops out entirely"
+    subj = out["subjects"][0]
+    assert subj["title"] == "Fundamentals"
+    warmup, decay = out["concepts"]
+    assert subj["concept_ids"] == [warmup["id"], decay["id"]]
+    assert warmup["subject"] == subj["id"] and decay["subject"] == subj["id"]
+
+
+def test_build_from_research_still_resolves_prereqs_across_subject_boundaries():
+    # "after Warmup" names another concept by title -- the same substring match G.build's
+    # research-driven sibling already does, unaffected by which subject either sits in.
+    out = run(G.build_from_research(course(), synth=_synth_result))
+    warmup, decay = out["concepts"]
+    assert decay["prereqs"] == [warmup["id"]]
+
+
+async def _synth_no_subjects(objective: str) -> dict:
+    return {"subjects": [], "references": {}, "degraded": False, "tokens_in": 0,
+           "tokens_out": 0, "rounds": 0}
+
+
+def test_build_from_research_with_no_subjects_yields_an_honestly_empty_course():
+    out = run(G.build_from_research(course(), synth=_synth_no_subjects))
+    assert out["concepts"] == [] and out["subjects"] == []
+
+
+def test_revise_from_research_replaces_the_concept_map_from_the_resumed_graph():
+    calls = {}
+
+    async def revise(feedback: str) -> dict:
+        calls["feedback"] = feedback
+        return {"subjects": [{"title": "Fundamentals", "summary": "",
+                              "concepts": [{"title": "Only decay", "summary": "Decay [2].",
+                                           "prereqs_text": "", "competencies": []}]}],
+               "references": _refs("2"), "degraded": False, "tokens_in": 1, "tokens_out": 1,
+               "rounds": 1}
+
+    out = run(G.revise_from_research(course(), "drop warmup", revise=revise))
+    assert calls["feedback"] == "drop warmup"
+    assert [c["title"] for c in out["concepts"]] == ["Only decay"]
+    assert out["subjects"][0]["title"] == "Fundamentals"

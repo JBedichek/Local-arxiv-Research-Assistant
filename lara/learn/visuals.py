@@ -167,10 +167,23 @@ async def figures_in(claims: list[dict], corpus) -> list[dict]:
     itself -- this only has to find the image, not check it. `corpus` is a CorpusRetriever
     (or anything with its `.figure` method); None (the diagnostic-only path, or a caller with
     no corpus at all) yields nothing, same as `corpus.figure` itself already does when no
-    lookup was injected into it."""
+    lookup was injected into it.
+
+    A research-driven-pipeline lesson's claims (lara.learn.research._pseudo_claim) never
+    have this -- synthesis's own `Reference` carries no `kind`/`anchor`, the structured
+    caption metadata only `passages.Passage` extraction ever had -- so `candidates` above
+    is always empty for them, not because their papers have no figures. The fallback below
+    recovers what it can: for each paper a live claim actually cites, look up that paper's
+    own caption passages directly (`corpus.full_paper`, already available on
+    `CorpusRetriever` -- no new corpus API needed) rather than faking `kind`/`anchor` data
+    that was never gathered. This is a looser coupling than the claim-level one above (a
+    paper this lesson cites has this figure, not this exact sentence's source IS this
+    caption) but every figure returned is still real: a genuine caption from a paper the
+    lesson's own citations name, never a fabricated one."""
     if corpus is None:
         return []
-    candidates = [c for c in _live(claims) if (p := c.get("passage") or {}).get("kind") == "caption"
+    live = _live(claims)
+    candidates = [c for c in live if (p := c.get("passage") or {}).get("kind") == "caption"
                  and p.get("anchor") and p.get("arxiv_id")]
     found = await asyncio.gather(*(
         asyncio.to_thread(corpus.figure, c["passage"]["arxiv_id"], c["passage"].get("version") or 1,
@@ -185,6 +198,32 @@ async def figures_in(claims: list[dict], corpus) -> list[dict]:
         out.append({"kind": "figure", "title": c["text"][:120], "src": img["src"],
                     "caption": img.get("caption") or c["passage"].get("text", ""),
                     "arxiv_id": c["passage"]["arxiv_id"], "claims": [c["key"]]})
+
+    if out or not hasattr(corpus, "full_paper"):
+        return out
+
+    by_paper: dict[tuple[str, int], list[str]] = {}
+    for c in live:
+        p = c.get("passage") or {}
+        aid = p.get("arxiv_id")
+        if aid and p.get("kind") != "caption":
+            by_paper.setdefault((aid, int(p.get("version") or 1)), []).append(c["key"])
+    papers_keys = list(by_paper)
+    papers = await asyncio.gather(*(
+        asyncio.to_thread(corpus.full_paper, aid, version) for aid, version in papers_keys))
+    fig_candidates = [(aid, version, chunk, by_paper[(aid, version)])
+                      for (aid, version), chunks in zip(papers_keys, papers)
+                      for chunk in chunks if chunk.kind == "caption" and chunk.anchor]
+    imgs = await asyncio.gather(*(
+        asyncio.to_thread(corpus.figure, aid, version, chunk.anchor)
+        for aid, version, chunk, _ in fig_candidates))
+    for (aid, _version, chunk, cited_keys), img in zip(fig_candidates, imgs):
+        if not img or not img.get("src") or img["src"] in seen_src:
+            continue
+        seen_src.add(img["src"])
+        out.append({"kind": "figure", "title": chunk.text[:120], "src": img["src"],
+                    "caption": img.get("caption") or chunk.text, "arxiv_id": aid,
+                    "claims": cited_keys})
     return out
 
 

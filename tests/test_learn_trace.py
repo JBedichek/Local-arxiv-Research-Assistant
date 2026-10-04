@@ -1,12 +1,12 @@
 import asyncio
 
 import pytest
+from learn_helpers import corpus, model
 
 from lara.learn import pipeline as PL
 from lara.learn import scope as SC
 from lara.learn import store
 from lara.learn import trace as TR
-from learn_helpers import corpus, model
 
 
 def run(c):
@@ -151,3 +151,49 @@ def test_the_trace_route_serves_the_written_events(_root):
     assert json.loads(resp2.body)["events"] == []
     assert LR.concept_trace("nope", "c1").status_code == 404
     assert LR.concept_trace(course["id"], "nope").status_code == 404
+
+
+# ── Phase 1: course mapping, traced too ─────────────────────────────────────────────
+
+async def _fake_topic_graph_synth(objective: str) -> dict:
+    return {"subjects": [{"title": "Fundamentals", "summary": "",
+                          "concepts": [{"title": "Warmup basics",
+                                       "summary": "What warmup does [1].",
+                                       "prereqs_text": "", "competencies": []}]}],
+           "references": {"1": {"chunk_id": 1, "arxiv_id": "1234.5678", "title": "A paper"}},
+           "degraded": False, "tokens_in": 10, "tokens_out": 5, "rounds": 1}
+
+
+def test_a_research_driven_map_writes_a_trace(_root):
+    m = model()
+    course = run(SC.begin(m, "learn pretraining"))
+    course = run(PL.map_course(m, corpus(), course, topic_graph_synth=_fake_topic_graph_synth))
+    rows = TR.read(store.map_trace_path(course["id"]))
+    assert rows and rows[0]["type"] == "map_start"
+    assert any(r["type"] == "topic_graph_research" for r in rows)
+    assert course["concepts"] and course["concepts"][0]["title"] == "Warmup basics"
+
+
+def test_a_blind_map_writes_no_trace_file(_root):
+    """G.build's one blind call has nothing worth polling for -- no topic_graph_synth,
+    no trace file at all, not an empty one."""
+    m = model()
+    course = run(SC.begin(m, "learn pretraining"))
+    course = run(PL.map_course(m, corpus(), course))
+    assert not store.map_trace_path(course["id"]).exists()
+
+
+def test_the_map_trace_route_serves_the_written_events(_root):
+    import json
+
+    from lara.serve.routes import learn as LR
+
+    m = model()
+    course = run(SC.begin(m, "learn pretraining"))
+    course = run(PL.map_course(m, corpus(), course, topic_graph_synth=_fake_topic_graph_synth))
+    resp = LR.map_trace(course["id"])
+    events = json.loads(resp.body)["events"]
+    assert events and events[0]["type"] == "map_start"
+    resp2 = LR.map_trace(course["id"], since=events[-1]["seq"])
+    assert json.loads(resp2.body)["events"] == []
+    assert LR.map_trace("nope").status_code == 404

@@ -736,7 +736,7 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
   font-family: var(--paper-font, inherit); font-size: var(--paper-size, 16px);
   line-height: var(--paper-leading, 1.6); }
 #learn-main button, #synth-main button { font: inherit; font-size: .9em; }
-#learn-pop { --ink: var(--text); z-index: 60; }
+#learn-pop { --ink: var(--text); }
 #learn h3 { margin: .8em 0 .3em; }
 #learn h4 { margin: 1em 0 .4em; color: var(--dim); font-size: .95em; }
 #learn .lede { color: var(--dim); max-width: 70ch; margin-top: 0; }
@@ -765,6 +765,16 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .learn-courses, #learn .learn-comps, #learn .learn-progress, #learn .claims, #learn .conflicts, #learn .critique { padding-left: 1.1em; }
 #learn .learn-courses { list-style: none; padding: 0; }
 #learn .learn-course { display: flex; gap: 12px; align-items: baseline; padding: 4px 0; }
+/* The plan-review list (course map) and lesson/plan revision history -- both plain
+ * fact lists, not the flowing prose .lede/.hint already style. */
+#learn .learn-plan { list-style: none; padding: 0; max-width: 70ch; }
+#learn .learn-plan li { padding: 8px 0; border-bottom: 1px solid var(--line); }
+#learn .learn-plan li:last-child { border-bottom: none; }
+#learn .learn-plan p { margin: 4px 0 0; }
+/* One subject's own lessons, in the plan-review outline -- see planReviewView. */
+#learn .learn-subject { margin: 18px 0; }
+#learn .learn-subject h5 { margin: 0 0 2px; font-size: 1.0714em; }
+#learn .learn-subject > .hint { margin: 0 0 6px; }
 /* A lesson is read, not scanned -- centered as a column instead of pinned to the left edge
  * of a full-width overlay, the way the course list and concept map stay full width. */
 #learn .learn-concept { max-width: 86ch; margin: 0 auto; }
@@ -837,10 +847,16 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .ln { fill: none; stroke: var(--accent); stroke-width: 2; }
 #learn .axis { stroke: var(--line); }
 #learn .val, #learn .lab { fill: var(--dim); font-size: 0.6786em; }
-/* Highlight a lesson passage, ask for more detail inline. */
-#learn-pop { position: fixed; z-index: 30; padding: 4px 10px; font-size: 0.8214em; cursor: pointer;
+/* Highlight a lesson passage, ask for more detail inline. Above the full-screen panels
+   (Deep, Learn, Synthesize; z-index 40, see #advanced's own comment) it floats over --
+   a prior fix for this same thing landed as a z-index:60 override earlier in this file
+   (on #learn-pop's --ink rule) but never took effect: this later rule, same specificity,
+   redeclared z-index:30 and won the cascade right back. */
+#learn-pop { position: fixed; z-index: 60; display: flex; gap: 4px; }
+#learn-pop button { padding: 4px 10px; font-size: 0.8214em; cursor: pointer;
              background: var(--accent); color: var(--bg); border: 0; border-radius: 6px;
              box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35); }
+#learn .learn-card.plan p { margin: 2px 0; }
 #learn .ask-panel textarea { width: 100%; box-sizing: border-box; margin: 6px 0; }
 /* Voice: mic button beside the ask textarea, and the read-aloud bar above a lesson. */
 #learn .ask-row { display: flex; gap: 6px; align-items: flex-start; }
@@ -898,6 +914,15 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .trace-row summary > :first-child { flex: 1; }
 #learn .trace-row pre { margin: 8px 0 0; font-size: 0.8em; white-space: pre-wrap; word-break: break-word;
                 background: var(--panel-2); padding: 6px 10px; border-radius: 4px; }
+/* The deliverable itself, growing section by section while a research-driven build is
+ * live -- shown unfolded and up front, not collapsed inside a trace-row like everything
+ * else here, since this is the one thing in the Profile tab meant to be watched rather
+ * than dug into. */
+#learn .trace-live { margin: 0 0 20px; border: 1px solid var(--accent); border-radius: 6px;
+              padding: 10px 12px; background: var(--panel-2); }
+#learn .trace-live h4 { margin: 0 0 6px; }
+#learn .trace-live-text { margin: 0; font-size: 0.8571em; white-space: pre-wrap; word-break: break-word;
+                  max-height: 40vh; overflow-y: auto; }
 /* Sources bibliography + the Profile tab's retrieved-passage lists -- neither existed here
  * before: claims/citations were shown per-claim (learn-card.claim) or not surfaced as a list
  * at all. */

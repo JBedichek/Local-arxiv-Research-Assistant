@@ -5,7 +5,9 @@ justify it -- a concept nothing in the corpus discusses is dropped."""
 from __future__ import annotations
 
 import asyncio
+import re
 
+from lara.learn import trace as TR
 from lara.learn.llm import Llm
 from lara.learn.passages import Passage
 
@@ -115,3 +117,184 @@ async def build(llm: Llm, corpus, course: dict) -> dict:
     covered = {x for c in ordered for x in c["competencies"]}
     return {"concepts": ordered, "removed_edges": [list(e) for e in removed], "dropped": dropped,
             "uncovered": [c["text"] for c in comps if c["id"] not in covered]}
+
+
+#: A citation bracket, matching lara.serve.citations.CITATION -- duplicated, not imported:
+#: lara.learn never imports lara.serve (see passages.CorpusRetriever's own docstring), and
+#: this is a two-line regex, not real coupling to that module's Reference/bind machinery.
+_CITE = re.compile(r"\[\s*\d+(?:\s*,\s*\d+)*\s*\]")
+_CITE_KEYS = re.compile(r"\d+")
+
+
+def cited_keys(text: str) -> list[str]:
+    """Every citation key in `text`, in order of first appearance, deduplicated."""
+    keys: list[str] = []
+    for m in _CITE.finditer(text or ""):
+        keys.extend(_CITE_KEYS.findall(m.group(0)))
+    return list(dict.fromkeys(keys))
+
+
+def _concepts_from_result(course: dict, result: dict) -> dict:
+    """{"concepts", "subjects", "removed_edges", "uncovered", "dropped"} from a `synth`/
+    `revise` result -- the shared tail of `build_from_research` (a fresh run) and
+    `revise_from_research` (a resumed one): both hand this the same shape (see
+    lara.serve.learn_research's `_parse_topic_graph`), so there is exactly one place that
+    turns a synthesis result into a concept map.
+
+    `result["subjects"]` groups this run's own candidate concepts into a hierarchy (see
+    synthesizer._finalize_topic_graph's `organize_curriculum` pass) -- flattened here into
+    the same course["concepts"] list every downstream stage (build_concept, learner
+    tracking, quiz caps, prereqs) already expects, so nothing past this function needs to
+    know a subject exists. `course["subjects"]` is that grouping, kept alongside it purely
+    for the UI: each entry names the concept ids (assigned here) that belong to it, in the
+    teaching order the curriculum-organizing pass itself chose."""
+    comps = course["competencies"]
+    refs = result.get("references") or {}
+    valid = {c["id"] for c in comps}
+    concepts: list[dict] = []
+    subjects: list[dict] = []
+    dropped = 0
+    for s_idx, s in enumerate(result.get("subjects") or [], 1):
+        if not isinstance(s, dict):
+            continue
+        sid = f"s{s_idx}"
+        concept_ids: list[str] = []
+        for item in s.get("concepts") or []:
+            if not isinstance(item, dict) or not str(item.get("title", "")).strip():
+                continue
+            summary = str(item.get("summary", "")).strip()
+            sources = [{"chunk_id": refs[k].get("chunk_id"), "arxiv_id": refs[k].get("arxiv_id"),
+                       "title": refs[k].get("paper_title") or refs[k].get("title", "")}
+                      for k in cited_keys(summary) if k in refs]
+            if not sources:
+                dropped += 1
+                continue
+            cid = f"c{len(concepts) + 1}"
+            concept_ids.append(cid)
+            concepts.append({
+                "id": cid, "subject": sid, "title": str(item["title"]).strip(),
+                "summary": summary, "_prereqs_text": str(item.get("prereqs_text", "")).strip(),
+                "competencies": [x for x in item.get("competencies") or [] if x in valid],
+                "sources": sources})
+        if concept_ids:
+            subjects.append({"id": sid, "title": str(s.get("title") or "").strip(),
+                             "summary": str(s.get("summary") or "").strip(),
+                             "concept_ids": concept_ids})
+
+    prereqs = {}
+    for c in concepts:
+        text = c.pop("_prereqs_text").lower()
+        prereqs[c["id"]] = [o["id"] for o in concepts
+                            if o["id"] != c["id"] and o["title"].lower() in text]
+    removed = break_cycles(prereqs)
+    by_id = {c["id"]: c for c in concepts}
+    for cid in order(prereqs, [c["id"] for c in concepts]):
+        by_id[cid]["prereqs"] = prereqs[cid]
+    ordered = [by_id[cid] for cid in order(prereqs, [c["id"] for c in concepts])]
+    covered = {x for c in ordered for x in c["competencies"]}
+    return {"concepts": ordered, "subjects": subjects,
+           "removed_edges": [list(e) for e in removed], "dropped": dropped,
+           "uncovered": [c["text"] for c in comps if c["id"] not in covered]}
+
+
+#: How much of a subject decomposition's answer the mapping objective carries: the map needs
+#: its structure, not every sentence, and the objective is re-read by every reasoning round.
+DECOMPOSITION_CHARS = 12_000
+
+
+def _course_objective(course: dict, decomposition: dict | None = None) -> str:
+    comps = course["competencies"]
+    listing = "\n".join(f"- {c['id']}: {c['text']}" for c in comps)
+    objective = ("Map the concepts a course on the following goal should teach, in the "
+                 "order a learner should meet them, from the paper corpus -- from the "
+                 "foundations the subject builds on to its frontier.\n\n"
+                 f"GOAL: {course['goal']}"
+                 + (f"\n\nCOMPETENCIES the course must cover:\n{listing}" if listing else ""))
+    if decomposition and decomposition.get("text"):
+        objective += ("\n\nA MAP OF THE WHOLE SUBJECT, from one thorough deep-research run -- "
+                      "start from it: its areas, from the most basic to the most advanced, are "
+                      "what the course should cover, as far as the goal needs them.\n"
+                      + decomposition["text"][:DECOMPOSITION_CHARS])
+    return objective
+
+
+async def build_from_research(course: dict, *, synth, decomposition: dict | None = None) -> dict:
+    """{"concepts", "removed_edges", "uncovered", "dropped"} for a scoped course -- same
+    shape `build` above returns, so `pipeline.map_course` does not change. Unlike `build`,
+    which makes one blind call against a handful of survey passages, this asks one full
+    course-level synthesis run (`synth`, injected -- see lara.serve.learn_research) to
+    research the course's goal first and write the concept map directly from what it
+    found: every concept still must cite the research that justifies it (`cited_keys`
+    below), the same "nothing a learner is asked to trust without a source" guarantee
+    `build`'s own passage-citation check keeps.
+
+    `synth` researches the whole course in clusters (`synthesizer._cluster_goals`), each
+    written up independently without seeing the others' concepts -- so unlike `build`,
+    which gets clean prereq ids straight from the model, a concept only has its
+    prerequisites in plain words (`prereqs_text`). Resolved here by matching another
+    concept's title inside that text; a real but inexact substitute for an id the writer
+    genuinely did not have available to it.
+
+    `decomposition`, when given (`lara.learn.decompose`), is a thorough map of the whole
+    subject folded into the objective, so the mapping run starts from it."""
+    TR.set_phase("course_research")
+    result = await synth(_course_objective(course, decomposition))
+    TR.emit("topic_graph_research", concepts_proposed=len(result.get("concepts") or []),
+           degraded=result.get("degraded"), rounds=result.get("rounds"))
+    return _concepts_from_result(course, result)
+
+
+async def revise_from_research(course: dict, feedback: str, *, revise) -> dict:
+    """Phase 1 revision: re-maps the course from a learner's feedback on the plan
+    currently awaiting their approval, by resuming the persisted course-mapping
+    synthesis graph (`revise`, injected -- see lara.serve.learn_research.
+    topic_graph_revise) instead of researching from scratch. Same return shape
+    `build_from_research` gives, so `pipeline.revise_plan` applies it the same way."""
+    TR.set_phase("course_research_revision")
+    result = await revise(feedback)
+    TR.emit("topic_graph_revision", concepts_proposed=len(result.get("concepts") or []),
+           degraded=result.get("degraded"), rounds=result.get("rounds"))
+    return _concepts_from_result(course, result)
+
+
+# ── how well the goal needs each concept ────────────────────────────────────────
+
+TIERS = ("foundation", "core", "frontier")
+
+NEED_SYSTEM = """You judge, for each concept of a self-study course, how well the LEARNER'S \
+GOAL requires knowing it, and where it sits in the subject.
+
+Reply with JSON only: {"concepts": {"<concept id>": {"need": 0-4, "tier": "foundation"|"core"|"frontier"}}}
+
+- need: 0 not at all, 1 recognise the name, 2 know what it is for and why it exists, 3 use it \
+correctly, 4 explain its mechanism and critique variants. Judge by what the learner will DO \
+with the subject, not by how important the concept is to the field.
+- tier: foundation (what the field builds on), core (its central methods), frontier (open \
+problems and recent work)."""
+
+
+def clamp_level(value, default: int = 2) -> int:
+    try:
+        return max(0, min(4, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+async def assign_needs(llm: Llm, course: dict) -> int:
+    """Sets `need` (0-4) and `tier` on every concept of `course`, in place -- what the
+    diagnostic asks about first and what a lesson's treatment plan measures the learner
+    against. A concept the reply leaves out keeps the default need, 2. Returns how many the
+    reply covered."""
+    listing = "\n".join(f"- {c['id']}: {c['title']} -- {c.get('summary', '')[:300]}"
+                         for c in course["concepts"])
+    use = f"\nTHE LEARNER WILL USE IT FOR: {course['use']}" if course.get("use") else ""
+    data = await llm.ask_json(NEED_SYSTEM, f"GOAL: {course['goal']}{use}\n\nCONCEPTS:\n{listing}",
+                              default=800, cap=3_000, stage="learn_needs")
+    found = (data or {}).get("concepts") if isinstance(data, dict) else None
+    found = found if isinstance(found, dict) else {}
+    for c in course["concepts"]:
+        got = found.get(c["id"]) if isinstance(found.get(c["id"]), dict) else {}
+        c["need"] = clamp_level(got.get("need"), default=c.get("need", 2))
+        if got.get("tier") in TIERS:
+            c["tier"] = got["tier"]
+    return sum(1 for c in course["concepts"] if c["id"] in found)
