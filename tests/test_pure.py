@@ -1271,6 +1271,69 @@ def test_consolidate_passes_the_computed_budget_to_the_thorough_call_only(monkey
     assert seen_max_tokens[1] == 400      # TLDR: untouched
 
 
+# ── fitting the evidence table ───────────────────────────────────────────────────
+#
+# The table went into the consolidation prompt whole. A long run's table could take nearly
+# the whole window and leave the answer _MIN_THOROUGH_TOKENS. The answer's room is now
+# reserved first and the lowest-scoring claims are left out of the table instead.
+
+
+def _claim(i: int, score: float) -> "_SY.Claim":
+    return _SY.Claim(chunk_id=i, arxiv_id=f"a{i}", paper_title="t", section="s",
+                     name=f"n{i}", claim=f"claim {i}", score=score)
+
+
+def test_select_evidence_keeps_the_best_scoring_claims_in_their_original_order():
+    claims = [_claim(1, 0.1), _claim(2, 0.9), _claim(3, 0.5)]
+    kept = _SY.select_evidence(claims, [10, 10, 10], room=20)
+    assert [c.chunk_id for c in kept] == [2, 3]
+
+
+def test_select_evidence_skips_a_claim_too_big_to_fit_but_keeps_looking():
+    claims = [_claim(1, 0.9), _claim(2, 0.5), _claim(3, 0.1)]
+    kept = _SY.select_evidence(claims, [50, 30, 5], room=40)
+    assert [c.chunk_id for c in kept] == [2, 3]
+
+
+def test_a_table_that_fits_is_passed_whole(monkeypatch):
+    run = _SY.Run(run_id="r", question="q?", claims=[_claim(i, i / 10) for i in range(5)])
+    _fake_context(monkeypatch, limit=131072, counts=[50, 20] + [100] * 5)
+    kept = asyncio.run(_SY.fit_evidence(_VllmCfg(), "m", run))
+    assert kept == run.claims
+
+
+def test_a_table_too_big_for_the_window_is_cut_to_leave_the_answer_room(monkeypatch):
+    run = _SY.Run(run_id="r", question="q?", claims=[_claim(i, i / 100) for i in range(100)])
+    _fake_context(monkeypatch, limit=32768, counts=[500, 50] + [400] * 100)
+    kept = asyncio.run(_SY.fit_evidence(_VllmCfg(), "m", run))
+    room = 32768 - 550 - int(32768 * _SY._ANSWER_SHARE) - _SY._CONTEXT_SAFETY_MARGIN
+    assert 0 < len(kept) < 100
+    assert len(kept) * 402 <= room
+    assert min(c.score for c in kept) > max(c.score for c in run.claims if c not in kept)
+
+
+def test_without_a_server_the_table_is_still_fitted_by_estimate(monkeypatch):
+    run = _SY.Run(run_id="r", question="q?",
+                  claims=[_SY.Claim(chunk_id=i, arxiv_id="a", paper_title="t", section="s",
+                                    name="n", claim="x" * 4000, score=i) for i in range(40)])
+    _fake_context(monkeypatch, limit=None, counts=None)
+    kept = asyncio.run(_SY.fit_evidence(_VllmCfg(), "m", run))
+    assert 0 < len(kept) < 40
+
+
+def test_consolidate_tells_the_model_when_claims_were_left_out(monkeypatch):
+    run = _SY.Run(run_id="r", question="q?", claims=[_claim(i, i / 100) for i in range(100)])
+    _fake_context(monkeypatch, limit=32768, counts=[500, 50] + [400] * 100)
+    prompts = []
+
+    async def _fake_stream_answer(cfg, prompt, hits, **kw):
+        prompts.append(prompt)
+        yield "ok."
+
+    asyncio.run(_SY.consolidate(_VllmCfg(), run, "m", _fake_stream_answer))
+    assert "left out to fit the context window" in prompts[0]
+
+
 # ── GGUF quantisation parsing ─────────────────────────────────────────────────────
 #
 # A GGUF repo ships one file per quantisation, so a download must name files rather than

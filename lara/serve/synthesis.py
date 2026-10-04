@@ -623,6 +623,63 @@ async def _thorough_budget(cfg, model, system: str, prompt: str) -> int:
     return max(limit - sum(counts) - _CONTEXT_SAFETY_MARGIN, _MIN_THOROUGH_TOKENS)
 
 
+# The evidence table used to go into the consolidation prompt whole, and the thorough
+# answer got whatever room was left. A long run (more rounds, more excerpts per round)
+# gathers a table that can take nearly the whole window, leaving the answer
+# _MIN_THOROUGH_TOKENS -- a full run's research reduced to a truncated paragraph. So the
+# answer's room is reserved first and the table is fitted into the rest.
+_ANSWER_SHARE = 0.25
+_MIN_ANSWER_TOKENS = 4096
+# When the server cannot report its window or count tokens: this deployment's
+# max_model_len (lara-core/config.yaml), and a rough characters-per-token ratio.
+_FALLBACK_CONTEXT = 32768
+_CHARS_PER_TOKEN = 4
+
+
+def select_evidence(claims: list[Claim], costs: list[int], room: int) -> list[Claim]:
+    """The highest-scoring claims whose costs fit in `room` tokens, in their original order.
+
+    Pure, so the choice can be tested without a server. A claim that does not fit is skipped
+    rather than ending the selection: a smaller, lower-scoring one may still fit."""
+    chosen, used = set(), 0
+    for i in sorted(range(len(claims)), key=lambda i: claims[i].score, reverse=True):
+        if used + costs[i] <= room:
+            chosen.add(i)
+            used += costs[i]
+    return [c for i, c in enumerate(claims) if i in chosen]
+
+
+async def fit_evidence(cfg, model, run: Run) -> list[Claim]:
+    """The claims the consolidation prompt can carry while leaving the answer room to write.
+
+    Everything is returned unchanged when it fits, which is the common case for an
+    ordinary-length run."""
+    if not run.claims:
+        return []
+    from lara.serve import generate as GEN
+
+    vcfg = (cfg.get_in("serving.vllm") or {}) if hasattr(cfg, "get_in") else {}
+    base_url = vcfg.get("base_url", "http://127.0.0.1:8000/v1")
+    model_name = model or vcfg.get("default_model") or ""
+    api_key = vcfg.get("api_key")
+    blocks = [evidence_table([c]) for c in run.claims]
+    frame = f"Research question: {run.question}\n\nEvidence table:\n\nWrite the full answer."
+    texts = [THOROUGH_SYSTEM, frame] + blocks
+
+    limit = await GEN.context_limit(base_url, model_name, api_key=api_key)
+    counts = await GEN.count_tokens(base_url, model_name, texts, api_key=api_key)
+    if not counts or len(counts) != len(texts):
+        counts = [len(t) // _CHARS_PER_TOKEN + 1 for t in texts]
+    limit = limit or _FALLBACK_CONTEXT
+    reserve = max(_MIN_ANSWER_TOKENS, int(limit * _ANSWER_SHARE))
+    # Each block is joined by a blank line: a couple of tokens apiece.
+    costs = [n + 2 for n in counts[2:]]
+    room = limit - counts[0] - counts[1] - reserve - _CONTEXT_SAFETY_MARGIN
+    if sum(costs) <= room:
+        return list(run.claims)
+    return select_evidence(run.claims, costs, max(room, 0))
+
+
 async def consolidate(cfg, run: Run, model, stream_answer, on_token=None) -> None:
     """Thorough first, then TLDR derived from it.
 
@@ -630,9 +687,13 @@ async def consolidate(cfg, run: Run, model, stream_answer, on_token=None) -> Non
     that stops trusting both. Compressing the long answer guarantees the short one asserts
     nothing the long one does not.
     """
+    kept = await fit_evidence(cfg, model, run)
+    omitted = len(run.claims) - len(kept)
+    note = (f" -- the {len(kept)} most relevant shown; {omitted} lower-scoring claims "
+            "left out to fit the context window" if omitted else "")
     prompt = (f"Research question: {run.question}\n\n"
               f"Evidence table ({len(run.claims)} claims from {len(run.papers)} papers, "
-              f"gathered over {len(run.rounds)} rounds):\n\n{evidence_table(run.claims)}\n\n"
+              f"gathered over {len(run.rounds)} rounds{note}):\n\n{evidence_table(kept)}\n\n"
               "Write the full answer.")
     # Bounded by the model's real remaining context, not a fixed ceiling -- see
     # _thorough_budget. Truncation should only happen if the model still doesn't finish
