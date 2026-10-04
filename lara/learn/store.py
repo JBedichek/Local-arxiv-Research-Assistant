@@ -134,3 +134,33 @@ def shared_get(title: str, *, max_age_days: float = SHARED_MAX_AGE_DAYS) -> dict
 
 def shared_put(title: str, content: dict) -> None:
     _write(ROOT / SHARED / f"{slug(title, 60)}.json", {**content, "built": time.time()})
+
+
+# ── a subject's decomposition, and a course's diagnostic ─────────────────────────
+
+DECOMPOSITIONS = "_decompositions"
+#: A decomposition older than this is researched again: the corpus grows.
+DECOMPOSITION_MAX_AGE_DAYS = 30
+
+
+def decomposition_get(subject: str, *, max_age_days: float = DECOMPOSITION_MAX_AGE_DAYS) -> dict | None:
+    """A subject mapped by an earlier course, if recent enough -- the same for every learner,
+    so kept beside the courses, not in one of them."""
+    found = _read(ROOT / DECOMPOSITIONS / f"{slug(subject, 60)}.json")
+    if not found or time.time() - found.get("built", 0) > max_age_days * 86_400:
+        return None
+    return found
+
+
+def decomposition_put(subject: str, data: dict) -> dict:
+    stored = {**data, "subject": subject, "built": time.time()}
+    _write(ROOT / DECOMPOSITIONS / f"{slug(subject, 60)}.json", stored)
+    return stored
+
+
+def save_diagnostic(course_id: str, diagnostic: dict) -> None:
+    _write(course_dir(course_id) / "diagnostic.json", diagnostic)
+
+
+def load_diagnostic(course_id: str) -> dict | None:
+    return _read(course_dir(course_id) / "diagnostic.json")

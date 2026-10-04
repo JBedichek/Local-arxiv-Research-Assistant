@@ -407,7 +407,7 @@ def test_learner_profile_route_returns_the_snapshot():
 
 def test_learner_profile_route_is_empty_before_any_quiz_is_answered():
     resp = LR.learner_profile()
-    assert body(resp) == {"concepts": [], "digest": ""}
+    assert body(resp) == {"concepts": [], "terms": [], "anchors": [], "use": "", "digest": ""}
 
 
 def test_figure_lookup_is_none_with_no_cached_html():
@@ -431,3 +431,54 @@ def test_figure_lookup_reads_the_cached_html_when_there_is_one(tmp_path, monkeyp
     assert out["src"] == "https://x/y.png"
     # version 0 (unknown) becomes 1, the same fallback resolve_full_paper-style callers use.
     assert seen == [(str(path), "2401.00001", 1, "S4.F2")]
+
+
+def test_the_diagnostic_converses_prepares_questions_and_grades(monkeypatch):
+    from lara.learn import pipeline as PLm
+    from lara.learn import profile as PRm
+
+    turns = iter([json.dumps({"question": "What will you use it for?", "anchors": []}),
+                  json.dumps({"question": None, "use": "train models",
+                              "anchors": [{"domain": "python", "depth": "solid"}]})])
+    m = model(("getting to know a learner", lambda s, p: next(turns)),
+              ("estimate how well a learner", json.dumps({"levels": {}})),
+              ("You write one diagnostic question", json.dumps(
+                  {"question": "Why warm up?", "reference": "To avoid early spikes.", "rubric": []})),
+              ("grade a learner", json.dumps({"level": 3, "feedback": "Right."})))
+
+    async def fake_llm():
+        return m
+
+    async def research(question):
+        return {"text": "Warmup avoids early spikes [1].", "references": {}}
+
+    def fake_synth(mode, course_id, cid=""):
+        return research if mode == "probe" else None
+
+    monkeypatch.setattr(LR, "_llm", fake_llm)
+    monkeypatch.setattr(LR, "_synth", fake_synth)
+
+    async def go():
+        cid = await ready()
+        started = body(await LR.diagnostic_start(cid))
+        assert started["pending"]["question"] == "What will you use it for?"
+        after = await LR.diagnostic_reply(cid, LR.AnswerRequest(answer="to train models"))
+        assert after.status_code == 202 and body(after)["state"] == "preparing"
+        await settle()
+        shown = body(LR.diagnostic(cid))
+        assert shown["state"] == "probing" and shown["current"]["question"] == "Why warm up?"
+        assert "To avoid early spikes." not in json.dumps(shown)
+        graded = body(await LR.diagnostic_answer(cid, LR.ItemAnswer(response="spikes")))
+        assert graded["result"]["level"] == 3 and graded["result"]["reference"] == "To avoid early spikes."
+        assert PRm.load()["use"] == "train models"
+        assert body(LR.learner_profile())["concepts"]
+    run(go())
+
+
+def test_skipping_the_diagnostic_and_saying_i_know_this():
+    async def go():
+        cid = await ready()
+        assert body(LR.diagnostic_skip(cid))["state"] == "skipped"
+        out = body(LR.known(cid, "c1"))
+        assert next(c for c in out["concepts"] if c["id"] == "c1")["passed"]
+    run(go())

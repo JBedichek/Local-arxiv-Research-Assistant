@@ -1,4 +1,4 @@
-"""`/api/learn` -- courses: scope a goal, map it, build concepts on demand, learn and quiz.
+"""`/api/learn` -- courses: scope a goal, map it, diagnose, build concepts on demand, learn and quiz.
 
 Long work (mapping a course, building a concept, the diagnostic) runs as a background task
 the page polls: the course's own `status` and each concept's `build` say where it is."""
@@ -12,6 +12,7 @@ from fastapi import APIRouter
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from lara.learn import diagnostic as DG
 from lara.learn import learner as LN
 from lara.learn import lesson as LE
 from lara.learn import pipeline as PL
@@ -63,6 +64,7 @@ class ExpandRequest(BaseModel):
     section: int = 0
     claims: list[str] = []
     variant: str = "standard"
+    intent: str = "deeper"      # "deeper" or "explain"
 
 
 class LessonRequest(BaseModel):
@@ -140,7 +142,19 @@ def _synth(mode: str, course_id: str, cid: str = ""):
         return LR.lesson_synth(state, course_id, cid)
     if mode == "expand":
         return LR.expand_synth(state)
+    if mode == "decompose":
+        return LR.decompose_research(state)
+    if mode == "probe":
+        return LR.probe_research(state)
     raise ValueError(f"unknown synth mode {mode!r}")
+
+
+def _simulated_reader() -> bool:
+    """Config `learn.simulated_reader` (off by default) -- see lara.learn.reader."""
+    try:
+        return bool(require_state().cfg.get_in("learn.simulated_reader", False))
+    except Exception:                                          # noqa: BLE001
+        return False
 
 
 def _revise(mode: str, course_id: str, cid: str = ""):
@@ -253,8 +267,10 @@ async def map_it(course_id: str) -> JSONResponse:
     if llm is None:
         return _err("no generator replica was reachable", 503)
     corpus, _ = await _corpus()
+    topic_graph = _synth("topic_graph", course_id)
     _keep(f"map:{course_id}", asyncio.ensure_future(
-        PL.map_course(llm, corpus, course, topic_graph_synth=_synth("topic_graph", course_id))))
+        PL.map_course(llm, corpus, course, topic_graph_synth=topic_graph,
+                      decompose_research=_synth("decompose", course_id) if topic_graph else None)))
     return JSONResponse({"status": "mapping"}, status_code=202)
 
 
@@ -283,7 +299,7 @@ async def revise_plan(course_id: str, req: TextRequest) -> JSONResponse:
     if revise is None:
         return _err("no generator replica was reachable", 503)
     _keep(f"map:{course_id}", asyncio.ensure_future(
-        PL.revise_plan(course, req.text.strip(), revise=revise)))
+        PL.revise_plan(course, req.text.strip(), revise=revise, llm=await _llm())))
     return JSONResponse({"status": "mapping"}, status_code=202)
 
 
@@ -316,7 +332,10 @@ def concept(course_id: str, cid: str) -> JSONResponse:
         "lesson_history": content.get("lesson_history", []),
         "quiz": {"items": len(quiz.get("items", [])), "dropped": quiz.get("dropped", 0)},
         "build": store.load_build(course_id, cid), "sources": meta["sources"],
-        "state": LN.concept_state(learner, cid)})
+        "state": LN.concept_state(learner, cid), "plan": content.get("plan"),
+        "need": meta.get("need"), "tier": meta.get("tier"),
+        "level": {k: v for k, v in PR.have(PR.load(), meta["title"]).items() if k != "dist"},
+        "checks": DG.checks_for(course, DG.load(course_id), PR.load(), cid)})
 
 
 @router.get("/api/learn/courses/{course_id}/trace")
@@ -361,7 +380,8 @@ async def build(course_id: str, cid: str, req: BuildRequest | None = None) -> JS
         return _err("no generator replica was reachable", 503)
     corpus, embed = await _corpus()
     PL.ensure_concept(llm, corpus, course, cid, embed=embed, force=bool(req and req.force),
-                      lesson_synth=_synth("lesson", course_id, cid))
+                      lesson_synth=_synth("lesson", course_id, cid),
+                      simulated_reader=_simulated_reader())
     return JSONResponse({"status": "building"}, status_code=202)
 
 
@@ -382,7 +402,8 @@ async def expand(course_id: str, cid: str, req: ExpandRequest) -> JSONResponse:
                                            question=req.question.strip()[:500],
                                            selection_claims=req.claims, section=req.section,
                                            embed=embed, variant=req.variant,
-                                           synth=_synth("expand", course_id, cid))
+                                           synth=_synth("expand", course_id, cid),
+                                           intent="explain" if req.intent == "explain" else "deeper")
     except ValueError as e:
         return _err(str(e), 409)
     return JSONResponse(result)
@@ -582,3 +603,153 @@ async def flag(course_id: str, cid: str, key: str, req: FlagRequest) -> JSONResp
         return JSONResponse(await PL.flag_claim(llm, course, learner, cid, key, req.note))
     except KeyError:
         return _err("no such concept or claim", 404)
+
+
+# ── the diagnostic: a conversation, then free-answer questions graded against references ──
+
+
+@router.get("/api/learn/courses/{course_id}/diagnostic")
+def diagnostic(course_id: str) -> JSONResponse:
+    course = _course(course_id)
+    if course is None:
+        return _err(f"no course {course_id}", 404)
+    return JSONResponse(DG.public(course, DG.load(course_id), PR.load()))
+
+
+def _finish_diagnostic(course: dict, diag: dict, profile: dict) -> None:
+    learner = store.load_learner(course["id"]) or LN.blank()
+    DG.apply_to_course(course, learner, profile)
+    store.save_learner(course["id"], learner)
+    PR.save(profile)
+
+
+async def _prepare_probes(llm: Llm, research, course: dict, diag: dict) -> None:
+    profile = PR.load()
+    await DG.seed_from_anchors(llm, course, profile)
+    PR.save(profile)
+    await DG.prepare(llm, research, course, diag, on_change=lambda: store.save_diagnostic(course["id"], diag))
+    profile = PR.load()
+    DG.advance(course, diag, profile)
+    store.save_diagnostic(course["id"], diag)
+    if diag["state"] == "done":
+        _finish_diagnostic(course, diag, profile)
+
+
+async def _after_conversation(llm: Llm, course: dict, diag: dict) -> JSONResponse:
+    """The conversation is over: prepare every question in the background."""
+    research = _synth("probe", course["id"])
+    if research is None:
+        # Back to the start, so the page offers the diagnostic again rather than waiting on
+        # questions nobody is preparing. The conversation's reading is already in the profile.
+        diag.update(state="todo", pending=None)
+        store.save_diagnostic(course["id"], diag)
+        return _err("deep research needs a generator, and none was reachable", 503)
+    diag["state"] = "preparing"
+    store.save_diagnostic(course["id"], diag)
+    _keep(f"diagnostic:{course['id']}", asyncio.ensure_future(_prepare_probes(llm, research, course, diag)))
+    return JSONResponse(DG.public(course, diag, PR.load()), status_code=202)
+
+
+@router.post("/api/learn/courses/{course_id}/diagnostic/start")
+async def diagnostic_start(course_id: str) -> JSONResponse:
+    course = _course(course_id)
+    if course is None or course["status"] != "ready":
+        return _err("approve the course plan before the diagnostic", 409)
+    llm = await _llm()
+    if llm is None:
+        return _err("no generator replica was reachable", 503)
+    diag, profile = DG.blank(), PR.load()
+    await DG.converse(llm, course, diag, profile)
+    PR.save(profile)
+    store.save_diagnostic(course_id, diag)
+    if diag["pending"]:
+        return JSONResponse(DG.public(course, diag, profile))
+    return await _after_conversation(llm, course, diag)
+
+
+@router.post("/api/learn/courses/{course_id}/diagnostic/reply")
+async def diagnostic_reply(course_id: str, req: AnswerRequest) -> JSONResponse:
+    course = _course(course_id)
+    if course is None:
+        return _err(f"no course {course_id}", 404)
+    diag = DG.load(course_id)
+    if not diag.get("pending"):
+        return _err("no question is waiting for an answer", 409)
+    llm = await _llm()
+    if llm is None:
+        return _err("no generator replica was reachable", 503)
+    diag["turns"].append({"question": diag["pending"]["question"], "answer": req.answer.strip()[:2_000]})
+    diag["pending"] = None
+    profile = PR.load()
+    await DG.converse(llm, course, diag, profile)
+    PR.save(profile)
+    store.save_diagnostic(course_id, diag)
+    if diag["pending"]:
+        return JSONResponse(DG.public(course, diag, profile))
+    return await _after_conversation(llm, course, diag)
+
+
+@router.post("/api/learn/courses/{course_id}/diagnostic/answer")
+async def diagnostic_answer(course_id: str, req: ItemAnswer) -> JSONResponse:
+    course = _course(course_id)
+    if course is None:
+        return _err(f"no course {course_id}", 404)
+    diag = DG.load(course_id)
+    cid = diag.get("current")
+    if diag["state"] != "probing" or not cid:
+        return _err("no diagnostic question is waiting", 409)
+    llm = await _llm()
+    if llm is None:
+        return _err("no generator replica was reachable", 503)
+    profile = PR.load()
+    result = await DG.answer(llm, course, diag, profile, cid, req.response)
+    PR.save(profile)
+    store.save_diagnostic(course_id, diag)
+    if diag["state"] == "done":
+        _finish_diagnostic(course, diag, profile)
+    return JSONResponse({"result": {**result, "reference": diag["probes"][cid]["reference"]},
+                         "diagnostic": DG.public(course, diag, profile)})
+
+
+@router.post("/api/learn/courses/{course_id}/diagnostic/skip")
+def diagnostic_skip(course_id: str) -> JSONResponse:
+    course = _course(course_id)
+    if course is None:
+        return _err(f"no course {course_id}", 404)
+    diag = DG.load(course_id)
+    diag.update(state="skipped", pending=None, current=None)
+    store.save_diagnostic(course_id, diag)
+    learner = store.load_learner(course_id) or LN.blank()
+    learner["pretest"]["state"] = "done"
+    store.save_learner(course_id, learner)
+    return JSONResponse(DG.public(course, diag, PR.load()))
+
+
+@router.post("/api/learn/courses/{course_id}/concepts/{cid}/checks/{pid}/answer")
+async def check_answer(course_id: str, cid: str, pid: str, req: ItemAnswer) -> JSONResponse:
+    """A quick re-check of one prerequisite before a lesson relies on it."""
+    course = _course(course_id)
+    if course is None or not any(c["id"] == cid for c in course["concepts"]):
+        return _err("no such course or concept", 404)
+    diag = DG.load(course_id)
+    if "question" not in (diag["probes"].get(pid) or {}):
+        return _err(f"no check prepared for {pid}", 404)
+    llm = await _llm()
+    if llm is None:
+        return _err("no generator replica was reachable", 503)
+    profile = PR.load()
+    result = await DG.answer(llm, course, diag, profile, pid, req.response, advance_after=False)
+    PR.save(profile)
+    store.save_diagnostic(course_id, diag)
+    return JSONResponse({"result": {**result, "reference": diag["probes"][pid]["reference"]},
+                         "checks": DG.checks_for(course, diag, profile, cid)})
+
+
+@router.post("/api/learn/courses/{course_id}/concepts/{cid}/known")
+def known(course_id: str, cid: str) -> JSONResponse:
+    course = _course(course_id)
+    if course is None or not any(c["id"] == cid for c in course["concepts"]):
+        return _err("no such course or concept", 404)
+    learner = store.load_learner(course_id) or LN.blank()
+    PL.mark_known(course, learner, cid)
+    return JSONResponse(PL.overview(course, learner))

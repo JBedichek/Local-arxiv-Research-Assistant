@@ -21,6 +21,7 @@ directly inside those two call trees.
 """
 from __future__ import annotations
 
+import copy
 import json
 
 from lara.learn import trace as TR
@@ -271,3 +272,64 @@ def expand_synth(app_state, *, model: str | None = None):
         TR.emit("expand_research", found=True, references=len(refs))
         return {"text": bound.text or "", "references": refs}
     return synth
+
+
+# ── single deep-research leaves with their own budgets ───────────────────────────
+#
+# Two Learn calls are one question each, not a multi-goal graph, and each wants a budget the
+# global `retrieval.synthesis` config is not tuned for: mapping a whole subject once (wide,
+# deliberately thorough -- a broad question never saturates, so its round budget is what ends
+# it) and grounding one diagnostic question about one concept (narrow, a few rounds). Both run
+# `synthruns.leaf` on a copy of the config with those knobs overridden for that call only.
+
+#: For the subject decomposition (`lara.learn.decompose`): starting values to tune against
+#: measured runs, not settled numbers.
+DECOMPOSE_SYNTHESIS = {"max_rounds": 24, "min_rounds": 8, "stop_votes": 3, "per_round": 20,
+                       "over_fetch": 5, "cap_per_paper": 2, "max_feedback_vectors": 10,
+                       "saturation_window": 3, "dry_rounds": 3, "expand_every": 2}
+#: For one diagnostic question (`lara.learn.diagnostic`).
+PROBE_SYNTHESIS = {"max_rounds": 3, "min_rounds": 2, "stop_votes": 1, "per_round": 8,
+                   "saturation_window": 2, "dry_rounds": 1}
+
+
+def with_synthesis(cfg, overrides: dict):
+    """A copy of `cfg` whose `retrieval.synthesis` knobs are overridden by `overrides` --
+    `run_synthesis` reads them from the config it is handed, per call, so nothing else sees
+    the change."""
+    new = copy.copy(cfg)
+    retrieval = dict(cfg.get_in("retrieval") or {})
+    retrieval["synthesis"] = {**(retrieval.get("synthesis") or {}), **overrides}
+    new["retrieval"] = retrieval
+    return new
+
+
+def _leaf_research(app_state, overrides: dict, phase: str, *, model: str | None = None):
+    async def research(question: str) -> dict:
+        g = await SR.generator(app_state, model)
+        aresearch = SR.leaf(app_state, with_synthesis(g.cfg, overrides))
+        TR.emit(f"{phase}_start", question=question)
+        try:
+            result = await aresearch(question, model=g.model, base_url=g.base_url,
+                                     api_key=g.api_key)
+        except SR.NoEvidence as e:
+            TR.emit(f"{phase}_done", found=False, error=str(e))
+            return {"text": "", "references": {}, "stopped_because": str(e)}
+        bound = result.thorough
+        refs = {k: v.to_dict() for k, v in (bound.references or {}).items()}
+        TR.emit(f"{phase}_done", found=True, references=len(refs),
+                stopped_because=result.stopped_because)
+        return {"text": bound.text or "", "references": refs,
+                "stopped_because": result.stopped_because or ""}
+    return research
+
+
+def decompose_research(app_state, *, model: str | None = None):
+    """The `research` capability `lara.learn.decompose.decompose` takes: one thorough
+    deep-research call that maps a whole subject, from its foundations to its frontier."""
+    return _leaf_research(app_state, DECOMPOSE_SYNTHESIS, "decompose", model=model)
+
+
+def probe_research(app_state, *, model: str | None = None):
+    """The `research` capability `lara.learn.diagnostic.prepare` takes: one short
+    deep-research call that grounds one diagnostic question about one concept."""
+    return _leaf_research(app_state, PROBE_SYNTHESIS, "probe", model=model)

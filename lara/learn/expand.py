@@ -32,6 +32,20 @@ the claims, and do not pad by restating the highlighted text itself.
 - Convey certainty as marked: one paper, a hypothesis, replaced by later work.
 - If the claims cannot add anything to the highlighted text, reply exactly: INSUFFICIENT"""
 
+EXPLAIN_SYSTEM = """A learner highlighted part of a lesson because they did not understand it. \
+Explain it more simply, using ONLY the numbered claims.
+
+Format: one sentence per line, each ending -- before its full stop -- with the keys of the claims \
+it rests on in brackets, exactly as they are written below. A sentence with no key is not allowed.
+
+- Say what the highlighted words mean and why they matter, in plain words, before any detail. \
+Define every technical term you use. Do not add any fact that is not in the claims.
+- If the claims cannot explain the highlighted text, reply exactly: INSUFFICIENT"""
+
+EXPLAIN_REQUEST = "Explain what this means, in plain terms."
+INSUFFICIENT_EXPLAIN = ("The paper corpus does not explain this in terms I can support. It is "
+                        "worth looking up in an introductory source.")
+
 INSUFFICIENT = ("The paper corpus has nothing more on that which I can support. "
                 "Try highlighting a narrower passage or asking a more specific question.")
 
@@ -68,7 +82,8 @@ def rank(claims: list[dict], focus: str, embed) -> list[dict]:
     return [c for _, c in sorted(scored, key=lambda t: t[0], reverse=True)]
 
 
-async def _answer(llm: Llm, selection: str, request: str, claims: list[dict]):
+async def _answer(llm: Llm, selection: str, request: str, claims: list[dict], *,
+                  system: str = ANSWER_SYSTEM):
     """(sections, stats) of the verified answer, or None when the claims cannot answer."""
     if not claims:
         return None
@@ -77,7 +92,7 @@ async def _answer(llm: Llm, selection: str, request: str, claims: list[dict]):
               + "\n".join(LE.line(c) for c in claims))
     # cap=0: no fixed ceiling -- the answer may use whatever of the context window is left
     # once the prompt is in it (see reply_room), rather than an arbitrary token budget.
-    text = await llm.ask(ANSWER_SYSTEM, prompt, default=2_000, cap=0, stage="learn_expand")
+    text = await llm.ask(system, prompt, default=2_000, cap=0, stage="learn_expand")
     if not text or text.upper().startswith("INSUFFICIENT"):
         return None
     sections, stats = await LE.verify(llm, LE.parse(text, set(by_key)), by_key)
@@ -95,6 +110,12 @@ def _adds_something(answer, selection_claims: set[str]) -> bool:
         return False
     sentences = [s for sec in answer[0] for s in sec["sentences"]]
     return any(k not in selection_claims for s in sentences for k in s["claims"])
+
+
+def _explains(answer) -> bool:
+    """An explanation may rest on the very claims the highlight cites -- saying the same thing
+    in plainer words is the point -- so it only needs a sentence to survive."""
+    return answer is not None and any(sec["sentences"] for sec in answer[0])
 
 
 def _next_id(expansions: list[dict]) -> int:
@@ -271,9 +292,10 @@ async def _paper_tier(llm: Llm, corpus, context: list[dict], selection: str, req
 
 async def expand(llm: Llm, corpus, concept: dict, content: dict, *, selection: str,
                  question: str = "", selection_claims=(), section: int = 0, embed=None,
-                 lesson_generated=None, synth=None) -> dict:
+                 lesson_generated=None, synth=None, intent: str = "deeper") -> dict:
     """The expansion to store, or {"insufficient": True, "message": ...} when nothing verifiable
-    could be said.
+    could be said. `intent` is "deeper" (more detail, the default) or "explain" (a simpler
+    explanation, for a reader who did not follow).
 
     Escalates cheapest-first when the concept's own claims cannot add anything: tier 2
     (`_paper_tier`) reads the fuller text of the most relevant paper(s) already cited before
@@ -282,14 +304,19 @@ async def expand(llm: Llm, corpus, concept: dict, content: dict, *, selection: s
     of the old judge-verified `_new_claims`/claims.py `extract()` path. `None` (the default) is
     the old tier-3 behavior exactly, which is what a concept built before the research-driven
     pipeline existed still gets -- tier 2 is unaffected either way, since it needs neither."""
+    explain = intent == "explain"
+    system = EXPLAIN_SYSTEM if explain else ANSWER_SYSTEM
     question = question.strip()
     focus = f"{selection}\n{question}" if question else selection
-    request = question or DEFAULT_REQUEST
+    if explain:
+        focus = f"{focus}\nwhat it is, definition, introduction"
+    request = question or (EXPLAIN_REQUEST if explain else DEFAULT_REQUEST)
     live = [c for c in content.get("claims", []) if not c.get("withdrawn")]
     context = rank(live, focus, embed)
-    answer = await _answer(llm, selection, request, context)
+    answer = await _answer(llm, selection, request, context, system=system)
     searched, new_dicts = False, []
-    if not _adds_something(answer, set(selection_claims)):
+    good = _explains(answer) if explain else _adds_something(answer, set(selection_claims))
+    if not good:
         searched = True
         paper_answer, paper_claims = await _paper_tier(llm, corpus, context, selection, request)
         if paper_answer is not None and paper_claims:
@@ -302,13 +329,14 @@ async def expand(llm: Llm, corpus, concept: dict, content: dict, *, selection: s
                 new_dicts = [c.to_dict() for c in
                             await _new_claims(llm, corpus, concept, live, focus, n, embed)]
             pool = context + new_dicts
-            answer = await _answer(llm, selection, request, pool)
+            answer = await _answer(llm, selection, request, pool, system=system)
             if answer is None:
-                return {"insufficient": True, "message": INSUFFICIENT, "searched": True}
+                return {"insufficient": True, "searched": True,
+                        "message": INSUFFICIENT_EXPLAIN if explain else INSUFFICIENT}
     cited = {k for sec in answer[0] for s in sec["sentences"] for k in s["claims"]}
     kept_new = [c for c in new_dicts if c["key"] in cited]
     return {"id": f"x{_next_id(content.get('expansions', []))}", "section": section,
             "selection": selection[:600], "question": question,
             "answer": {"sections": answer[0], "stats": answer[1]}, "claims": kept_new,
-            "searched": searched, "lesson_generated": lesson_generated,
+            "searched": searched, "lesson_generated": lesson_generated, "intent": intent,
             "stale": False, "ts": time.time()}

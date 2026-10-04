@@ -91,7 +91,7 @@ def _insufficient(result: dict) -> dict:
                     "rounds": result.get("rounds", 0)}}
 
 
-def _lesson_objective(concept: dict, *, profile_digest: str = "") -> str:
+def _lesson_objective(concept: dict, *, profile_digest: str = "", brief: str = "") -> str:
     objective = (f"{concept['title']} -- {concept.get('summary', '')}\n\n"
                 f"Write this as a lesson for a learner whose goal is: "
                 f"{concept.get('goal') or '(not given)'}")
@@ -107,6 +107,11 @@ def _lesson_objective(concept: dict, *, profile_digest: str = "") -> str:
             "it briefly without re-deriving it from scratch, and spend the room you save "
             "going deeper on what they have not yet shown understanding of. Where it is "
             "not relevant, ignore it.")
+    if brief:
+        # This learner's treatment plan (lara.learn.treatment.brief): which concepts and
+        # terms to use freely, gloss, give an intuition for, or research and explain in a
+        # Background section -- what aims this run's research at the reader's own gaps.
+        objective += f"\n\n{brief}"
     return objective
 
 
@@ -145,7 +150,7 @@ def _lesson_from_result(result: dict) -> dict:
                     "rounds": result.get("rounds", 0)}}
 
 
-async def build_lesson(concept: dict, *, synth, profile_digest: str = "") -> dict:
+async def build_lesson(concept: dict, *, synth, profile_digest: str = "", brief: str = "") -> dict:
     """Phase 2: one full synthesis run scoped to this concept, its own citation writing
     becoming the lesson directly -- replaces claims.build() + depth.deepen()'s standard-
     lesson path (see pipeline.build_concept's "claims" stage).
@@ -157,7 +162,7 @@ async def build_lesson(concept: dict, *, synth, profile_digest: str = "") -> dic
     takes one, since a revision is already a specific, human-directed instruction rather
     than this general personalization."""
     TR.set_phase(f"lesson_research: {concept['title']}")
-    result = await synth(_lesson_objective(concept, profile_digest=profile_digest))
+    result = await synth(_lesson_objective(concept, profile_digest=profile_digest, brief=brief))
     TR.emit("lesson_research", tokens_in=result.get("tokens_in", 0),
            tokens_out=result.get("tokens_out", 0), degraded=result.get("degraded"))
     return _lesson_from_result(result)
