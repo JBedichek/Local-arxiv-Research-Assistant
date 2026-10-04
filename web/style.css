@@ -852,9 +852,11 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
    a prior fix for this same thing landed as a z-index:60 override earlier in this file
    (on #learn-pop's --ink rule) but never took effect: this later rule, same specificity,
    redeclared z-index:30 and won the cascade right back. */
-#learn-pop { position: fixed; z-index: 60; padding: 4px 10px; font-size: 0.8214em; cursor: pointer;
+#learn-pop { position: fixed; z-index: 60; display: flex; gap: 4px; }
+#learn-pop button { padding: 4px 10px; font-size: 0.8214em; cursor: pointer;
              background: var(--accent); color: var(--bg); border: 0; border-radius: 6px;
              box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35); }
+#learn .learn-card.plan p { margin: 2px 0; }
 #learn .ask-panel textarea { width: 100%; box-sizing: border-box; margin: 6px 0; }
 /* Voice: mic button beside the ask textarea, and the read-aloud bar above a lesson. */
 #learn .ask-row { display: flex; gap: 6px; align-items: flex-start; }

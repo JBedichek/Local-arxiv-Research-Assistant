@@ -49,7 +49,11 @@ const L = {
   traceOpen: new Set(),
   mapTrace: [], mapTraceCursor: 0, mapTraceId: "",
   showKnowledge: false, knowledge: null,
+  diag: null, diagResult: null, checkResult: null,
 };
+
+/* The five levels of the learner profile (lara/learn/profile.py). */
+const LEVELS = ["unknown", "heard of", "intuition", "use", "derive"];
 
 /* Lesson/claim/quiz text comes from the model, reading real papers -- 66% of chunks
  * carry inline LaTeX (see tex.js), so it has to go through the same renderer the paper
@@ -68,6 +72,7 @@ export async function loadLearn() {
   try {
     L.courses = (await get("/api/learn/courses")).courses;
     if (L.id) L.course = await get(`/api/learn/courses/${encodeURIComponent(L.id)}`);
+    if (L.id && L.course?.status === "ready") await loadDiagnostic();
     L.error = "";
   } catch (err) {
     L.error = err.message;
@@ -96,6 +101,7 @@ function schedulePoll() {
   const c = L.course;
   const waiting = c?.next?.action === "build" && L.requested.has(c.next.concept);
   const building = c && (waiting || c.status === "mapping" || c.pretest === "building"
+    || L.diag?.state === "preparing"
     || (c.concepts || []).some((k) => k.build?.stage && !["done", "error", ""].includes(k.build.stage)
       && L.requested.has(k.id)));
   if (building || (L.conceptId && L.concept && buildingNow(L.concept))) {
@@ -146,6 +152,7 @@ async function refresh() {
     if (L.conceptId) L.concept = await fetchConcept(L.conceptId);
     if (L.pretest?.state === "building" || L.course.pretest === "building") await loadPretest();
     if (L.course.status === "mapping") await loadMapTrace();
+    if (L.course.status === "ready") await loadDiagnostic();
     await autoBuild();
   } catch (err) {
     L.error = err.message;
@@ -157,6 +164,10 @@ const base = () => `/api/learn/courses/${encodeURIComponent(L.id)}`;
 
 async function fetchConcept(cid) {
   return get(`${base()}/concepts/${encodeURIComponent(cid)}`);
+}
+
+async function loadDiagnostic() {
+  L.diag = await get(`${base()}/diagnostic`);
 }
 
 async function loadPretest() {
@@ -231,12 +242,17 @@ function knowledgeView(k) {
   const known = k.concepts.filter((c) => c.bucket === "known");
   const shaky = k.concepts.filter((c) => c.bucket === "shaky");
   const row = (c) => `<li>${md(c.title)}
-    <span class="hint">${Math.round(c.score * 100)}% · ${c.attempts} quiz answer${c.attempts === 1 ? "" : "s"}</span></li>`;
+    <span class="hint">most likely: ${escapeHtml(LEVELS[c.level] || "?")} · ${c.attempts} piece${c.attempts === 1 ? "" : "s"} of evidence</span></li>`;
+  const background = k.anchors?.length || k.use
+    ? `<p class="hint">${k.use ? `You'll use this for: ${md(k.use)}. ` : ""}${k.anchors?.length
+      ? `Your background: ${k.anchors.map((a) => `${escapeHtml(a.domain)} (${escapeHtml(a.depth)})`).join(", ")}.` : ""}</p>` : "";
   const empty = !known.length && !shaky.length
     ? `<p class="hint">Nothing assessed yet — answer some quiz questions in a course and they'll show up here.</p>` : "";
   return `${head}
-    <p class="lede">What quizzes across your courses show you understand. New lessons read this
-      too: parts you've already shown you know stay brief, and parts you haven't get more room.</p>
+    <p class="lede">What your quiz answers, diagnostics and highlights across courses show you
+      understand. Every new lesson is planned against this: what you know is used without
+      explaining it, and what you don't is researched and explained.</p>
+    ${background}
     ${k.digest ? `<div class="learn-card"><p>${md(k.digest)}</p></div>` : ""}
     ${known.length ? `<h4>Solid</h4><ul class="learn-plan">${known.map(row).join("")}</ul>` : ""}
     ${shaky.length ? `<h4>Shaky</h4><ul class="learn-plan">${shaky.map(row).join("")}</ul>` : ""}
@@ -278,8 +294,10 @@ function scopeView(c) {
     action = `<button type="button" data-learn="map">Build the concept map</button>`;
   } else if (c.status === "mapping") {
     const revising = (c.plan_history || []).length > 0;
-    action = `<p class="hint">${revising ? "Revising the plan from your feedback…"
-      : "Reading survey papers to draw the map of what you need to learn…"}</p>
+    const phase = revising ? "Revising the plan from your feedback…"
+      : c.mapping === "decomposing" ? "Mapping the whole subject with one thorough deep-research run, from its foundations to its frontier… <span class=\"hint\">It reads hundreds of passages and takes several minutes; a subject mapped before is reused.</span>"
+        : "Researching the course and drawing the map of what you need to learn…";
+    action = `<p class="hint">${phase}</p>
       <div class="learn-card">${profileView(L.mapTrace)}</div>`;
   } else if (c.status === "awaiting_approval") {
     action = planReviewView(c);
@@ -417,8 +435,9 @@ function mapView(c) {
   const edges = c.concepts.flatMap((k) => k.prereqs.map((p) => ({ from: p, to: k.id })));
   const cls = (n) => (n.unavailable ? "unavailable" : n.passed || n.mastery >= 0.75 ? "passed"
     : n.unlocked ? "open" : "locked") + (n.id === L.conceptId ? " current" : "");
-  const sub = (n) => (n.unavailable ? "no sources" : n.inferred ? "assumed from diagnostic"
-    : `${Math.round(n.mastery * 100)}% · ${n.built.length ? "built" : "not built"}`);
+  const sub = (n) => (n.unavailable ? "no sources" : n.inferred ? "known, per diagnostic"
+    : n.need != null ? `you: ${LEVELS[n.level] || "?"} · needs: ${LEVELS[n.need] || "?"}`
+      : `${Math.round(n.mastery * 100)}% · ${n.built.length ? "built" : "not built"}`);
   return `<h4>Concept map <span class="hint">click a concept to open it</span></h4>
     ${svgGraph(nodes, edges, { nodeClass: cls, nodeSub: sub, action: "concept" })}`;
 }
@@ -428,7 +447,10 @@ function mapView(c) {
 function focusView(c) {
   if (L.graded) return gradedCard();
   const n = c.next || {};
-  if (c.pretest === "todo" && !Object.values(c.concepts).some((k) => k.mastery > 0)) {
+  const d = L.diag;
+  if (L.diagResult) return diagResultCard();
+  if (d && ["conversation", "preparing", "probing"].includes(d.state)) return diagnosticView(d);
+  if (d && d.state === "todo" && c.pretest === "todo" && !Object.values(c.concepts).some((k) => k.mastery > 0)) {
     return diagnosticOffer() + nextCard(c, n);
   }
   if (L.pretest?.state === "active" || c.pretest === "building" || c.pretest === "active") {
@@ -438,10 +460,44 @@ function focusView(c) {
 }
 
 function diagnosticOffer() {
-  return `<div class="learn-card"><p><b>Skip what you already know.</b> A short diagnostic samples
-    concepts across the course; what you pass, and what it depends on, is marked known.</p>
-    <button type="button" data-learn="pretest">Take the diagnostic</button>
-    <button type="button" class="link" data-learn="skip-pretest">No thanks, start from the beginning</button></div>`;
+  return `<div class="learn-card"><p><b>Lessons pitched at what you already know.</b> A short conversation
+    about your background, then up to ten questions answered in your own words. Lessons then explain
+    what you need and skip what you have; what you already know is marked known.</p>
+    <button type="button" data-learn="diag-start">Start</button>
+    <button type="button" class="link" data-learn="diag-skip">Skip — start from the beginning</button></div>`;
+}
+
+function diagnosticView(d) {
+  if (d.state === "conversation" && d.pending) {
+    return `<div class="learn-card"><p class="hint">Getting to know you · ${d.turns.length + 1} of up to 4</p>
+      <p><b>${md(d.pending.question)}</b></p>
+      <form id="learn-diag-reply" class="learn-new"><textarea id="learn-diag-text" rows="2"></textarea>
+        <button type="submit">Answer</button></form>
+      <button type="button" class="link" data-learn="diag-skip">Skip the diagnostic</button></div>`;
+  }
+  if (d.state === "preparing" || (d.state === "conversation" && !d.pending)) {
+    return `<div class="learn-card"><p>Writing your questions from the papers…
+      <span class="hint">${d.prepared} ready${d.preparing ? `, ${d.preparing} still being researched` : ""}.
+      Each one is grounded by a short deep-research run, so this takes a few minutes.</span></p></div>`;
+  }
+  if (d.state === "probing" && d.current) {
+    return `<form id="learn-diag-probe" class="learn-card">
+      <p class="hint">Question ${d.asked + 1} of up to ${d.budget} · about “${md(d.current.title)}”</p>
+      <p><b>${md(d.current.question)}</b></p>
+      <textarea id="learn-diag-answer" rows="3" placeholder="A few sentences in your own words"></textarea>
+      <button type="submit">Submit</button>
+      <button type="button" class="link" data-learn="diag-noidea">I don't know</button></form>`;
+  }
+  return "";
+}
+
+function diagResultCard() {
+  const r = L.diagResult;
+  const level = r.self ? "Noted — we'll start from the beginning on this." : `Your answer shows: <b>${escapeHtml(LEVELS[r.level])}</b>.`;
+  return `<div class="learn-card"><p>${level}</p>
+    ${r.feedback ? `<p>${md(r.feedback)}</p>` : ""}
+    ${r.reference ? `<p class="hint">A strong answer: ${md(r.reference)}</p>` : ""}
+    <button type="button" data-learn="diag-continue">Continue</button></div>`;
 }
 
 function nextCard(c, n) {
@@ -869,6 +925,7 @@ function lessonBody(concept) {
       ? `<p class="hint">Not enough sources for: ${lesson.dropped_sections.map(escapeHtml).join("; ")}.</p>` : "");
   const trust = length + `<p class="hint trust" title="Every sentence is re-checked against the claims it cites; ones that fail are rewritten once, then dropped.">
     ${s.grounded_pct}% of sentences verified on the first pass · ${s.repaired} rewritten · ${s.dropped} dropped
+    ${lesson.reader ? ` · a simulated reader flagged ${lesson.reader.flagged}, ${lesson.reader.rewritten} rewritten` : ""}
     ${lesson.stale ? ' · <span class="warn">a source was withdrawn — rewrite this version to refresh</span>' : ""}</p>`;
   const { by: visualsFor, leftover } = visualsBySection(concept, lesson.sections);
   const sections = lesson.sections.map((sec, i) => `
@@ -1012,6 +1069,40 @@ function conflictsView(concept) {
     ${rest.length ? `<details><summary>${rest.length} more</summary><ul class="conflicts">${rest.map(row).join("")}</ul></details>` : ""}`;
 }
 
+function planCard(concept) {
+  const plan = concept.plan;
+  if (!plan) return "";
+  const by = (t) => plan.items.filter((i) => i.treatment === t && !i.uncovered).map((i) => md(i.title));
+  const explained = [...by("section"), ...by("refresher"), ...by("intuition")];
+  const assumed = by("use");
+  const lines = [];
+  if (explained.length) lines.push(`Explains, for you: ${explained.join(", ")}.`);
+  if (assumed.length) lines.push(`Assumes you know: ${assumed.join(", ")}.`);
+  const level = concept.level && concept.need != null
+    ? `<span class="hint">You: ${escapeHtml(LEVELS[concept.level.level])} · this course needs: ${escapeHtml(LEVELS[concept.need])}</span>` : "";
+  const uncovered = plan.uncovered?.length
+    ? `<p class="warn">The papers in the corpus don't explain ${plan.uncovered.map(md).join(", ")}. This lesson
+        relies on ${plan.uncovered.length > 1 ? "them" : "it"}, so it's worth looking up in an introductory source.</p>` : "";
+  return lines.length || uncovered ? `<div class="learn-card plan">${level}${lines.map((l) => `<p class="hint">${l}</p>`).join("")}${uncovered}</div>` : "";
+}
+
+function checksCard(concept) {
+  if (L.checkResult) {
+    const r = L.checkResult;
+    return `<div class="learn-card"><p>${r.self ? "Noted." : `Your answer shows: <b>${escapeHtml(LEVELS[r.level])}</b>.`}</p>
+      ${r.feedback ? `<p>${md(r.feedback)}</p>` : ""}
+      <button type="button" data-learn="check-continue">Continue</button></div>`;
+  }
+  const c = (concept.checks || [])[0];
+  if (!c || concept.lesson) return "";
+  return `<form id="learn-check" class="learn-card" data-id="${escapeHtml(c.concept)}">
+    <p class="hint">Quick check before this lesson · “${md(c.title)}” — so the lesson isn't written on an old guess</p>
+    <p><b>${md(c.question)}</b></p>
+    <textarea id="learn-check-answer" rows="2"></textarea>
+    <button type="submit">Submit</button>
+    <button type="button" class="link" data-learn="check-noidea" data-id="${escapeHtml(c.concept)}">I don't know</button></form>`;
+}
+
 function conceptView(concept) {
   // concept.lesson alone, not build.stage === "done": the lesson stage is what actually sets
   // it (even an "insufficient" lesson is a real object), and it becomes true the moment that
@@ -1031,6 +1122,7 @@ function conceptView(concept) {
   const lesson = gated ? "" : `${backgroundLinks(concept)}${concept.lesson ? variantBar(concept) : ""}${lessonBody(concept)}${claimShownInLesson(concept) ? "" : claimCard(concept)}${conflictsView(concept)}${bibliography(concept)}
     ${concept.lesson && !concept.lesson.insufficient ? critiqueBox(concept) : ""}
     ${concept.lesson ? `<p><button type="button" data-learn="read" data-id="${escapeHtml(concept.id)}">I've read this — start practice</button>
+      <button type="button" class="link" data-learn="known" data-id="${escapeHtml(concept.id)}">I already know this</button>
       <button type="button" class="link" data-learn="build" data-id="${escapeHtml(concept.id)}" data-force="1">Refresh from the corpus</button></p>` : ""}
     ${concept.lesson && !concept.lesson.insufficient && concept.research_driven && L.variant === "standard" ? reviseLessonCard(concept) : ""}
     <details><summary>All ${concept.claims.length} claims and their sources${s.unfaithful_dropped ? ` · ${s.unfaithful_dropped} extractions dropped as unfaithful` : ""}</summary><ul class="claims">${list}</ul></details>`;
@@ -1054,7 +1146,7 @@ function conceptView(concept) {
     <button type="button" class="link" data-learn="close-concept">← back to your path</button>
     <h3>${md(concept.title)}</h3><p class="hint">${md(concept.summary)}
       ${concept.reused ? " · reused from an earlier course" : ""}</p>
-    ${tabs}${notBuilt}${traceView(concept)}${gated ? topicsGate(concept, unanswered) : ""}${lesson}</div>`;
+    ${tabs}${checksCard(concept)}${planCard(concept)}${notBuilt}${traceView(concept)}${gated ? topicsGate(concept, unanswered) : ""}${lesson}</div>`;
 }
 
 /* The blocking gate: every topic the lesson leans on without teaching gets a yes/no/partial
@@ -1163,7 +1255,8 @@ function expansionView(e, concept) {
     `<sup class="ck ${k === L.claim ? "on" : ""}" data-learn="claim" data-claim="${escapeHtml(k)}">${escapeHtml(k)}</sup>`).join("")}</span>`).join(" ");
   const st = e.answer.stats;
   const shown = expansionSentences(e).some((x) => x.claims.includes(L.claim));
-  const label = e.question ? `“${md(e.question)}”` : `More on “${md(e.selection.slice(0, 70))}${e.selection.length > 70 ? "…" : ""}”`;
+  const quoted = `“${md(e.selection.slice(0, 70))}${e.selection.length > 70 ? "…" : ""}”`;
+  const label = e.question ? `“${md(e.question)}”` : e.intent === "explain" ? `Explained: ${quoted}` : `More on ${quoted}`;
   return `<details class="expansion" ${L.claim && shown ? "open" : ""}>
     <summary>${label}</summary>
     <p class="hint">${e.searched ? "Found by searching the corpus for this" : "From the lesson's own sources"} ·
@@ -1180,9 +1273,9 @@ function askPanel(section) {
     <blockquote>${md(a.selection.slice(0, 400))}${a.selection.length > 400 ? "…" : ""}</blockquote>
     ${L.askResult ? `<p class="warn">${md(L.askResult)}</p>` : ""}
     ${L.asking ? `<p class="hint">Looking through the sources… <span class="hint">this can take up to half a minute</span></p>` : `
-    <div class="ask-row"><textarea id="learn-ask-question" rows="2" placeholder="Ask something specific, or leave blank for more detail on this"></textarea>
+    <div class="ask-row"><textarea id="learn-ask-question" rows="2" placeholder="${a.intent === "explain" ? "What didn't make sense? Or leave blank" : "Ask something specific, or leave blank for more detail on this"}"></textarea>
     ${VOICE.sttAvailable() ? `<button type="button" class="mic" data-learn="mic-start" title="Ask by voice">🎙</button>` : ""}</div>
-    <button type="button" data-learn="ask-go">Get more detail</button>
+    <button type="button" data-learn="ask-go">${a.intent === "explain" ? "Explain it more simply" : "Get more detail"}</button>
     <button type="button" class="link" data-learn="ask-cancel">Cancel</button>`}</div>`;
 }
 
@@ -1191,11 +1284,10 @@ function askPanel(section) {
 function popup() {
   let pop = document.getElementById("learn-pop");
   if (!pop) {
-    pop = document.createElement("button");
+    pop = document.createElement("div");
     pop.id = "learn-pop";
-    pop.type = "button";
-    pop.dataset.learn = "ask-open";
-    pop.textContent = "Explain this";
+    pop.innerHTML = `<button type="button" data-learn="ask-open" data-intent="explain">Explain this</button>
+      <button type="button" data-learn="ask-open" data-intent="deeper">Go deeper</button>`;
     pop.style.display = "none";
     pop.addEventListener("mousedown", (e) => e.preventDefault());     // keep the selection
     document.body.appendChild(pop);
@@ -1234,9 +1326,9 @@ function checkSelection() {
     .flatMap((el) => (el.dataset.claims || "").split(",").filter(Boolean));
   L.pending = { section: Number(para.dataset.section), selection: text.slice(0, 2000), claims: [...new Set(claims)] };
   const rect = range.getBoundingClientRect();
-  pop.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 120))}px`;
+  pop.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 220))}px`;
   pop.style.top = `${Math.min(rect.bottom + 6, window.innerHeight - 40)}px`;
-  pop.style.display = "block";
+  pop.style.display = "flex";
 }
 
 async function askForDetail() {
@@ -1247,7 +1339,7 @@ async function askForDetail() {
   renderLearn();
   try {
     const out = await send("POST", `${base()}/concepts/${encodeURIComponent(L.conceptId)}/expand`,
-      { selection: a.selection, question, section: a.section, claims: a.claims, variant: L.variant }, { timeoutMs: 240000 });
+      { selection: a.selection, question, section: a.section, claims: a.claims, variant: L.variant, intent: a.intent || "deeper" }, { timeoutMs: 240000 });
     if (out.insufficient) {
       L.askResult = out.message;
     } else {
@@ -1312,6 +1404,22 @@ function pretestView(c) {
 
 /* ── events ───────────────────────────────────────────────────────────────────── */
 
+function diagAnswer(response) {
+  act("Reading your answer", async () => {
+    const out = await send("POST", `${base()}/diagnostic/answer`, { response });
+    L.diag = out.diagnostic;
+    L.diagResult = out.result;
+  });
+}
+
+function checkAnswer(pid, response) {
+  act("Reading your answer", async () => {
+    const out = await send("POST", `${base()}/concepts/${encodeURIComponent(L.conceptId)}/checks/${encodeURIComponent(pid)}/answer`, { response });
+    L.checkResult = out.result;
+    L.concept = { ...L.concept, checks: out.checks };
+  });
+}
+
 async function openCourse(id) {
   L.id = id;
   L.view = "path";
@@ -1320,6 +1428,9 @@ async function openCourse(id) {
   L.graded = null;
   L.pretest = null;
   L.claim = "";
+  L.diag = null;
+  L.diagResult = null;
+  L.checkResult = null;
   await loadLearn();
 }
 
@@ -1352,7 +1463,7 @@ export function bindLearn() {
   document.getElementById("learn-close")?.addEventListener("click", closeLearn);
   document.addEventListener("keydown", (e) => { if (e.key === "Escape" && L.open && !L.ask) closeLearn(); });
   document.addEventListener("mouseup", (e) => {
-    if (e.target.id !== "learn-pop") setTimeout(checkSelection, 0);
+    if (!e.target.closest?.("#learn-pop")) setTimeout(checkSelection, 0);
   });
   document.addEventListener("keyup", (e) => { if (e.key === "Shift" || e.key.startsWith("Arrow")) checkSelection(); });
 
@@ -1400,6 +1511,16 @@ export function bindLearn() {
         L.course = { ...L.course, ...out.overview };
         if (L.pretest?.state === "active") await loadPretest();
       });
+    } else if (f.id === "learn-diag-reply") {
+      e.preventDefault();
+      const answer = $("#learn-diag-text").value.trim();
+      if (answer) act("Thinking", async () => { L.diag = await send("POST", `${base()}/diagnostic/reply`, { answer }); });
+    } else if (f.id === "learn-diag-probe") {
+      e.preventDefault();
+      diagAnswer($("#learn-diag-answer").value);
+    } else if (f.id === "learn-check") {
+      e.preventDefault();
+      checkAnswer(f.dataset.id, $("#learn-check-answer").value);
     } else if (f.id === "learn-critique") {
       e.preventDefault();
       const text = $("#learn-critique-text").value.trim();
@@ -1548,7 +1669,7 @@ export function bindLearn() {
         L.concept = await fetchConcept(L.conceptId);
       });
     } else if (a === "ask-open" && L.pending) {
-      L.ask = L.pending;
+      L.ask = { ...L.pending, intent: t.dataset.intent || "deeper" };
       L.askResult = "";
       L.pending = null;
       popup().style.display = "none";
@@ -1572,6 +1693,21 @@ export function bindLearn() {
       await refresh();
     });
     else if (a === "skip-pretest") act("Skipping", async () => { await send("POST", `${base()}/pretest/skip`, {}); await refresh(); });
+    else if (a === "diag-start") act("Starting", async () => { L.diag = await send("POST", `${base()}/diagnostic/start`, {}); });
+    else if (a === "diag-skip") act("Skipping", async () => { L.diag = await send("POST", `${base()}/diagnostic/skip`, {}); await refresh(); });
+    else if (a === "diag-noidea") diagAnswer("I don't know");
+    else if (a === "diag-continue") { L.diagResult = null; act("Loading", async () => { await refresh(); }); }
+    else if (a === "check-noidea") checkAnswer(id, "I don't know");
+    else if (a === "check-continue") { L.checkResult = null; act("Loading", async () => { L.concept = await fetchConcept(L.conceptId); }); }
+    else if (a === "known") {
+      L.autostart = true;
+      act("Saving", async () => {
+        L.course = { ...L.course, ...(await send("POST", `${base()}/concepts/${encodeURIComponent(id)}/known`, {})) };
+        L.view = "path";
+        L.conceptId = "";
+        L.concept = null;
+      });
+    }
   });
 }
 
