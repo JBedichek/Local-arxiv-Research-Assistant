@@ -2,6 +2,7 @@ import asyncio
 import json
 
 from lara.learn import visuals as V
+from lara.learn.passages import Passage
 from learn_helpers import llm
 
 
@@ -190,6 +191,58 @@ def test_figures_in_ignores_non_caption_passages_and_no_corpus():
     claims = [claim_with_passage("c1", "x", {**CAPTION_PASSAGE, "kind": "body"})]
     assert run(V.figures_in(claims, FakeCorpus({}))) == []
     assert run(V.figures_in(claims, None)) == []
+
+
+# ── figures, new-pipeline fallback: a pseudo-claim's passage carries no kind/anchor at
+# all (lara.learn.research._pseudo_claim), so the direct path above always finds nothing
+# -- full_paper recovers real captions from the papers the lesson actually cites ────────
+
+
+class FullPaperCorpus(FakeCorpus):
+    """Adds full_paper, like CorpusRetriever, for figures_in's new-pipeline fallback."""
+
+    def __init__(self, answers, chunks):
+        super().__init__(answers)
+        self.chunks = chunks          # {(arxiv_id, version): [Passage, ...]}
+
+    def full_paper(self, arxiv_id, version):
+        return self.chunks.get((arxiv_id, version), [])
+
+
+def pseudo_claim(key, text, arxiv_id):
+    """The shape lara.learn.research._pseudo_claim actually produces: no passage "kind"
+    or "anchor" at all, only chunk_id/arxiv_id/title/section/text."""
+    return {"key": key, "text": text, "certainty": "single-source",
+           "passage": {"chunk_id": 42, "arxiv_id": arxiv_id, "title": "T", "section": "S",
+                       "text": "body text"}}
+
+
+def test_figures_in_falls_back_to_full_paper_lookup_for_pseudo_claims():
+    claims = [pseudo_claim("991", "Loss falls with more data.", "2401.00001")]
+    caption = Passage(chunk_id=7, arxiv_id="2401.00001", title="T", text="Figure 1: results.",
+                      kind="caption", anchor="S4.F1", version=1)
+    corpus = FullPaperCorpus({("2401.00001", 1, "S4.F1"):
+                             {"src": "https://x/fig1.png", "caption": "Results plot."}},
+                             {("2401.00001", 1): [caption]})
+    out = run(V.figures_in(claims, corpus))
+    assert out == [{"kind": "figure", "title": "Figure 1: results.", "src": "https://x/fig1.png",
+                    "caption": "Results plot.", "arxiv_id": "2401.00001", "claims": ["991"]}]
+
+
+def test_figures_in_fallback_is_skipped_once_the_direct_path_already_found_something():
+    claims = [claim_with_passage("c1", "x", CAPTION_PASSAGE)]
+    caption = Passage(chunk_id=7, arxiv_id="2401.00001", title="T", text="unused",
+                      kind="caption", anchor="S4.F9", version=1)
+    corpus = FullPaperCorpus({("2401.00001", 1, "S4.F2"): {"src": "https://x/y.png", "caption": "c"}},
+                             {("2401.00001", 1): [caption]})
+    out = run(V.figures_in(claims, corpus))
+    assert len(out) == 1 and out[0]["src"] == "https://x/y.png"
+    assert ("2401.00001", 1, "S4.F9") not in corpus.calls
+
+
+def test_figures_in_fallback_yields_nothing_without_full_paper_support():
+    claims = [pseudo_claim("991", "x", "2401.00001")]
+    assert run(V.figures_in(claims, FakeCorpus({}))) == []
 
 
 def test_build_includes_figures_alongside_synthesized_visuals():

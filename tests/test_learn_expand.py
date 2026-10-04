@@ -2,6 +2,7 @@ import asyncio
 import json
 
 import pytest
+from learn_helpers import FakeCorpus, corpus, llm, model, passage
 
 from lara.learn import expand as EX
 from lara.learn import learner as LN
@@ -9,7 +10,6 @@ from lara.learn import lesson as LE
 from lara.learn import pipeline as PL
 from lara.learn import scope as SC
 from lara.learn import store
-from learn_helpers import FakeCorpus, corpus, llm, model, passage
 
 LONG = "warmup avoids loss spikes early in training. " * 6
 CONCEPT = {"id": "c1", "title": "warmup", "summary": "s", "goal": "pretrain an LLM"}
@@ -112,6 +112,63 @@ def test_a_new_claim_that_repeats_an_existing_one_is_not_added():
     assert out["insufficient"] is True
 
 
+# ── new-pipeline search fallback: one research leaf (`synth`), not claims.py's
+# gather_passages/extract/relate, for a concept built by the research-driven pipeline ────
+
+
+def test_cited_keys_reads_chunk_id_brackets():
+    assert EX._cited_keys("A [12345]. Two [1, 2] together.") == ["12345", "1", "2"]
+    assert EX._cited_keys("nothing here") == []
+
+
+def test_pseudo_claim_prefers_the_short_claim_over_the_full_passage_text():
+    ref = {"claim": "Warmup helps.", "text": "the full passage...", "arxiv_id": "2409.9",
+          "chunk_id": 5, "paper_title": "P"}
+    c = EX._pseudo_claim("x1c1", ref)
+    assert c["key"] == "x1c1" and c["text"] == "Warmup helps." and c["certainty"] == "single-source"
+    assert c["passage"] == {"chunk_id": 5, "arxiv_id": "2409.9", "title": "P", "section": "",
+                            "text": "the full passage..."}
+
+
+def test_new_searches_use_the_injected_research_leaf_when_synth_is_given():
+    only_seen = "Warmup avoids early loss spikes [c1].\nIt matters early in training [c1]."
+    grounded = "A 2000-step warmup stabilised the 7B run [x1c1].\nThe loss spikes it prevents occur early [c1]."
+    replies = iter([only_seen, grounded])
+    m = llm((ANSWER, lambda s, p: next(replies)), ("strict fact-checker", "supports"))
+    calls = []
+
+    async def synth(focus):
+        calls.append(focus)
+        return {"text": "A 2000-step warmup stabilised the 7B run [91011].",
+                "references": {"91011": {"claim": "A 2000-step warmup stabilised the 7B run.",
+                                         "text": LONG, "arxiv_id": "2409.9", "chunk_id": 91011,
+                                         "paper_title": "New paper"}}}
+
+    out = run(EX.expand(m, FakeCorpus(default=[]), CONCEPT, content(), selection="Warmup avoids spikes",
+                        selection_claims=["c1"], synth=synth))
+    assert out["searched"] is True and calls and "Warmup avoids spikes" in calls[0]
+    assert [x["key"] for x in out["claims"]] == ["x1c1"]
+    assert out["claims"][0]["passage"]["arxiv_id"] == "2409.9"
+
+
+def test_a_research_leaf_result_that_only_repeats_an_existing_claim_is_dropped():
+    async def synth(focus):
+        return {"text": "Warmup avoids early loss spikes [91011].",
+                "references": {"91011": {"claim": "Warmup avoids early loss spikes.",
+                                         "text": LONG, "arxiv_id": "2409.9", "chunk_id": 91011}}}
+
+    existing = content()["claims"]                      # c1's text is the same sentence
+    fresh = run(EX._new_claims_from_research(synth, existing, "focus", 1))
+    assert fresh == [], "near-duplicate of an existing claim's text"
+
+
+def test_a_research_leaf_with_no_evidence_adds_nothing():
+    async def empty(focus):
+        return {"text": "", "references": {}}
+
+    assert run(EX._new_claims_from_research(empty, [], "focus", 1)) == []
+
+
 def test_expansion_ids_and_claim_keys_continue_from_what_is_stored():
     ct = content()
     ct["expansions"] = [{"id": "x1"}, {"id": "x3"}]
@@ -121,6 +178,70 @@ def test_expansion_ids_and_claim_keys_continue_from_what_is_stored():
 def test_lesson_parsing_accepts_expansion_claim_keys():
     [(_, sents)] = LE.parse("Detail here [x2c1, c3].", {"x2c1", "c3"})
     assert sents[0]["claims"] == ["x2c1", "c3"] and sents[0]["text"] == "Detail here."
+
+
+# ── tier 2: reading the lesson's own cited papers in full ───────────────────────────
+
+
+def test_ranked_papers_returns_distinct_papers_most_relevant_first():
+    ctx = [claim("c1", "t", 1, "2401.1"), claim("c2", "t", 2, "2401.1"),
+          claim("c3", "t", 3, "2401.2"), claim("c4", "t", 4, "2401.3"),
+          claim("c5", "t", 5, "2401.4")]
+    assert EX._ranked_papers(ctx, cap=3) == [("2401.1", 1), ("2401.2", 1), ("2401.3", 1)]
+
+
+def test_tier_2_is_skipped_when_the_concept_s_own_claims_already_answer():
+    """Cost discipline: a full paper read is not free, so it must not happen when the cheap
+    tier already succeeded -- checked here by giving a paper to read and confirming no
+    x-prefixed/paper-derived claim shows up in the result, which only tier 2 or 3 would add."""
+    reply = ("Warmup lasted 1000 steps for the 1B model [c2]."
+             "\nIt avoids early loss spikes [c1, c2]."
+             "\nLoss spikes are more likely without it [c1]."
+             "\nThe effect is strongest at the start of training [c1]."
+             "\nIt was validated on the 1B model specifically [c2].")
+    m = llm((ANSWER, reply), ("strict fact-checker", "supports"))
+    c = FakeCorpus(default=[passage(9, LONG)], full_papers={"2401.1": [passage(1, LONG)]})
+    out = run(EX.expand(m, c, CONCEPT, content(), selection="Warmup avoids spikes",
+                        selection_claims=["c1"]))
+    assert out["searched"] is False and out["claims"] == []
+
+
+def test_a_paper_that_does_not_answer_falls_through_to_the_next_candidate():
+    p1 = passage(101, "irrelevant filler about tokenizers.", arxiv="2401.1")
+    p2 = passage(202, "The learning rate ramps from zero during warmup.", arxiv="2401.2")
+
+    def reply(system, prompt):
+        if "202" in prompt:
+            return "The learning rate ramps from zero during warmup [202]."
+        return "INSUFFICIENT"
+
+    m = llm((ANSWER, reply))
+    ctx = [claim("c1", "t", 1, "2401.1"), claim("c2", "t", 2, "2401.2")]
+    c = FakeCorpus(full_papers={"2401.1": [p1], "2401.2": [p2]})
+    answer, claims = run(EX._paper_tier(m, c, ctx, "sel", "req"))
+    assert answer is not None and [x["key"] for x in claims] == ["202"]
+    assert claims[0]["passage"]["arxiv_id"] == "2401.2"
+
+
+def test_tier_2_answer_is_trusted_directly_with_no_verify_pass():
+    """No "strict fact-checker" rule is registered at all -- if _paper_answer routed its
+    answer through LE.verify() the way _answer() does, the judge call would hit `llm()`'s
+    empty default and every sentence would fail verification, leaving nothing. It does not:
+    the sentence survives untouched, proving no re-check pass ran."""
+    p = passage(202, "The learning rate ramps from zero during warmup.", arxiv="2401.2")
+    m = llm((ANSWER, "The learning rate ramps from zero during warmup [202]."))
+    result = run(EX._paper_answer(m, [p], "sel", "req"))
+    assert result is not None
+    sections, stats, claims = result
+    assert sections[0]["sentences"][0]["claims"] == ["202"] and stats["dropped"] == 0
+
+
+def test_expand_falls_through_to_general_search_only_when_tier_1_and_2_both_fail():
+    p1 = passage(101, "irrelevant filler about tokenizers.", arxiv="2401.1")
+    m = llm((ANSWER, "INSUFFICIENT"), ("extract atomic claims", "[]"))
+    c = FakeCorpus(default=[passage(9, LONG, arxiv="2409.9")], full_papers={"2401.1": [p1]})
+    out = run(EX.expand(m, c, CONCEPT, content(), selection="x"))
+    assert out["insufficient"] is True and c.queries, "tier 3's general search was reached"
 
 
 # ── persistence, flags, routes ───────────────────────────────────────────────────

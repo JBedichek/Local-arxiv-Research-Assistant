@@ -47,6 +47,8 @@ const L = {
   partialOpen: "",
   showProfile: false, trace: [], traceCursor: 0, traceConceptId: "", traceTimer: 0,
   traceOpen: new Set(),
+  mapTrace: [], mapTraceCursor: 0, mapTraceId: "",
+  showKnowledge: false, knowledge: null,
 };
 
 /* Lesson/claim/quiz text comes from the model, reading real papers -- 66% of chunks
@@ -72,6 +74,19 @@ export async function loadLearn() {
   }
   renderLearn();
   schedulePoll();
+}
+
+/* Cross-course, so it lives at the top level (alongside the course list), not inside any
+ * one course's own view -- see lara.learn.profile. Read-only: the only way to change it
+ * is to answer more quizzes. */
+async function loadKnowledge() {
+  try {
+    L.knowledge = await get("/api/learner/profile");
+    L.error = "";
+  } catch (err) {
+    L.error = err.message;
+  }
+  renderLearn();
 }
 
 /* Poll only while something is being built and the tab is open. */
@@ -130,6 +145,7 @@ async function refresh() {
     L.course = await get(`/api/learn/courses/${encodeURIComponent(L.id)}`);
     if (L.conceptId) L.concept = await fetchConcept(L.conceptId);
     if (L.pretest?.state === "building" || L.course.pretest === "building") await loadPretest();
+    if (L.course.status === "mapping") await loadMapTrace();
     await autoBuild();
   } catch (err) {
     L.error = err.message;
@@ -178,6 +194,10 @@ export function renderLearn() {
   if (!host) return;
   const err = L.error ? `<p class="error">${escapeHtml(L.error)}</p>` : "";
   const busy = L.busy ? `<p class="hint">${escapeHtml(L.busy)}…</p>` : "";
+  if (L.showKnowledge) {
+    host.innerHTML = `${err}${busy}${knowledgeView(L.knowledge)}`;
+    return;
+  }
   host.innerHTML = L.id && L.course ? `${err}${busy}${courseView(L.course)}` : `${err}${busy}${listView()}`;
 }
 
@@ -196,14 +216,38 @@ function listView() {
       <textarea id="learn-goal" rows="3" placeholder="e.g. I want to create the best pretraining recipe I can for a from-scratch LLM"></textarea>
       <button type="submit">Start a course</button>
     </form>
+    <button type="button" class="link" data-learn="knowledge-open">Your knowledge →</button>
     ${rows ? `<h4>Your courses</h4><ul class="learn-courses">${rows}</ul>` : ""}`;
+}
+
+/* Read-only, cross-course: what quizzes (in any course) have shown this learner
+ * understands -- see lara.learn.profile. Lessons already read this (the digest) when
+ * first written; this is the same information, for the learner themselves to see. */
+function knowledgeView(k) {
+  const head = `<div class="learn-head">
+    <button type="button" class="link" data-learn="knowledge-close">← all courses</button>
+    <h3>Your knowledge</h3></div>`;
+  if (!k) return `${head}<p class="hint">Loading…</p>`;
+  const known = k.concepts.filter((c) => c.bucket === "known");
+  const shaky = k.concepts.filter((c) => c.bucket === "shaky");
+  const row = (c) => `<li>${md(c.title)}
+    <span class="hint">${Math.round(c.score * 100)}% · ${c.attempts} quiz answer${c.attempts === 1 ? "" : "s"}</span></li>`;
+  const empty = !known.length && !shaky.length
+    ? `<p class="hint">Nothing assessed yet — answer some quiz questions in a course and they'll show up here.</p>` : "";
+  return `${head}
+    <p class="lede">What quizzes across your courses show you understand. New lessons read this
+      too: parts you've already shown you know stay brief, and parts you haven't get more room.</p>
+    ${k.digest ? `<div class="learn-card"><p>${md(k.digest)}</p></div>` : ""}
+    ${known.length ? `<h4>Solid</h4><ul class="learn-plan">${known.map(row).join("")}</ul>` : ""}
+    ${shaky.length ? `<h4>Shaky</h4><ul class="learn-plan">${shaky.map(row).join("")}</ul>` : ""}
+    ${empty}`;
 }
 
 function courseView(c) {
   const head = `<div class="learn-head">
     <button type="button" class="link" data-learn="back">← all courses</button>
     <h3>${escapeHtml(c.goal)}</h3></div>`;
-  if (["scoping", "scoped", "failed", "mapping"].includes(c.status) || !c.concepts.length) {
+  if (["scoping", "scoped", "failed", "mapping", "awaiting_approval"].includes(c.status) || !c.concepts.length) {
     return head + scopeView(c);
   }
   return head + competenciesView(c) + mapView(c)
@@ -233,12 +277,75 @@ function scopeView(c) {
   } else if (c.status === "scoped") {
     action = `<button type="button" data-learn="map">Build the concept map</button>`;
   } else if (c.status === "mapping") {
-    action = `<p class="hint">Reading survey papers to draw the map of what you need to learn…</p>`;
+    const revising = (c.plan_history || []).length > 0;
+    action = `<p class="hint">${revising ? "Revising the plan from your feedback…"
+      : "Reading survey papers to draw the map of what you need to learn…"}</p>
+      <div class="learn-card">${profileView(L.mapTrace)}</div>`;
+  } else if (c.status === "awaiting_approval") {
+    action = planReviewView(c);
   } else if (c.status === "failed" || c.status === "ready") {
     action = `<p class="error">${escapeHtml(c.error || "That did not work.")}</p>
       <button type="button" data-learn="map">Try mapping again</button>`;
   }
   return `<h4>What you will be able to do</h4><ul class="learn-comps">${comps}</ul>${diff}${action}`;
+}
+
+/* Phase 1's gate: the concept map is shown before any lesson is built from it, so a
+ * learner can catch a bad plan before paying for 12+ lessons written against it. */
+/* Lessons grouped under their subject (course["subjects"], see graph._concepts_from_
+ * result) -- a course this broad used to render as one flat list of 20-40 lessons with
+ * no relationship between them. A course mapped before subjects existed (or by the old
+ * blind pipeline) has none: falls back to one untitled group holding every lesson, so
+ * the same rendering code covers both without a separate flat-list branch. */
+function planReviewView(c) {
+  const byId = Object.fromEntries(c.concepts.map((k) => [k.id, k]));
+  const groups = (c.subjects || []).length
+    ? c.subjects
+    : [{ id: "", title: "", summary: "", concept_ids: c.concepts.map((k) => k.id) }];
+  const nodes = c.concepts.map((k) => ({ ...k, label: k.title }));
+  const edges = c.concepts.flatMap((k) => k.prereqs.map((p) => ({ from: p, to: k.id })));
+  const graph = svgGraph(nodes, edges,
+    { nodeSub: (n) => `${n.sources} source${n.sources === 1 ? "" : "s"}` });
+  const subjectBlocks = groups.map((s) => {
+    const lessons = (s.concept_ids || []).map((cid) => byId[cid]).filter(Boolean);
+    if (!lessons.length) return "";
+    const rows = lessons.map((k) => `
+      <li><b>${md(k.title)}</b>
+        <p>${md(k.summary)}</p>
+        ${k.prereqs.length ? `<p class="hint">After: ${k.prereqs.map((p) =>
+          escapeHtml(byId[p]?.title || p)).join(", ")}</p>` : ""}
+      </li>`).join("");
+    return `<div class="learn-subject">
+      ${s.title ? `<h5>${md(s.title)}</h5>` : ""}
+      ${s.summary ? `<p class="hint">${md(s.summary)}</p>` : ""}
+      <ul class="learn-plan">${rows}</ul>
+    </div>`;
+  }).join("");
+  const gaps = (c.uncovered || []).length
+    ? `<p class="hint warn">The corpus had nothing to build these from: ${c.uncovered.map(escapeHtml).join("; ")}</p>` : "";
+  return `<h4>Review the course plan</h4>
+    <p class="lede">Here is the course outline before any lessons are written, grouped into
+      subjects. Approve it to start building lessons, or say what you would like changed and
+      the plan will be revised.</p>
+    ${graph}${subjectBlocks}${gaps}
+    ${historyView(c.plan_history, "Earlier plan")}
+    <div class="learn-card">
+      <button type="button" data-learn="plan-approve">Approve this plan</button>
+      <form id="learn-plan-revise" class="learn-new">
+        <textarea id="learn-plan-feedback" rows="3" placeholder='What would you like changed? e.g. "Add a subject on reward hacking" or "Merge these two lessons" or "Put optimizer choice before scaling laws"'></textarea>
+        <button type="submit">Request changes</button>
+      </form>
+    </div>`;
+}
+
+/* Shared by the plan review above and the lesson revision card below -- a version kept
+ * (course["plan_history"] / concept["lesson_history"]) is shown as what changed and why,
+ * not re-rendered whole: the current version is already on screen. */
+function historyView(history, label) {
+  if (!history?.length) return "";
+  const rows = history.map((h, i) => `<li><b>${escapeHtml(label)} ${i + 1}</b> — ${md(h.feedback)}
+    <span class="hint">${new Date(h.superseded * 1000).toLocaleString()}</span></li>`).join("");
+  return `<details class="hint"><summary>${history.length} earlier version${history.length > 1 ? "s" : ""}</summary><ul>${rows}</ul></details>`;
 }
 
 /* Progress ---------------------------------------------------------------------- */
@@ -414,6 +521,26 @@ async function loadTrace() {
   renderLearn();
 }
 
+/* The same Profile view, for the course-level research a mapping course is running --
+ * piggybacked on `refresh()`'s own 2.5s poll (schedulePoll already polls while
+ * `status === "mapping"`) rather than a second timer, since it needs no independent
+ * on/off switch the way the per-concept Profile tab does: it is the only thing shown
+ * while a course is mapping, not one tab among several. */
+async function loadMapTrace() {
+  if (L.mapTraceId !== L.id) {
+    L.mapTraceId = L.id;
+    L.mapTrace = [];
+    L.mapTraceCursor = 0;
+  }
+  const body = await get(`/api/learn/courses/${encodeURIComponent(L.id)}/trace?since=${L.mapTraceCursor}`);
+  const rows = body.events || [];
+  if (rows.length) {
+    if (rows[0].seq <= L.mapTraceCursor) { L.mapTrace = []; }
+    L.mapTrace.push(...rows);
+    L.mapTraceCursor = rows[rows.length - 1].seq;
+  }
+}
+
 /* Lesson ------------------------------------------------------------------------ */
 
 function badge(certainty) {
@@ -505,6 +632,23 @@ function traceDetail(r) {
   if (r.type === "full_paper_read") {
     return { summary: `full-paper read <span class="hint">${escapeHtml(r.arxiv_id || "")} — ${r.chunks ?? "?"} chunk(s)</span>`, detail: "" };
   }
+  if (r.type === "deliverable_section") {
+    return { summary: `wrote “${escapeHtml((r.label || "").slice(0, 90))}” <span class="hint">${(r.text || "").length} char(s)</span>`,
+      detail: `<pre>${escapeHtml(r.text || "")}</pre>` };
+  }
+  if (r.type === "topic_graph_written" || r.type === "lesson_written") {
+    // `exit_reason` is why synthesizer.run's loop actually stopped -- see that
+    // function's own docstring on its three conditions. Named plainly here rather than
+    // echoing the raw "finished"/"idle"/"max_rounds" value, since that vocabulary is an
+    // implementation detail this reader never needs to have learned.
+    const why = { finished: "the research judged itself done",
+                 idle: "no further research was proposed",
+                 max_rounds: "hit its round limit — this may be an incomplete answer" }[r.exit_reason]
+      || escapeHtml(r.exit_reason || "");
+    return { summary: `research finished <span class="hint">${r.rounds ?? "?"} round(s) — ${why}</span>`,
+      detail: `<p class="hint">${r.goals_done ?? 0} goal(s) done, ${r.goals_failed ?? 0} failed`
+        + `${r.degraded ? ` · degraded: ${escapeHtml(r.degraded_because || "")}` : ""}</p>` };
+  }
   return { summary: escapeHtml(r.type || "event"), detail: `<pre>${escapeHtml(JSON.stringify(r, null, 1))}</pre>` };
 }
 
@@ -525,22 +669,39 @@ function traceRow(r, t0) {
  * gathered task) interleave their events in the file by timestamp, which would otherwise
  * scatter one facet's or section's story across the page. Phases appear in the order the
  * build first reached them. */
-function profileView(concept) {
-  const rows = L.trace;
-  const started = rows.find((r) => r.type === "build_start");
-  const t0 = rows.find((r) => r.type !== "build_start")?.ts ?? started?.ts ?? 0;
+/* `rows` is `L.trace` for a concept's own Profile tab, or `L.mapTrace` for the
+ * course-level research view a mapping course shows (see loadMapTrace) -- the same
+ * renderer either way, distinguishing only by which marker event (if any) opens the
+ * log, since that is the one thing that differs between the two call sites. */
+function profileView(rows) {
+  const started = rows.find((r) => r.type === "build_start" || r.type === "map_start");
+  const t0 = rows.find((r) => r.type !== "build_start" && r.type !== "map_start")?.ts ?? started?.ts ?? 0;
   const groups = [];
   const index = new Map();
   for (const r of rows) {
-    if (r.type === "build_start") continue;
+    if (r.type === "build_start" || r.type === "map_start") continue;
     if (!index.has(r.phase)) { index.set(r.phase, groups.length); groups.push({ phase: r.phase, rows: [] }); }
     groups[index.get(r.phase)].rows.push(r);
   }
-  const header = `<p class="hint">${started ? `Building the <b>${escapeHtml(started.variant)}</b> lesson${started.forced ? " (forced rebuild)" : ""} — ` : ""}${rows.length - (started ? 1 : 0)} event(s) so far.</p>`;
+  const marker = started?.type === "build_start"
+    ? `Building the <b>${escapeHtml(started.variant)}</b> lesson${started.forced ? " (forced rebuild)" : ""} — `
+    : started?.type === "map_start" ? "Researching the course's concept map — " : "";
+  const header = `<p class="hint">${marker}${rows.length - (started ? 1 : 0)} event(s) so far.</p>`;
+  // The deliverable itself, growing section by section as `_write_deliverable` actually
+  // writes each one (see synthesizer.py's `on_section`) -- shown up front and unfolded,
+  // not buried in a collapsed trace-row, since watching the topic graph / lesson prose
+  // actually being written is the whole point of this view while a research-driven build
+  // is live. Concatenated by `index` (the order sections are really written in), not
+  // arrival order in `rows` -- both happen to match today since `_write_deliverable`
+  // writes sequentially, but `index` is the one that is actually guaranteed to.
+  const written = rows.filter((r) => r.type === "deliverable_section").sort((a, b) => a.index - b.index);
+  const live = written.length ? `<section class="trace-live">
+    <h4>What's being written</h4>
+    <pre class="trace-live-text">${written.map((r) => escapeHtml(r.text || "")).join("\n\n")}</pre></section>` : "";
   const body = groups.length
     ? groups.map((g) => `<section class="trace-phase"><h4>${escapeHtml(g.phase)}</h4>${g.rows.map((r) => traceRow(r, t0)).join("")}</section>`).join("")
     : `<p class="hint">${rows.length ? "Nothing matches that filter." : "Nothing traced yet — build or refresh this concept to see its prompts, retrieval and tool calls here."}</p>`;
-  return header + body;
+  return header + live + body;
 }
 
 /* Versions of the lesson ------------------------------------------------------------ */
@@ -580,6 +741,25 @@ function writeCard(concept) {
     <span class="hint">Takes ${eta}. It only says what the sources support, so it may come out shorter than asked.</span></p>
     ${failed ? `<p class="error">${escapeHtml(b.error)}</p>` : ""}
     <button type="button" data-learn="write" ${spec}>Write it</button></div>`;
+}
+
+/* Optional, non-blocking (unlike the plan gate above): only offered on the research-
+ * driven standard lesson, which alone has a persisted synthesis graph behind it to
+ * resume (concept.research_driven -- see pipeline.build_concept's "claims" stage). */
+function reviseLessonCard(concept) {
+  const revising = buildingNow(concept) && concept.build?.stage === "revising_lesson";
+  if (revising) {
+    return `<div class="learn-card"><p>Revising the lesson from your feedback…</p></div>`;
+  }
+  const failed = concept.build?.stage === "error" && L.requested.has(concept.id);
+  return `<div class="learn-card">
+    <form id="learn-lesson-revise" class="learn-new" data-id="${escapeHtml(concept.id)}">
+      <label class="hint">Not quite right? Say what you'd like changed and it will be rewritten.</label>
+      <textarea id="learn-lesson-feedback" rows="2" placeholder='e.g. "Go deeper on how the KL penalty is computed"'></textarea>
+      <button type="submit">Request changes</button>
+    </form>
+    ${failed ? `<p class="error">${escapeHtml(concept.build.error)}</p>` : ""}
+    ${historyView(concept.lesson_history, "Earlier version")}</div>`;
 }
 
 function claimCard(concept) {
@@ -852,6 +1032,7 @@ function conceptView(concept) {
     ${concept.lesson && !concept.lesson.insufficient ? critiqueBox(concept) : ""}
     ${concept.lesson ? `<p><button type="button" data-learn="read" data-id="${escapeHtml(concept.id)}">I've read this — start practice</button>
       <button type="button" class="link" data-learn="build" data-id="${escapeHtml(concept.id)}" data-force="1">Refresh from the corpus</button></p>` : ""}
+    ${concept.lesson && !concept.lesson.insufficient && concept.research_driven && L.variant === "standard" ? reviseLessonCard(concept) : ""}
     <details><summary>All ${concept.claims.length} claims and their sources${s.unfaithful_dropped ? ` · ${s.unfaithful_dropped} extractions dropped as unfaithful` : ""}</summary><ul class="claims">${list}</ul></details>`;
   // The Profile tab (full prompt/response and retrieval detail) is separate from the
   // existing "How this lesson was built" trace card above (traceView): that one is the
@@ -864,7 +1045,7 @@ function conceptView(concept) {
   if (L.showProfile) {
     return `<div class="learn-concept">
       <button type="button" class="link" data-learn="close-concept">← back to your path</button>
-      <h3>${md(concept.title)}</h3>${tabs}${profileView(concept)}</div>`;
+      <h3>${md(concept.title)}</h3>${tabs}${profileView(L.trace)}</div>`;
   }
   // Not gated behind `built`/`gated`: the trace is written round by round as the claims stage
   // runs (see pipeline.build_concept's on_event), so it is worth showing -- open by default --
@@ -1157,6 +1338,8 @@ export function closeLearn() {
   view.hidden = true;
   document.body.classList.remove("learn-open");
   L.open = false;
+  L.showKnowledge = false;
+  L.knowledge = null;
   clearTimeout(L.poll);
   const pop = document.getElementById("learn-pop");
   if (pop) pop.style.display = "none";
@@ -1224,6 +1407,24 @@ export function bindLearn() {
         L.critique = (await send("POST", `${base()}/concepts/${encodeURIComponent(f.dataset.id)}/critique`, { text })).points;
         await refresh();
       });
+    } else if (f.id === "learn-plan-revise") {
+      e.preventDefault();
+      const text = $("#learn-plan-feedback").value.trim();
+      if (text) act("Requesting changes to the plan", async () => {
+        await send("POST", `${base()}/plan/revise`, { text });
+        await loadLearn();
+      });
+    } else if (f.id === "learn-lesson-revise") {
+      e.preventDefault();
+      const text = $("#learn-lesson-feedback").value.trim();
+      const cid = f.dataset.id;
+      if (text) {
+        L.requested.add(cid);
+        act("Requesting a revision", async () => {
+          await send("POST", `${base()}/concepts/${encodeURIComponent(cid)}/lesson/revise`, { text });
+          await refresh();
+        });
+      }
     }
   });
 
@@ -1234,10 +1435,13 @@ export function bindLearn() {
     const id = t.dataset.id;
     if (a === "open") openCourse(id);
     else if (a === "back") { L.id = ""; L.course = null; L.view = "path"; loadLearn(); }
+    else if (a === "knowledge-open") { L.showKnowledge = true; loadKnowledge(); }
+    else if (a === "knowledge-close") { L.showKnowledge = false; L.knowledge = null; renderLearn(); }
     else if (a === "delete") act("Deleting", async () => { await send("DELETE", `/api/learn/courses/${encodeURIComponent(id)}`, {}); await loadLearn(); });
     else if (a === "answer") act("Re-planning", async () => { await send("POST", `${base()}/answer`, { answer: t.dataset.value }); await loadLearn(); });
     else if (a === "accept") act("Accepting", async () => { await send("POST", `${base()}/accept`, {}); await loadLearn(); });
     else if (a === "map") act("Starting", async () => { await send("POST", `${base()}/map`, {}); await loadLearn(); });
+    else if (a === "plan-approve") act("Approving", async () => { await send("POST", `${base()}/plan/approve`, {}); await loadLearn(); });
     else if (a === "concept") { openConcept(id); }
     else if (a === "close-concept") { stopReading(); L.view = "path"; L.conceptId = ""; L.concept = null; L.graded = null; L.ask = null; L.variant = "standard"; L.partialOpen = ""; L.showProfile = false; watchTrace(false); renderLearn(); }
     else if (a === "profile-on") { L.showProfile = true; renderLearn(); watchTrace(true); loadTrace(); }

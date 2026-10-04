@@ -112,6 +112,38 @@ from somewhere else in it. A clear "this paper doesn't cover that" is a correct 
 useful answer; an invented one is not."""
 
 
+QUERY_SYSTEM = """You are turning a research question into a search query for a corpus of \
+academic papers.
+
+The search combines two signals: nearest-neighbour similarity over the query's meaning, \
+and keyword matching on the query's rarest, most specific words -- proper nouns, method \
+and dataset names, acronyms, established terms of art. Common words contribute almost \
+nothing to the keyword side, so a long, hedged or comparative restatement of the question \
+wastes no accuracy there, but it can bury the specific terms a paper would actually use \
+under framing and filler the semantic side then has to average past.
+
+Reply with JSON only: {"query": "..."}
+
+- Name the actual things being asked about -- methods, algorithms, datasets, metrics, \
+established terminology -- not a paraphrase of the question's framing. If the question \
+compares two things, name both.
+- Short: a phrase a paper's own abstract might contain, not a full sentence.
+- Never invent a term the question does not already imply."""
+
+
+RETRY_QUERY_SYSTEM = """You are retrying a search that found nothing.
+
+The first query below returned zero results from this corpus -- not zero relevant \
+results, zero results at all. Whatever it named either does not exist in this corpus \
+under that name, or the framing was too narrow to match anything. Propose a genuinely \
+different angle: broader or more general terminology, a specific named method or dataset \
+instead of an abstract description, or the single most concrete piece of a compound \
+question rather than the whole of it. Repeating the same terms rephrased will fail the \
+same way.
+
+Reply with JSON only: {"query": "..."}"""
+
+
 CONTINUE_SYSTEM = """You are deciding whether a literature survey is complete.
 
 You are told what the last round found and what the whole run has gathered.
@@ -540,6 +572,31 @@ async def extract(cfg, question: str, hits: list[dict], model, stream_answer,
         ))
     rejected = [int(h.get("chunk_id", 0)) for i, h in enumerate(hits, 1) if i not in kept_idx]
     return claims, rejected
+
+
+async def formulate_query(cfg, question: str, model, *, failed_query: str = "") -> str:
+    """A search-oriented query for `question`'s first retrieval, or -- when `failed_query`
+    is given -- a genuinely different one after that first attempt found nothing at all.
+    `run_synthesis` calls this before every goal's first retrieval and again on every dry
+    round (see its `query = question` / `if not picked:` sites), so this is one extra
+    small, cheap LLM call per goal and per dry retry across however many goals a
+    synthesis run spawns -- kept to a short prompt and a small `max_tokens` on purpose,
+    the same way `should_continue` already is.
+
+    Never blocks the actual research over a failed cosmetic rewrite: falls back to
+    `question` -- never to `failed_query`, which is already known to find nothing, so
+    repeating it verbatim would defeat the point of retrying -- if the call fails or
+    returns nothing. `complete_json`'s own failure-is-a-value contract, not an exception
+    here either."""
+    from lara.serve.generate import complete_json
+
+    prompt = ((f"First query (found nothing): {failed_query}\n\n"
+              f"Research question: {question}") if failed_query
+             else f"Research question: {question}") + "\n\nReply with the JSON object only."
+    d = await complete_json(cfg, prompt,
+                            system=RETRY_QUERY_SYSTEM if failed_query else QUERY_SYSTEM,
+                            model=model, max_tokens=80)
+    return str((d or {}).get("query") or "").strip() or question
 
 
 async def should_continue(cfg, question: str, rnd: Round, run: Run, model,
@@ -1006,7 +1063,13 @@ async def run_synthesis(state, cfg, question: str, *, model=None, stream_answer=
     rejected: list[tuple[str, int]] = []
     dry = 0
     stop_votes = 0
-    query = question
+    # The goal's raw text is rarely the best search string -- see `formulate_query`'s own
+    # docstring. Formulated once here, up front, rather than lazily inside the loop: round
+    # 1 needs it before the loop's first `_retrieve` either way, and computing it outside
+    # keeps the loop body's only other query reassignments (the dry-round retry below, and
+    # `should_continue`'s own `next_query`) at the same indentation level instead of one
+    # of the three being special-cased inside an `if n == 1`.
+    query = await formulate_query(cfg, question, model)
     via = "dense"
 
     def ev(name, payload):
@@ -1078,6 +1141,12 @@ async def run_synthesis(state, cfg, question: str, *, model=None, stream_answer=
             if dry >= dry_limit:
                 run.stopped_because = f"{dry} rounds found nothing new"
                 break
+            # A dry round means this exact query matched nothing -- not "nothing
+            # relevant," nothing at all -- so retrying it verbatim (as every round before
+            # this one did) would just fail the same way again. Reformulated with the
+            # failed query in hand, not repeated from `question` alone: see
+            # `RETRY_QUERY_SYSTEM`/`formulate_query`'s own docstring.
+            query = await formulate_query(cfg, question, model, failed_query=query)
             via = "citations" if via == "dense" else "dense"
             continue
 

@@ -23,7 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 
 import httpx
 
@@ -227,7 +227,8 @@ def _balanced(text: str, opener: str, closer: str) -> str:
 async def complete(cfg, prompt: str, *, system: str, model: str | None = None,
                    temperature: float = 0.0, max_tokens: int = 400,
                    sampling: dict | None = None, error_out: dict | None = None,
-                   finish_out: dict | None = None) -> str:
+                   finish_out: dict | None = None,
+                   on_token: Callable[[str], None] | None = None) -> str:
     """One non-streamed controller turn, accumulated to a string.
 
     The twelve lines this replaces were written out at nine call sites, and had already
@@ -243,6 +244,12 @@ async def complete(cfg, prompt: str, *, system: str, model: str | None = None,
     answer was sitting in the exception: `404 the model does not exist`, because the pool
     had substituted another card's endpoint while the caller went on naming the model it
     wanted. That took a vLLM log to find and should have taken reading the error.
+
+    `on_token`, when given, is called with each raw chunk as it streams in, in addition
+    to (not instead of) accumulating `buf` as always -- a caller that wants to surface
+    live progress (e.g. lara.serve.learn_research's Profile-tab bridge) without changing
+    what every other one of this function's ~19 call sites gets back. `None` by default:
+    zero behavior change for every caller that does not pass it.
     """
     buf = ""
     try:
@@ -259,6 +266,8 @@ async def complete(cfg, prompt: str, *, system: str, model: str | None = None,
                                        sampling=sampling,
                                        raw_user=True):
             buf += tok
+            if on_token is not None:
+                on_token(tok)
     except Exception as exc:
         if error_out is not None:
             error_out["type"] = type(exc).__name__

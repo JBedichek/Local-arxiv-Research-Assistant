@@ -6,6 +6,7 @@ import pytest
 
 from lara.learn import learner as LN
 from lara.learn import pipeline as PL
+from lara.learn import profile as PR
 from lara.learn import scope as SC
 from lara.learn import store
 from learn_helpers import corpus, llm, model
@@ -14,6 +15,7 @@ from learn_helpers import corpus, llm, model
 @pytest.fixture(autouse=True)
 def _root(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "ROOT", tmp_path / "courses")
+    monkeypatch.setattr(store, "PROFILE_PATH", tmp_path / "learner" / "profile.json")
     PL._building.clear()
     PL._building_topic.clear()
 
@@ -336,3 +338,189 @@ def test_concurrent_builds_keep_their_own_progress():
         assert store.load_build(course["id"], "c1")["stage"] == "done"
         assert store.load_build(course["id"], "c2")["stage"] == "done"
     run(go())
+
+
+# ── the plan-review gate and revision (both course- and lesson-level) ──────────────
+
+async def _fake_topic_graph_synth(objective: str) -> dict:
+    return {"subjects": [{"title": "Fundamentals", "summary": "",
+                          "concepts": [{"title": "Warmup basics",
+                                       "summary": "What warmup does [1].",
+                                       "prereqs_text": "", "competencies": []}]}],
+           "references": {"1": {"chunk_id": 1, "arxiv_id": "1234.5678", "title": "A paper"}},
+           "degraded": False, "tokens_in": 10, "tokens_out": 5, "rounds": 1}
+
+
+def _research_driven_course(m):
+    course = run(SC.begin(m, "learn pretraining"))
+    return run(PL.map_course(m, corpus(), course, topic_graph_synth=_fake_topic_graph_synth))
+
+
+def test_a_research_driven_map_stops_at_awaiting_approval_not_ready():
+    course = _research_driven_course(model())
+    assert course["status"] == "awaiting_approval"
+    assert store.load_course(course["id"])["status"] == "awaiting_approval"
+
+
+def test_approve_plan_moves_it_to_ready():
+    course = _research_driven_course(model())
+    approved = PL.approve_plan(course)
+    assert approved["status"] == "ready"
+    assert store.load_course(course["id"])["status"] == "ready"
+
+
+def test_revise_plan_keeps_the_superseded_version_and_installs_the_new_one():
+    course = _research_driven_course(model())
+    old_concepts = course["concepts"]
+
+    async def revise(feedback: str) -> dict:
+        assert feedback == "add a concept on decay"
+        return {"subjects": [{"title": "Fundamentals", "summary": "",
+                              "concepts": [{"title": "Decay basics",
+                                           "summary": "What decay does [1].",
+                                           "prereqs_text": "", "competencies": []}]}],
+               "references": {"1": {"chunk_id": 2, "arxiv_id": "1234.5678", "title": "A paper"}},
+               "degraded": False, "tokens_in": 3, "tokens_out": 2, "rounds": 1}
+
+    revised = run(PL.revise_plan(course, "add a concept on decay", revise=revise))
+    assert revised["status"] == "awaiting_approval"
+    assert [c["title"] for c in revised["concepts"]] == ["Decay basics"]
+    assert len(revised["plan_history"]) == 1
+    assert revised["plan_history"][0]["concepts"] == old_concepts
+    assert revised["plan_history"][0]["feedback"] == "add a concept on decay"
+    assert store.load_course(course["id"])["status"] == "awaiting_approval"
+
+
+def test_revise_plan_reverts_to_awaiting_approval_and_records_the_error_on_failure():
+    course = _research_driven_course(model())
+
+    async def revise(feedback: str) -> dict:
+        raise ValueError("no prior plan is on record for this course to revise from")
+
+    with pytest.raises(ValueError):
+        run(PL.revise_plan(course, "add a concept", revise=revise))
+    assert course["status"] == "awaiting_approval"
+    assert "revision failed" in course["error"]
+    assert store.load_course(course["id"])["status"] == "awaiting_approval"
+
+
+def _research_driven_lesson_synth(text="## Warmup\nWarmup avoids spikes [1]. It helps [1, 2]."):
+    async def synth(objective: str) -> dict:
+        return {"deliverable": text,
+               "references": {"1": {"chunk_id": 1, "arxiv_id": "1234.5678", "title": "A paper",
+                                    "claim": "Warmup avoids spikes."},
+                              "2": {"chunk_id": 2, "arxiv_id": "1234.5678", "title": "A paper",
+                                    "claim": "It helps."}},
+               "degraded": False, "tokens_in": 10, "tokens_out": 5, "rounds": 1}
+    return synth
+
+
+def test_a_research_driven_lesson_is_marked_so_it_can_later_be_revised():
+    course = _research_driven_course(model())
+    PL.approve_plan(course)
+    content = run(PL.build_concept(model(), corpus(), course, "c1",
+                                   lesson_synth=_research_driven_lesson_synth()))
+    assert content["research_driven"] is True
+    assert store.load_concept(course["id"], "c1")["research_driven"] is True
+
+
+def test_revise_lesson_requires_a_built_lesson_first():
+    course = _research_driven_course(model())
+    PL.approve_plan(course)
+
+    async def revise(feedback: str) -> dict:
+        raise AssertionError("should never be called -- nothing built yet")
+
+    with pytest.raises(ValueError, match="build this concept"):
+        run(PL.revise_lesson(course, "c1", "go deeper", revise=revise))
+
+
+def test_revise_lesson_keeps_the_superseded_lesson_and_installs_the_new_one():
+    course = _research_driven_course(model())
+    PL.approve_plan(course)
+    run(PL.build_concept(model(), corpus(), course, "c1",
+                         lesson_synth=_research_driven_lesson_synth()))
+    old_content = store.load_concept(course["id"], "c1")
+
+    async def revise(feedback: str) -> dict:
+        assert feedback == "go deeper on the math"
+        return {"deliverable": "## Warmup\nA deeper account of warmup [1]. More detail [1, 2].",
+               "references": {"1": {"chunk_id": 1, "arxiv_id": "1234.5678", "title": "A paper",
+                                    "claim": "A deeper account of warmup."},
+                              "2": {"chunk_id": 2, "arxiv_id": "1234.5678", "title": "A paper",
+                                    "claim": "More detail."}},
+               "degraded": False, "tokens_in": 4, "tokens_out": 6, "rounds": 2}
+
+    content = run(PL.revise_lesson(course, "c1", "go deeper on the math", revise=revise))
+    assert "A deeper account" in content["lesson"]["sections"][0]["sentences"][0]["text"]
+    assert len(content["lesson_history"]) == 1
+    assert content["lesson_history"][0]["lesson"] == old_content["lesson"]
+    assert content["lesson_history"][0]["feedback"] == "go deeper on the math"
+    assert store.load_build(course["id"], "c1")["stage"] == "done"
+
+
+def test_revise_lesson_records_the_build_error_and_reraises_on_failure():
+    course = _research_driven_course(model())
+    PL.approve_plan(course)
+    run(PL.build_concept(model(), corpus(), course, "c1",
+                         lesson_synth=_research_driven_lesson_synth()))
+
+    async def revise(feedback: str) -> dict:
+        raise ValueError("no prior lesson is on record for this concept to revise from")
+
+    with pytest.raises(ValueError):
+        run(PL.revise_lesson(course, "c1", "go deeper", revise=revise))
+    build = store.load_build(course["id"], "c1")
+    assert build["stage"] == "error" and "no prior lesson" in build["error"]
+
+
+# ── the cross-course knowledge profile: fed by quizzes, read by the first lesson build ──
+
+
+def test_answer_item_records_evidence_into_the_global_profile():
+    m = model()
+    course = ready_course(m)
+    run(PL.build_concept(m, corpus(), course, "c1"))
+    learner = LN.blank()
+    run(PL.answer_item(m, course, learner, "c1-q1", "A", 3))
+    snap = PR.snapshot()
+    assert any(c["title"] == "Warmup" for c in snap["concepts"])
+
+
+def test_build_concept_folds_the_profile_digest_into_the_first_lesson_objective():
+    course = _research_driven_course(model())
+    PL.approve_plan(course)
+    for _ in range(6):
+        PR.record_quiz_answer("Something learned elsewhere", True, 3, "mcq")
+    m = model(("summarizing one learner", "Knows something learned elsewhere well."))
+    captured = {}
+
+    async def synth(objective: str) -> dict:
+        captured["objective"] = objective
+        return {"deliverable": "## Warmup\nWarmup avoids spikes [1]. It helps [1, 2].",
+               "references": {"1": {"chunk_id": 1, "arxiv_id": "1234.5678", "title": "A paper",
+                                    "claim": "Warmup avoids spikes."},
+                              "2": {"chunk_id": 2, "arxiv_id": "1234.5678", "title": "A paper",
+                                    "claim": "It helps."}},
+               "degraded": False, "tokens_in": 1, "tokens_out": 1, "rounds": 1}
+
+    run(PL.build_concept(m, corpus(), course, "c1", lesson_synth=synth))
+    assert "Knows something learned elsewhere well." in captured["objective"]
+
+
+def test_build_concept_with_no_profile_evidence_asks_for_no_personalization():
+    course = _research_driven_course(model())
+    PL.approve_plan(course)
+    captured = {}
+
+    async def synth(objective: str) -> dict:
+        captured["objective"] = objective
+        return {"deliverable": "## Warmup\nWarmup avoids spikes [1]. It helps [1, 2].",
+               "references": {"1": {"chunk_id": 1, "arxiv_id": "1234.5678", "title": "A paper",
+                                    "claim": "Warmup avoids spikes."},
+                              "2": {"chunk_id": 2, "arxiv_id": "1234.5678", "title": "A paper",
+                                    "claim": "It helps."}},
+               "degraded": False, "tokens_in": 1, "tokens_out": 1, "rounds": 1}
+
+    run(PL.build_concept(model(), corpus(), course, "c1", lesson_synth=synth))
+    assert "already demonstrated" not in captured["objective"]

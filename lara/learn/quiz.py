@@ -15,18 +15,28 @@ from lara.learn.llm import Llm
 MAX_ITEMS = 10
 NUMERIC_TOLERANCE = 0.15
 
-QUIZ_SYSTEM = """Write quiz items that test understanding of the claims below.
+QUIZ_SYSTEM = """Write quiz items that test whether a learner understands the claims below -- \
+not whether they can recall a number or phrase quoted from the source passage. A learner who \
+has only skimmed the passage should be able to find the words; a learner who understands the \
+claim should be the only one who can answer correctly.
 
 Reply with JSON only: [{"type": "mcq"|"short"|"predict", "question": "...", \
 "choices": ["...", "...", "...", "..."], "answer": "...", "claim": "c1", "explanation": "..."}]
 
-- mcq: exactly one correct choice; "answer" is its letter A-D. Distractors plausible but \
-clearly wrong according to the claim. Omit "choices" for other types.
-- short: "answer" is one short phrase stated in the claim.
+- mcq: exactly one correct choice; "answer" is its letter A-D. Distractors should be plausible \
+misunderstandings of the claim's mechanism or a flipped/overstated version of it -- not merely \
+facts the claim never mentioned, which a careful skim would rule out without understanding \
+anything. Omit "choices" for other types.
+- short: ask why the claim's finding holds, what it implies, or how it would change under a \
+different condition the claim itself describes -- never to recall a number or name verbatim. \
+"answer" is still one short phrase, grounded in the claim, but answering it should require \
+understanding the claim, not locating it.
 - predict: only for a claim reporting a number, direction or comparison. The question sets up \
 the situation WITHOUT the result and asks the learner to predict it; "answer" is the result.
-- Each item tests one claim and must be answerable from that claim's source passage alone, \
-with no outside knowledge.
+- Every item must still be answerable from its claim's source passage alone, with no outside \
+knowledge -- the shift above is in what kind of question you ask about that passage, never in \
+how much of it a correct answer is allowed to need.
+- Each item tests one claim.
 - Write every question and explanation so it stands alone: never mention "the claims", claim \
 keys like c1, "the passage", "the text" or "the provided information".
 - explanation: one sentence on why the answer is right."""

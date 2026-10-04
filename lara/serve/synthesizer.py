@@ -66,6 +66,19 @@ SUBSYNTHESIS_MAX_IDLE_ROUNDS = 3
 #: cap, deliberately — see the module docstring).
 MAX_REFINEMENT_DEPTH = 10
 
+#: How many consecutive rounds must call the `finish` tool (and nothing else that counts
+#: as progress) before `run` treats that as the reason to stop, rather than waiting for
+#: `idle_rounds` to reach `max_idle_rounds` on its own. Two, not one: a round where
+#: nothing else progressed leaves next round's digest unchanged, so a model that is
+#: genuinely done will plausibly just call `finish` again — cheap to require, and a guard
+#: against one premature or mistaken call being taken at face value. `finish` calling
+#: this out explicitly is a strictly better signal than the model merely going quiet for
+#: `max_idle_rounds` rounds in a row (which still works as a fallback for a model that
+#: never calls `finish` at all — see `run`), because it is the model looking at the
+#: actual graph and judging the objective covered, not an absence of activity that could
+#: just as easily mean it got confused.
+FINISH_STREAK_TO_STOP = 2
+
 #: How many goals may sit `pending`/`running` at once. `_execute_round` dispatches every
 #: `pending` goal concurrently via one `asyncio.gather`, and the bounded-budget threshold
 #: (`_deliverable_threshold`) is only checked once per round, after that round's goals
@@ -140,6 +153,22 @@ class LogicalGoal:
     #: resolved — the same keying `citations.py`/`serve/runs.py:Run.references` already
     #: use, so a key here is a `Reference` a moment away from `citations.Reference.from_dict`.
     citations: dict = field(default_factory=dict)
+    #: The same leaf's short answer, alongside `summary`'s thorough one -- kept
+    #: separately (not read from instead of `summary`) because most callers (the live
+    #: round-to-round digest, a report/lesson deliverable) genuinely want the thorough
+    #: depth; only `deliverable_mode="topic_graph"`'s own section-writing prefers this
+    #: shorter one, to stop an outline-writing pass from being handed the same page of
+    #: evidence a report section gets when a title and a couple of sentences is all a
+    #: course outline actually needs (see `_write_deliverable`'s `use_tldr`). Empty for a
+    #: goal answered before this field existed, or a nested (`spawn_subsynthesis`) goal,
+    #: which has no separate short form of its own -- `_render_goal` falls back to
+    #: `summary` either way, so an older persisted graph still renders.
+    tldr: str = ""
+    #: `citations`'s own counterpart for `tldr` -- a tldr answer can cite a different (or
+    #: narrower) set of references than the thorough one, so resolving `tldr`'s brackets
+    #: against `citations` alone could leave a bracket the tldr text actually uses
+    #: unresolved.
+    tldr_citations: dict = field(default_factory=dict)
     #: Set when `status` is `failed`: what `run_synthesis` raised.
     error: str = ""
     #: Set by `spawn_subsynthesis` (never by `spawn_goal`/`refine_goal`): this goal is
@@ -174,6 +203,13 @@ class SynthesizerState:
     objective: str
     goals: dict[str, LogicalGoal] = field(default_factory=dict)
     idle_rounds: int = 0
+    #: Consecutive rounds that called `finish` and nothing else that counts as progress
+    #: — see `FINISH_STREAK_TO_STOP`. Reset to 0 by any round that is not exactly that
+    #: (a round that spawns/refines something, even alongside a `finish` call, is not a
+    #: genuine finish signal; neither is a round that goes quiet without calling `finish`
+    #: at all — that still only feeds `idle_rounds`). Updated inside `_reason_round`,
+    #: same as `idle_rounds` itself.
+    finish_streak: int = 0
     #: Prior compression summaries, oldest first. See the module docstring for why this
     #: carries no attached citation table of its own.
     compressed: list[str] = field(default_factory=list)
@@ -200,7 +236,8 @@ class SynthesizerState:
     def to_dict(self) -> dict:
         return {"objective": self.objective,
                 "goals": {gid: g.to_dict() for gid, g in self.goals.items()},
-                "idle_rounds": self.idle_rounds, "compressed": list(self.compressed),
+                "idle_rounds": self.idle_rounds, "finish_streak": self.finish_streak,
+                "compressed": list(self.compressed),
                 "round": self.round,
                 "silent_reason_rounds": self.silent_reason_rounds,
                 "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
@@ -213,6 +250,7 @@ class SynthesizerState:
                  for gid, g in (d.get("goals") or {}).items()}
         return cls(objective=str(d.get("objective") or ""), goals=goals,
                     idle_rounds=int(d.get("idle_rounds") or 0),
+                    finish_streak=int(d.get("finish_streak") or 0),
                     compressed=[str(x) for x in (d.get("compressed") or [])],
                     round=int(d.get("round") or 0),
                     silent_reason_rounds=int(d.get("silent_reason_rounds") or 0),
@@ -273,10 +311,15 @@ def load(state_id: str, *, root: Path | None = None) -> SynthesizerState | None:
 # ── the digest a reasoning pass reads ────────────────────────────────────────────
 
 
-def _render_goal(goal: LogicalGoal) -> str:
+def _render_goal(goal: LogicalGoal, *, use_tldr: bool = False) -> str:
     """One goal, as both `_digest` (every goal, flat) and `_cluster_digest` (one
     cluster's worth) render it — the single copy of this block, so the two can never
-    drift into describing the same goal two different ways."""
+    drift into describing the same goal two different ways.
+
+    `use_tldr` — default False, so `_digest`'s own live round-to-round reasoning keeps
+    reading the full thorough answer exactly as before — renders `goal.tldr` instead of
+    `goal.summary`, falling back to `summary` when a goal has no `tldr` (an older
+    persisted graph, or a nested goal — see that field's own comment)."""
     head = f"### {goal.id} (depth {goal.depth}"
     if goal.refines:
         head += f", refines {goal.refines}"
@@ -291,7 +334,8 @@ def _render_goal(goal: LogicalGoal) -> str:
     head += f", {goal.status})"
     block = [head, goal.text]
     if goal.status == DONE:
-        block.append(f"**Answer:** {goal.summary or '(nothing)'}")
+        answer = (goal.tldr if use_tldr else "") or goal.summary or "(nothing)"
+        block.append(f"**Answer:** {answer}")
     else:
         block.append(f"**Failed:** {goal.error or 'unknown error'}")
     return "\n".join(block)
@@ -350,10 +394,12 @@ def _cluster_goals(goals: dict[str, LogicalGoal]) -> list[list[LogicalGoal]]:
     return list(clusters.values())
 
 
-def _cluster_digest(objective: str, cluster: list[LogicalGoal]) -> str:
-    """One cluster's own slice of `_digest` — the objective plus only its goals."""
+def _cluster_digest(objective: str, cluster: list[LogicalGoal], *,
+                    use_tldr: bool = False) -> str:
+    """One cluster's own slice of `_digest` — the objective plus only its goals. See
+    `_render_goal`'s own docstring for `use_tldr`."""
     parts = [f"Objective: {objective}"]
-    parts.extend(_render_goal(g) for g in cluster)
+    parts.extend(_render_goal(g, use_tldr=use_tldr) for g in cluster)
     return "\n\n".join(parts)
 
 
@@ -567,6 +613,76 @@ def _section_system(n_goals: int) -> str:
         "not one compressed sentence standing in for it.")
 
 
+#: `deliverable_mode="topic_graph"` — Learn's Phase 1 (see lara.learn.graph.build_from_research):
+#: this run's research becomes a course's concept map directly, instead of a prose report.
+TOPIC_GRAPH_SYSTEM = """You design part of the concept map for a self-study course, from \
+research already gathered on this one theme of the course's overall objective. The \
+objective below names the course's competencies with their ids.
+
+Reply with JSON only: {"concepts": [{"title": "...", "summary": "...", \
+"prereqs_text": "...", "competencies": ["<competency id>"]}]}
+
+- 1 to 4 teachable concepts from this material -- not the whole course (other themes are \
+handled separately, and every theme's candidates are organized into the final course by a \
+later pass that may group, reorder or drop one that turns out to duplicate another -- \
+propose freely from what this theme alone supports; do not worry about overlap with \
+themes you cannot see), not a single fact.
+- "summary": 2-4 sentences a learner would read before studying it, citing the chunk ids \
+that support it in square brackets exactly as they appear in the research below, e.g. \
+[12345] or [12345, 67890]. Never invent a citation; never drop one still load-bearing.
+- "prereqs_text": in plain words, what a learner should already understand before this \
+concept (referring to other concepts by title, not by an id you do not have) -- or "" if \
+nothing here depends on anything else.
+- "competencies": which of the objective's listed competency ids this concept serves, or \
+[] if none of them fit.
+- Only concepts this material actually supports. Skip anything the research below does \
+not substantiate."""
+
+
+def _topic_graph_section_system(n_goals: int) -> str:
+    return TOPIC_GRAPH_SYSTEM + (
+        f"\n\nThis theme covers {n_goals} sub-question{'s' if n_goals != 1 else ''} of "
+        "the course's objective.")
+
+
+#: `deliverable_mode="lesson"` — Learn's Phase 2 (see lara.learn.research.build_lesson):
+#: this run's research becomes one concept's lesson directly, instead of a prose report.
+LESSON_DELIVERABLE_SYSTEM = """You are writing a lesson on one concept for a learner, from \
+research already gathered on it -- the material below covers one theme's own \
+sub-questions toward that lesson, not the whole thing.
+
+Write in this order, each as its own "## Heading": what the concept is, then how or why \
+it works, then what is known about using it (results, numbers, conditions, limits). Use \
+whichever of those actually apply to this material; skip one this theme's research did \
+not touch.
+
+Rules:
+- Cite every factual sentence with the chunk id(s) it rests on, in square brackets exactly \
+as they appear below, e.g. [12345] or [12345, 67890]. Never invent one; never drop one \
+still load-bearing for a claim you keep.
+- The first time a sentence uses a technical term, acronym or named method, briefly say \
+what it means as part of that sentence, from what the research already says about it.
+- State each idea once, even when several findings support it -- cite them together \
+rather than repeating the point once per finding.
+- Convey certainty as the research shows it: say when a point rests on one paper, is only \
+proposed rather than shown, or was contradicted by other work.
+- If two findings genuinely disagree, say so plainly under their own "## Where sources \
+disagree" heading (only if this theme's material actually contains a disagreement), \
+naming what each side found and its conditions -- never the bare word "claim" or \
+"finding" standing in for one, and never picking a winner.
+- A later pass places this section among the others -- do not write a lesson title, an \
+introduction to the whole lesson, or a conclusion; start on the material and end when it \
+does.
+- If something the corpus discusses did not work or is disputed, say so plainly rather \
+than omitting it."""
+
+
+def _lesson_section_system(n_goals: int) -> str:
+    return LESSON_DELIVERABLE_SYSTEM + (
+        f"\n\nThis section covers {n_goals} sub-question{'s' if n_goals != 1 else ''} of "
+        "the lesson.")
+
+
 #: The tool a stitching pass calls — see `_stitch`. Its arguments are the *only* channel
 #: that call's output can reach the caller through, which is what makes "never rewrites a
 #: section" an enforced property rather than a hoped-for one: nothing here ever reads
@@ -585,6 +701,52 @@ restate the section's own content, which follows immediately after it.
 closing paragraph tying it together.
 
 Call organize_report exactly once, naming every section id below in "order"."""
+
+
+#: `deliverable_mode="topic_graph"`'s own analog of `STITCH_TOOL` -- see
+#: `_organize_curriculum`. Same never-rewrites-content discipline: the model's only
+#: output channel is this call's own arguments, so a candidate lesson's title/summary
+#: text physically cannot be rewritten by it, whatever it tries to do.
+CURRICULUM_TOOL = "organize_curriculum"
+
+CURRICULUM_SYSTEM = """You are organizing a course outline from candidate lessons that \
+several independent passes over the research already proposed. Each pass only saw one \
+theme of the material, so candidates from different passes sometimes overlap or cover the \
+same ground from a different angle.
+
+Below is every candidate: its id, title and summary. You may not rewrite, shorten, \
+paraphrase or add facts to any candidate's title or summary — your only job is structure:
+
+- Group related candidates under a handful of subjects, each a coherent unit of the course \
+(e.g. "Data Selection Fundamentals", "Reward Modeling") — not one subject per candidate, \
+and not one subject for the whole course.
+- Within a subject, order its lessons the way a learner should meet them.
+- Leave a candidate out entirely (never list its id) when it substantially duplicates one \
+you kept, or is too minor to earn its own lesson — a smaller, well-organized course \
+teaches better than a long flat list of every candidate that was ever proposed.
+- Give each subject a short (1-2 sentence) framing summary of its own — an introduction \
+to its lessons, not a restatement of them.
+
+Call organize_curriculum exactly once."""
+
+
+def _curriculum_schema(candidate_ids: list[str]) -> dict:
+    return _schema(
+        CURRICULUM_TOOL,
+        "Group the candidate lessons below into subjects, in teaching order. A candidate "
+        "id left out of every subject is dropped from the course.",
+        {"subjects": {
+            "type": "array",
+            "items": {"type": "object",
+                     "properties": {
+                         "title": {"type": "string"},
+                         "summary": {"type": "string"},
+                         "lesson_ids": {
+                             "type": "array", "items": {"type": "string"},
+                             "description": "Candidate ids, in teaching order: "
+                                           + ", ".join(candidate_ids)}},
+                     "required": ["title", "lesson_ids"]}}},
+        ["subjects"])
 
 
 def _stitch_schema(section_ids: list[str]) -> dict:
@@ -738,7 +900,9 @@ async def _reason_round(state: SynthesizerState, *, base_url: str, model: str,
                         deliverable_tokens: int | None = None,
                         allow_subsynthesis: bool = False, embed=None) -> bool:
     """One reasoning pass. Mutates `state` in place. Returns whether real progress was
-    made — a goal was actually created, not merely a tool called and refused.
+    made — a goal was actually created, not merely a tool called and refused. Also
+    updates `state.finish_streak` (see `FINISH_STREAK_TO_STOP`) from whether this round
+    called `finish` and nothing else that counts as progress.
 
     Never raises: a reasoning pass that errored is a round with
     nothing proposed, which is exactly what an idle round already means, not a reason to
@@ -766,9 +930,15 @@ async def _reason_round(state: SynthesizerState, *, base_url: str, model: str,
     from lara.serve import converse as CV
 
     progressed = False
+    #: Whether `finish` was called this round — tracked separately from `progressed`,
+    #: never folded into it: a round that calls `finish` and also spawns/refines
+    #: something is not a genuine "nothing further would help" signal, so it must not be
+    #: indistinguishable, on this flag alone, from a round that called only `finish`.
+    #: `state.finish_streak` (below) is what actually combines the two correctly.
+    finished = False
 
     def dispatch(name: str, args: dict) -> str:
-        nonlocal progressed
+        nonlocal progressed, finished
         if name == SPAWN_TOOL:
             ok, msg = _do_spawn(state, args)
             progressed = progressed or ok
@@ -778,6 +948,7 @@ async def _reason_round(state: SynthesizerState, *, base_url: str, model: str,
             progressed = progressed or ok
             return msg
         if name == FINISH_TOOL:
+            finished = True
             return "noted — nothing further this round"
         if name == SPAWN_SUBSYNTHESIS_TOOL and allow_subsynthesis:
             ok, msg = _do_spawn_subsynthesis(state, args)
@@ -817,6 +988,9 @@ async def _reason_round(state: SynthesizerState, *, base_url: str, model: str,
     except Exception:                                          # noqa: BLE001
         pass
     state.idle_rounds = 0 if progressed else state.idle_rounds + 1
+    # A genuine finish signal is `finish` called and nothing else that counts as
+    # progress — see `finished`'s own comment above and `FINISH_STREAK_TO_STOP`.
+    state.finish_streak = state.finish_streak + 1 if (finished and not progressed) else 0
     return progressed
 
 
@@ -890,19 +1064,24 @@ async def _execute_round(state: SynthesizerState, *, aresearch, model: str,
                     goal.status = DONE
                     goal.summary = nested_result.deliverable
                     goal.citations = dict(nested_result.references)
+                    # A nested run has no separate short form of its own -- `_render_goal`
+                    # falls back to `summary` when `tldr` is empty, so leaving this unset
+                    # is the correct (not merely convenient) choice here.
                 return
             research = await aresearch(goal.text, model=model, base_url=base_url,
                                        api_key=api_key)
             thorough = getattr(research, "thorough", None)
             text = str(getattr(thorough, "text", "") or "").strip()
             refs = dict(getattr(thorough, "references", {}) or {})
+            tldr_obj = getattr(research, "tldr", None)
+            tldr_text = str(getattr(tldr_obj, "text", "") or "").strip()
+            tldr_refs = dict(getattr(tldr_obj, "references", {}) or {})
             if not text:
                 # A thorough answer that came back empty still leaves the tldr, the same
                 # fallback `context.fitted` already prefers a complete short answer over
                 # nothing from a long one that did not materialise.
-                tldr = getattr(research, "tldr", None)
-                text = str(getattr(tldr, "text", "") or "").strip()
-                refs = dict(getattr(tldr, "references", {}) or refs)
+                text = tldr_text
+                refs = tldr_refs or refs
             stopped_because = str(getattr(research, "stopped_because", "") or "")
             if _CONSOLIDATION_FAILED_MARKER in stopped_because:
                 # `run_synthesis` caught its own consolidation failure and returned a
@@ -915,6 +1094,14 @@ async def _execute_round(state: SynthesizerState, *, aresearch, model: str,
                 goal.summary = text
                 goal.citations = {k: (v.to_dict() if hasattr(v, "to_dict") else v)
                                   for k, v in refs.items()}
+                # Never empty when a real answer landed: a tldr that itself came back
+                # blank still gets the same thorough-derived `text`/`refs` `summary` and
+                # `citations` just got, rather than leaving `_render_goal`'s `use_tldr`
+                # path to silently read nothing.
+                goal.tldr = tldr_text or text
+                tldr_cite_src = tldr_refs or refs
+                goal.tldr_citations = {k: (v.to_dict() if hasattr(v, "to_dict") else v)
+                                       for k, v in tldr_cite_src.items()}
         except Exception as exc:                                # noqa: BLE001
             goal.status = FAILED
             goal.error = f"{type(exc).__name__}: {exc}"[:400]
@@ -1165,6 +1352,83 @@ async def _stitch(sections: list[tuple[str, str, str]], objective: str, *,
     return "\n\n".join(parts), tokens_in, tokens_out
 
 
+async def _organize_curriculum(candidates: list[dict], *, objective: str, base_url: str,
+                               model: str, max_model_len: int, api_key: str = ""
+                               ) -> tuple[list[dict], int, int]:
+    """Groups already-written candidate lessons (each `{"id", "title", "summary", ...}`,
+    from `_topic_graph_section_system`'s per-cluster output — see `_finalize_topic_graph`)
+    into subjects: `deliverable_mode="topic_graph"`'s analog of `_stitch`, for the same
+    reason — a 15-cluster graph proposing 1-4 candidates each used to become a flat list
+    of 15-40 "lessons" with no relationship between them (`_merge_topic_graph_sections`
+    was pure concatenation, no editorial judgment at all). This is the actual reduce step
+    that replaced it: the model's only output channel is `organize_curriculum`'s own
+    arguments, so a candidate's title/summary text physically cannot be rewritten by it —
+    what this call can change is only which candidates survive and how they are grouped.
+
+    Degrades to one fallback subject holding every candidate, in the order given, when the
+    call comes back with nothing usable at all — an unreachable replica, a malformed
+    reply, or a `subjects` list whose every entry names no real candidate id — so a
+    transport or parsing failure here can never silently drop a candidate the research
+    actually supported. Once a reply has produced at least one real subject, though, an id
+    it left out is trusted as a deliberate drop (duplicate, or too minor) — the entire
+    point of this call — not reinjected as if it were itself a failure.
+
+    Returns `([{"title", "summary", "concepts": [<candidate dicts, "id" popped>]}],
+    tokens_in, tokens_out)`."""
+    from lara.serve import converse as CV
+
+    by_id = {c["id"]: c for c in candidates}
+    ids = list(by_id)
+    listing = "\n\n".join(f"### {c['id']}\n{c['title']}\n{c.get('summary', '')}"
+                          for c in candidates)
+    prompt = f"Objective: {objective}\n\n{listing}"
+    room = CX.reply_room(max_model_len, CURRICULUM_SYSTEM, prompt,
+                         stage="synthesizer.curriculum", default=1_500, cap=4_000)
+
+    captured: dict = {}
+
+    def dispatch(name: str, args: dict) -> str:
+        if name == CURRICULUM_TOOL:
+            captured.update(args or {})
+        return "recorded"
+
+    tokens_in = tokens_out = 0
+    try:
+        reply = await CV.talk(
+            base_url, model, CV.opening(CURRICULUM_SYSTEM, prompt),
+            tools=[_curriculum_schema(ids)], dispatch=dispatch, max_turns=1,
+            max_tokens=room, api_key=api_key,
+            tool_choice={"type": "function", "function": {"name": CURRICULUM_TOOL}},
+            enable_thinking=False)
+        tokens_in = int(getattr(reply, "tokens_in", 0) or 0)
+        tokens_out = int(getattr(reply, "tokens_out", 0) or 0)
+    except Exception:                                          # noqa: BLE001
+        pass
+
+    raw_subjects = captured.get("subjects")
+    subjects: list[dict] = []
+    seen: set[str] = set()
+    if isinstance(raw_subjects, list):
+        for s in raw_subjects:
+            if not isinstance(s, dict):
+                continue
+            kept = [dict(by_id[cid]) for cid in (s.get("lesson_ids") or [])
+                   if isinstance(cid, str) and cid in by_id and cid not in seen]
+            if not kept:
+                continue
+            seen.update(c["id"] for c in kept)
+            subjects.append({"title": str(s.get("title") or "").strip(),
+                             "summary": str(s.get("summary") or "").strip(),
+                             "concepts": kept})
+    if not subjects:
+        subjects = [{"title": "Course topics", "summary": "",
+                    "concepts": [dict(c) for c in candidates]}]
+    for s in subjects:
+        for c in s["concepts"]:
+            c.pop("id", None)
+    return subjects, tokens_in, tokens_out
+
+
 #: Prepended to the deliverable when `_write_deliverable` had to fall back or accept a
 #: truncated section anywhere in it — a reader-facing analog of `deliverable.py`'s
 #: `SHIPPED WITHOUT A MEASUREMENT` stamp: the caveat belongs where the text is actually
@@ -1180,7 +1444,9 @@ def _pressure_note(because: str) -> str:
 
 async def _write_deliverable(state: SynthesizerState, *, base_url: str, model: str,
                              max_model_len: int, api_key: str = "", conn=None,
-                             deliverable_tokens: int | None = None
+                             deliverable_tokens: int | None = None,
+                             deliverable_mode: str = "report",
+                             on_section=None
                              ) -> tuple[str, dict[str, C.Reference], bool, str]:
     """Write the actual deliverable — the thing a person reads.
 
@@ -1223,15 +1489,50 @@ async def _write_deliverable(state: SynthesizerState, *, base_url: str, model: s
     `_compress` returns, so `run()`'s final-step call site barely changes. `degraded` is
     True if *any* section (including the folded-in prior compression) had to fall back or
     accept a truncated reply; `degraded_because` is that section's own reason.
+
+    `deliverable_mode` picks what a section actually is:
+    - `"report"` (default): `_section_system`, prose, organized by `_stitch` below.
+    - `"lesson"` (lara.learn.research.build_lesson): `_lesson_section_system`, still
+      prose, still organized by `_stitch` — a lesson reads like a report, it is only the
+      system prompt that changes what it is a lesson about versus a general finding.
+    - `"topic_graph"` (lara.learn.graph.build_from_research): `_topic_graph_section_system`,
+      each section a JSON `{"concepts":[...]}` object rather than prose, read from each
+      cluster's own *tldr* answers rather than the thorough ones every other mode reads
+      (see `LogicalGoal.tldr`'s own docstring) — a course outline needs a title and a
+      couple of sentences per candidate, not a page of evidence. `_stitch`'s prose-
+      transition logic does not apply to organizing JSON candidates into subjects, so
+      those go through `_finalize_topic_graph`/`_organize_curriculum` instead, never sent
+      through `_stitch`.
+
+    `on_section(label, text)`, when given, fires once per section — after each cluster's
+    own `_compose` call lands, in the same sequential order they are written in below —
+    with that section's actual composed text. This is real content, not a token stream:
+    `_compose`'s own transport (`converse.talk`) makes one blocking, non-streaming HTTP
+    call per attempt, so there is no per-token signal to forward here without first
+    reworking that transport (a separate, contained change: `converse.talk` has exactly
+    three call sites, all in this module, and `generate.stream_answer` already has the
+    native-tool-call-fragment reconstruction a streaming version of it would need). A
+    section landing as soon as it is actually written is the honest granularity available
+    today — see `lara.serve.learn_research`'s bridge of this into the Profile tab.
     """
+    # Both `citations` (thorough) and `tldr_citations` are folded in, regardless of mode:
+    # a topic_graph section is written from tldr text (see `use_tldr` below) and so cites
+    # `tldr_citations`' keys, which need to resolve here too, not just `citations`' own.
     known: dict[str, C.Reference] = {}
     for g in state.goals.values():
         if g.status not in (DONE, FAILED):
             continue
-        for k, d in (g.citations or {}).items():
-            ref = C.Reference.from_dict(d)
-            if ref is not None:
-                known[k] = ref
+        for cites in (g.citations, g.tldr_citations):
+            for k, d in (cites or {}).items():
+                ref = C.Reference.from_dict(d)
+                if ref is not None:
+                    known.setdefault(k, ref)
+
+    section_system = {"report": _section_system, "lesson": _lesson_section_system,
+                      "topic_graph": _topic_graph_section_system}[deliverable_mode]
+    # See `LogicalGoal.tldr`'s own docstring: only the topic-graph outline reads the
+    # short form -- a report/lesson section still gets the full thorough depth.
+    use_tldr = deliverable_mode == "topic_graph"
 
     cap = deliverable_tokens or MAX_COMPRESS_TOKENS
     degraded_any = False
@@ -1244,7 +1545,7 @@ async def _write_deliverable(state: SynthesizerState, *, base_url: str, model: s
                         + "\n\n".join(f"### earlier compression {i}\n{c}"
                                       for i, c in enumerate(state.compressed, 1)))
         text, degraded, why, tin, tout = await _compose(
-            prior_source, system=_section_system(len(state.compressed)),
+            prior_source, system=section_system(len(state.compressed)),
             base_url=base_url, model=model, max_model_len=max_model_len,
             api_key=api_key, cap=cap, stage="synthesizer.section")
         total_in += tin
@@ -1252,12 +1553,14 @@ async def _write_deliverable(state: SynthesizerState, *, base_url: str, model: s
         degraded_any = degraded_any or degraded
         degraded_because = why or degraded_because
         sections.append(("prior", "Established earlier in this run", text))
+        if on_section is not None:
+            on_section("prior", text)
 
     for cluster in _cluster_goals(state.goals):
         root = cluster[0]
-        source = _cluster_digest(state.objective, cluster)
+        source = _cluster_digest(state.objective, cluster, use_tldr=use_tldr)
         text, degraded, why, tin, tout = await _compose(
-            source, system=_section_system(len(cluster)), base_url=base_url,
+            source, system=section_system(len(cluster)), base_url=base_url,
             model=model, max_model_len=max_model_len, api_key=api_key, cap=cap,
             stage="synthesizer.section")
         total_in += tin
@@ -1265,13 +1568,23 @@ async def _write_deliverable(state: SynthesizerState, *, base_url: str, model: s
         degraded_any = degraded_any or degraded
         degraded_because = why or degraded_because
         sections.append((f"section-{root.id}", root.text, text))
+        if on_section is not None:
+            on_section(root.text, text)
 
     state.tokens_in += total_in
     state.tokens_out += total_out
 
     if not sections:
         return "", {}, False, ""
-    if len(sections) == 1:
+
+    if deliverable_mode == "topic_graph":
+        final, curr_in, curr_out = await _finalize_topic_graph(
+            [text for _, _, text in sections], objective=state.objective,
+            base_url=base_url, model=model, max_model_len=max_model_len,
+            api_key=api_key)
+        state.tokens_in += curr_in
+        state.tokens_out += curr_out
+    elif len(sections) == 1:
         final = sections[0][2]
     else:
         final, stitch_in, stitch_out = await _stitch(
@@ -1282,6 +1595,54 @@ async def _write_deliverable(state: SynthesizerState, *, base_url: str, model: s
 
     cited = C.bind(final, known=known, conn=conn)
     return cited.text, cited.references, degraded_any, degraded_because
+
+
+def _parse_topic_graph_section(text: str) -> list[dict]:
+    """Salvages the `concepts` list from one cluster's own topic-graph reply. A reply
+    that was not valid JSON (a malformed or truncated `_compose` fallback) still gets one
+    best-effort recovery attempt (the first `{...}` span in the text) before giving up and
+    contributing nothing — the same tolerance a hand-typed tool-call fallback anywhere
+    else in this module gets."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if not match:
+            return []
+        try:
+            data = json.loads(match.group(0))
+        except ValueError:
+            return []
+    items = data.get("concepts") if isinstance(data, dict) else None
+    return [item for item in items if isinstance(item, dict)] if isinstance(items, list) else []
+
+
+async def _finalize_topic_graph(texts: list[str], *, objective: str, base_url: str,
+                                model: str, max_model_len: int, api_key: str = ""
+                                ) -> tuple[str, int, int]:
+    """Turns every cluster's own raw `{"concepts": [...]}` reply into one course outline:
+    pools every cluster's candidates, gives each a stable id, and organizes them into
+    subjects (`_organize_curriculum`) — the reduce step that replaced blind concatenation
+    (see that function's own docstring for why). Returns `(json_text, tokens_in,
+    tokens_out)`, where `json_text` decodes to `{"subjects": [{"title", "summary",
+    "concepts": [<the original per-candidate dicts, untouched>]}]}` — the shape
+    `lara.learn.graph._concepts_from_result` flattens into the course's own concept list,
+    with `subjects` carried alongside it purely for the UI to group by."""
+    candidates: list[dict] = []
+    for text in texts:
+        for item in _parse_topic_graph_section(text):
+            if not str(item.get("title", "")).strip():
+                continue
+            # "id" assigned last: TOPIC_GRAPH_SYSTEM's schema never asks the model for one,
+            # but `**item` winning over a leading "id" would let a hallucinated field
+            # collide two candidates onto the same id.
+            candidates.append({**item, "id": f"cand-{len(candidates) + 1}"})
+    if not candidates:
+        return json.dumps({"subjects": []}), 0, 0
+    subjects, tokens_in, tokens_out = await _organize_curriculum(
+        candidates, objective=objective, base_url=base_url, model=model,
+        max_model_len=max_model_len, api_key=api_key)
+    return json.dumps({"subjects": subjects}), tokens_in, tokens_out
 
 
 #: Ceiling for `answer_from_deliverable`'s reply. Well below `MAX_COMPRESS_TOKENS`: the
@@ -1411,6 +1772,20 @@ class SynthesisResult:
     #: `SynthesizerState.silent_reason_rounds`. Observability only: does not affect
     #: `rounds`, `degraded`, or `verdict_for`.
     silent_reason_rounds: int = 0
+    #: Why `run`'s main loop actually stopped: `"finished"` (the model called `finish`
+    #: `FINISH_STREAK_TO_STOP` times in a row — the content-aware exit), `"idle"` (today's
+    #: fallback — `idle_rounds` reached `max_idle_rounds` without an explicit finish
+    #: streak), or `"max_rounds"` (the hard safety-net cap fired — `max_rounds` was given
+    #: and `state.round` reached it; the graph was still finding genuinely new goals to
+    #: propose every round, never idle and never calling `finish`, which is exactly the
+    #: pathological case a cap this coarse exists to catch). Empty string only for a run
+    #: that never entered the loop at all (impossible in practice — `run` always attempts
+    #: at least one round — kept as the dataclass default rather than a fourth sentinel
+    #: value). Deliberately not named `stopped_because` — that name already means
+    #: something different and narrower (a single LLM reply's own finish reason, e.g.
+    #: `"length"` vs `"stop"`) elsewhere in this file and in `generate.py`; reusing it here
+    #: for a whole run's outcome would collide two distinct concepts under one name.
+    exit_reason: str = ""
     #: `state.tokens_in`/`state.tokens_out` as they stood at the end of the run — the
     #: synthesizer's own reasoning-round and compression calls only, not the token cost of
     #: each goal's `aresearch(...)` deep-research call.
@@ -1423,7 +1798,8 @@ class SynthesisResult:
                 "total_failed": self.total_failed, "degraded": self.degraded,
                 "degraded_because": self.degraded_because,
                 "silent_reason_rounds": self.silent_reason_rounds,
-                "tokens_in": self.tokens_in, "tokens_out": self.tokens_out}
+                "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
+                "exit_reason": self.exit_reason}
 
 
 def verdict_for(result: SynthesisResult):
@@ -1475,18 +1851,37 @@ def verdict_for(result: SynthesisResult):
 
 async def run(state: SynthesizerState, *, base_url: str, model: str, api_key: str = "",
               max_model_len: int, aresearch, on_change=None, conn=None,
-              max_idle_rounds: int = MAX_IDLE_ROUNDS,
+              max_idle_rounds: int = MAX_IDLE_ROUNDS, max_rounds: int | None = None,
               deliverable_tokens: int | None = None,
               allow_subsynthesis: bool = False,
-              final_compression_prompt: str = "", embed=None) -> SynthesisResult:
+              final_compression_prompt: str = "", embed=None,
+              deliverable_mode: str = "report", on_section=None) -> SynthesisResult:
     """Drive `state` to exhaustion, then write it into the deliverable, section by
     section — see `_write_deliverable`.
 
     One round is exactly the six steps the module docstring and the design spec agree
     on: digest, one reasoning call (dispatch happens inside it), execute whatever is now
     `pending` concurrently, check the *next* round's digest against the context budget
-    and compact working memory (`_compress`) if it would not fit, then check
-    `idle_rounds` against `max_idle_rounds`.
+    and compact working memory (`_compress`) if it would not fit, then check the loop's
+    three stopping conditions.
+
+    Three conditions stop the loop, checked in this priority order once every round
+    (`SynthesisResult.exit_reason` records which one fired):
+
+    1. `"finished"` — `state.finish_streak` reached `FINISH_STREAK_TO_STOP`: the model
+       itself, via the `finish` tool, judged the graph as covering the objective as far
+       as it usefully can, twice in a row. The content-aware exit — prefer this reading
+       whenever it applies, even if a round that reaches it also happens to satisfy one
+       of the two conditions below.
+    2. `"idle"` — `idle_rounds` reached `max_idle_rounds` without an explicit finish
+       streak: today's original, still-necessary fallback for a model that goes quiet
+       without ever calling `finish`.
+    3. `"max_rounds"` — `max_rounds` is not `None` and `state.round` reached it. The
+       safety net, not a normal exit: sized to comfortably exceed rounds 1 and 2 under
+       ordinary operation, only meant to catch a graph that keeps legitimately finding
+       one more goal to propose every round, indefinitely, for an objective broad enough
+       that it never goes idle and the model never judges it done. `None` (the default)
+       preserves today's exact behavior — no caller gets this cap unless it opts in.
 
     `deliverable_tokens`, when given, changes two things, not just the final write's cap:
 
@@ -1526,6 +1921,14 @@ async def run(state: SynthesizerState, *, base_url: str, model: str, api_key: st
     `embed`, passed straight through to every `_reason_round` — see that function's own
     docstring — backs the `retrieve_facts` tool. `None` (the default) is today's exact
     behavior: the tool is still offered, but reports itself unavailable if called.
+
+    `deliverable_mode` — see `_write_deliverable` — picks what the graph's research is
+    finally written into: `"report"` (default, unchanged), `"lesson"` or `"topic_graph"`
+    for lara.learn's research-driven course map and lesson writing.
+
+    `on_section` — see `_write_deliverable`'s own docstring — is passed straight through
+    to it, fired once per section as the deliverable is written. `None` by default: no
+    change for every existing caller.
     """
     total_done = 0
     total_failed = 0
@@ -1541,7 +1944,9 @@ async def run(state: SynthesizerState, *, base_url: str, model: str, api_key: st
         if on_change is not None:
             on_change()
 
-    while state.idle_rounds < max_idle_rounds:
+    while (state.finish_streak < FINISH_STREAK_TO_STOP
+          and state.idle_rounds < max_idle_rounds
+          and (max_rounds is None or state.round < max_rounds)):
         state.round += 1
         await _reason_round(state, base_url=base_url, model=model,
                             max_model_len=max_model_len, api_key=api_key,
@@ -1595,7 +2000,8 @@ async def run(state: SynthesizerState, *, base_url: str, model: str, api_key: st
     else:
         final_summary, final_refs, final_degraded, final_because = await _write_deliverable(
             state, base_url=base_url, model=model, max_model_len=max_model_len,
-            api_key=api_key, conn=conn, deliverable_tokens=deliverable_tokens)
+            api_key=api_key, conn=conn, deliverable_tokens=deliverable_tokens,
+            deliverable_mode=deliverable_mode, on_section=on_section)
         degraded = degraded or final_degraded
         if final_degraded:
             degraded_because = final_because
@@ -1620,10 +2026,21 @@ async def run(state: SynthesizerState, *, base_url: str, model: str, api_key: st
             final_summary = _pressure_note(degraded_because) + "\n\n" + final_summary
     changed()
 
+    # Same priority order the loop condition itself documents above: a round that
+    # reaches finish_streak's threshold is reported as "finished" even if it also
+    # happens to satisfy idle_rounds/max_rounds that same round.
+    if state.finish_streak >= FINISH_STREAK_TO_STOP:
+        exit_reason = "finished"
+    elif max_rounds is not None and state.round >= max_rounds:
+        exit_reason = "max_rounds"
+    else:
+        exit_reason = "idle"
+
     return SynthesisResult(
         deliverable=final_summary,
         references={k: v.to_dict() for k, v in final_refs.items()},
         rounds=state.round, total_done=total_done, total_failed=total_failed,
         degraded=degraded, degraded_because=degraded_because,
         silent_reason_rounds=state.silent_reason_rounds,
-        tokens_in=state.tokens_in, tokens_out=state.tokens_out)
+        tokens_in=state.tokens_in, tokens_out=state.tokens_out,
+        exit_reason=exit_reason)

@@ -15,12 +15,14 @@ from pydantic import BaseModel
 from lara.learn import learner as LN
 from lara.learn import lesson as LE
 from lara.learn import pipeline as PL
+from lara.learn import profile as PR
 from lara.learn import scope as SC
 from lara.learn import store
 from lara.learn import trace as TR
 from lara.learn.llm import Llm
 from lara.learn.passages import CorpusRetriever, embed_fn
 from lara.serve import generate as G
+from lara.serve import learn_research as LR
 from lara.serve.deps import require_state
 
 router = APIRouter()
@@ -116,6 +118,46 @@ async def _corpus():
             embed_fn(getattr(state.retriever, "embedder", None)))
 
 
+def _synth(mode: str, course_id: str, cid: str = ""):
+    """The research-driven pipeline's injected `synth` capability (see
+    lara.serve.learn_research) for `map_course`/`ensure_concept`/`expand_selection` --
+    `"topic_graph"`, `"lesson"` or `"expand"`. `course_id`/`cid` are only ever used to key
+    that run's persisted graph (see learn_research._state_id) for a later revision --
+    never sent to the model. `None` when `require_state()` cannot yet (or, as in a route
+    test that monkeypatches `_llm`/`_corpus` instead of warming up a real one, does not)
+    produce a ready app state: `pipeline.py`'s own `topic_graph_synth`/`lesson_synth`/
+    `expand.expand`'s `synth` parameters fall back to the old direct pipeline whenever
+    this is `None`, exactly like a course started before this pipeline existed still
+    builds on the old one -- never a hard failure just because the new one's dependency
+    was not available."""
+    try:
+        state = require_state()
+    except Exception:                                          # noqa: BLE001
+        return None
+    if mode == "topic_graph":
+        return LR.topic_graph_synth(state, course_id)
+    if mode == "lesson":
+        return LR.lesson_synth(state, course_id, cid)
+    if mode == "expand":
+        return LR.expand_synth(state)
+    raise ValueError(f"unknown synth mode {mode!r}")
+
+
+def _revise(mode: str, course_id: str, cid: str = ""):
+    """The revision counterpart to `_synth` -- `"topic_graph"` or `"lesson"` only (there
+    is no revision of a one-shot `expand` leaf). `None` under the same condition `_synth`
+    returns `None` under; a caller gets a clear 503 rather than a crash either way."""
+    try:
+        state = require_state()
+    except Exception:                                          # noqa: BLE001
+        return None
+    if mode == "topic_graph":
+        return LR.topic_graph_revise(state, course_id)
+    if mode == "lesson":
+        return LR.lesson_revise(state, course_id, cid)
+    raise ValueError(f"unknown revise mode {mode!r}")
+
+
 def _course(course_id: str) -> dict | None:
     try:
         return store.load_course(course_id)
@@ -131,6 +173,15 @@ def _keep(key: str, task: asyncio.Task) -> None:
 @router.get("/api/learn/courses")
 def courses() -> JSONResponse:
     return JSONResponse({"courses": store.list_courses()})
+
+
+@router.get("/api/learner/profile")
+def learner_profile() -> JSONResponse:
+    """The read-only cross-course knowledge view -- see lara.learn.profile. Never
+    regenerates the digest itself (that needs a model call, made lazily by
+    pipeline.build_concept right before a lesson that would use it); this just shows
+    whatever is cached, which is always at least as fresh as the last lesson built."""
+    return JSONResponse(PR.snapshot())
 
 
 @router.post("/api/learn/courses")
@@ -154,7 +205,7 @@ def show(course_id: str) -> JSONResponse:
         return _err(f"no course {course_id}", 404)
     learner = store.load_learner(course_id) or LN.blank()
     body = {"scope": {k: course.get(k) for k in ("qa", "pending", "competencies", "map_history")},
-            "error": course.get("error", "")}
+            "error": course.get("error", ""), "plan_history": course.get("plan_history", [])}
     if course["concepts"]:
         body.update(PL.overview(course, learner))
     else:
@@ -202,7 +253,37 @@ async def map_it(course_id: str) -> JSONResponse:
     if llm is None:
         return _err("no generator replica was reachable", 503)
     corpus, _ = await _corpus()
-    _keep(f"map:{course_id}", asyncio.ensure_future(PL.map_course(llm, corpus, course)))
+    _keep(f"map:{course_id}", asyncio.ensure_future(
+        PL.map_course(llm, corpus, course, topic_graph_synth=_synth("topic_graph", course_id))))
+    return JSONResponse({"status": "mapping"}, status_code=202)
+
+
+@router.post("/api/learn/courses/{course_id}/plan/approve")
+def approve_plan(course_id: str) -> JSONResponse:
+    course = _course(course_id)
+    if course is None:
+        return _err(f"no course {course_id}", 404)
+    if course["status"] != "awaiting_approval":
+        return _err(f"the course is {course['status']}; nothing is awaiting approval", 409)
+    return JSONResponse(PL.approve_plan(course))
+
+
+@router.post("/api/learn/courses/{course_id}/plan/revise")
+async def revise_plan(course_id: str, req: TextRequest) -> JSONResponse:
+    course = _course(course_id)
+    if course is None:
+        return _err(f"no course {course_id}", 404)
+    if course["status"] != "awaiting_approval":
+        return _err(f"the course is {course['status']}; nothing is awaiting approval", 409)
+    if not req.text.strip():
+        return _err("say what you'd like changed", 400)
+    if f"map:{course_id}" in _tasks:
+        return JSONResponse({"status": "mapping"}, status_code=202)
+    revise = _revise("topic_graph", course_id)
+    if revise is None:
+        return _err("no generator replica was reachable", 503)
+    _keep(f"map:{course_id}", asyncio.ensure_future(
+        PL.revise_plan(course, req.text.strip(), revise=revise)))
     return JSONResponse({"status": "mapping"}, status_code=202)
 
 
@@ -231,9 +312,25 @@ def concept(course_id: str, cid: str) -> JSONResponse:
         "topics": topics,
         "stats": content.get("stats", {}), "trace": content.get("trace", {}),
         "reused": bool(content.get("reused")),
+        "research_driven": bool(content.get("research_driven")),
+        "lesson_history": content.get("lesson_history", []),
         "quiz": {"items": len(quiz.get("items", [])), "dropped": quiz.get("dropped", 0)},
         "build": store.load_build(course_id, cid), "sources": meta["sources"],
         "state": LN.concept_state(learner, cid)})
+
+
+@router.get("/api/learn/courses/{course_id}/trace")
+def map_trace(course_id: str, since: int = 0) -> JSONResponse:
+    """Every research goal behind this course's concept map, while it is being mapped --
+    the course-level counterpart to `concept_trace` below, for the same Profile view.
+    Guarded only by the course existing, not by a concept id: mapping is exactly the
+    phase in which `course["concepts"]` is still empty, which is why this cannot reuse
+    `concept_trace`'s own guard or path."""
+    course = _course(course_id)
+    if course is None:
+        return _err(f"no course {course_id}", 404)
+    rows = TR.read(store.map_trace_path(course_id), since=since)
+    return JSONResponse({"events": rows})
 
 
 @router.get("/api/learn/courses/{course_id}/concepts/{cid}/trace")
@@ -257,11 +354,14 @@ async def build(course_id: str, cid: str, req: BuildRequest | None = None) -> JS
     course = _course(course_id)
     if course is None or not any(c["id"] == cid for c in course["concepts"]):
         return _err("no such course or concept", 404)
+    if course["status"] == "awaiting_approval":
+        return _err("approve or revise the course plan before building a lesson from it", 409)
     llm = await _llm()
     if llm is None:
         return _err("no generator replica was reachable", 503)
     corpus, embed = await _corpus()
-    PL.ensure_concept(llm, corpus, course, cid, embed=embed, force=bool(req and req.force))
+    PL.ensure_concept(llm, corpus, course, cid, embed=embed, force=bool(req and req.force),
+                      lesson_synth=_synth("lesson", course_id, cid))
     return JSONResponse({"status": "building"}, status_code=202)
 
 
@@ -281,7 +381,8 @@ async def expand(course_id: str, cid: str, req: ExpandRequest) -> JSONResponse:
         result = await PL.expand_selection(llm, corpus, course, cid, selection=selection[:2000],
                                            question=req.question.strip()[:500],
                                            selection_claims=req.claims, section=req.section,
-                                           embed=embed, variant=req.variant)
+                                           embed=embed, variant=req.variant,
+                                           synth=_synth("expand", course_id, cid))
     except ValueError as e:
         return _err(str(e), 409)
     return JSONResponse(result)
@@ -349,6 +450,26 @@ async def write_lesson(course_id: str, cid: str, req: LessonRequest) -> JSONResp
     corpus, embed = await _corpus()
     PL.ensure_variant(llm, corpus, course, cid, req.variant, req.pages, embed=embed)
     return JSONResponse({"status": "writing", "variant": key, "pages": pages}, status_code=202)
+
+
+@router.post("/api/learn/courses/{course_id}/concepts/{cid}/lesson/revise")
+async def revise_lesson(course_id: str, cid: str, req: TextRequest) -> JSONResponse:
+    """Starts rewriting this concept's lesson from the learner's feedback on it, in the
+    background -- the page polls the concept, whose `build` says how far along it is.
+    Optional and non-blocking: unlike the course plan, nothing gates on this."""
+    course = _course(course_id)
+    if course is None or not any(c["id"] == cid for c in course["concepts"]):
+        return _err("no such course or concept", 404)
+    if not req.text.strip():
+        return _err("say what you'd like changed", 400)
+    key = f"lesson-revise:{course_id}:{cid}"
+    if key in _tasks:
+        return JSONResponse({"status": "revising"}, status_code=202)
+    revise = _revise("lesson", course_id, cid)
+    if revise is None:
+        return _err("no generator replica was reachable", 503)
+    _keep(key, asyncio.ensure_future(PL.revise_lesson(course, cid, req.text.strip(), revise=revise)))
+    return JSONResponse({"status": "revising"}, status_code=202)
 
 
 @router.delete("/api/learn/courses/{course_id}/concepts/{cid}/expansions/{xid}")

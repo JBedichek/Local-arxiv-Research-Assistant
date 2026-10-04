@@ -7,6 +7,7 @@ import json
 import pytest
 
 from lara.learn import pipeline as PL
+from lara.learn import profile as PR
 from lara.learn import store
 from lara.serve.routes import learn as LR
 from learn_helpers import corpus, llm, model
@@ -15,6 +16,7 @@ from learn_helpers import corpus, llm, model
 @pytest.fixture(autouse=True)
 def _env(tmp_path, monkeypatch):
     monkeypatch.setattr(store, "ROOT", tmp_path / "courses")
+    monkeypatch.setattr(store, "PROFILE_PATH", tmp_path / "learner" / "profile.json")
     PL._building.clear()
     PL._building_topic.clear()
     LR._tasks.clear()
@@ -293,6 +295,119 @@ def test_the_concept_lists_every_version_and_expansions_accept_a_variant(_env):
 
 
 # ── the figure lookup injected into CorpusRetriever ──────────────────────────────────
+
+
+# ── the plan-review gate and revision routes ────────────────────────────────────────
+#
+# `_synth`/`_revise` need `require_state()`, which fails in this harness (only `_llm`/
+# `_corpus` are patched -- see `_env` above), so `map_it` always takes the blind pipeline
+# here and a course never reaches "awaiting_approval" through the route layer on its own.
+# The gate/guard logic on the three new routes is still fully exercised: by flipping a
+# real course's status directly (the same shortcut store-level fixtures elsewhere take)
+# for the success paths, and by the ordinary "ready" course `ready()` already gives for
+# the refusal paths.
+
+
+def _awaiting_approval(cid):
+    course = store.load_course(cid)
+    course["status"] = "awaiting_approval"
+    store.save_course(course)
+    return course
+
+
+def test_plan_approve_moves_an_awaiting_course_to_ready():
+    async def go():
+        cid = await ready()
+        _awaiting_approval(cid)
+        resp = LR.approve_plan(cid)
+        assert resp.status_code == 200 and body(resp)["status"] == "ready"
+        assert store.load_course(cid)["status"] == "ready"
+    run(go())
+
+
+def test_plan_approve_refuses_when_nothing_is_awaiting_approval():
+    async def go():
+        cid = await ready()
+        assert LR.approve_plan(cid).status_code == 409
+    run(go())
+
+
+def test_plan_approve_404_for_an_unknown_course():
+    assert LR.approve_plan("nope").status_code == 404
+
+
+def test_plan_revise_refuses_when_nothing_is_awaiting_approval():
+    async def go():
+        cid = await ready()
+        resp = await LR.revise_plan(cid, LR.TextRequest(text="add a concept"))
+        assert resp.status_code == 409
+    run(go())
+
+
+def test_plan_revise_requires_nonempty_text():
+    async def go():
+        cid = await ready()
+        _awaiting_approval(cid)
+        resp = await LR.revise_plan(cid, LR.TextRequest(text="  "))
+        assert resp.status_code == 400
+    run(go())
+
+
+def test_plan_revise_503s_when_no_generator_is_reachable():
+    # `_env` patches `_llm`/`_corpus`, not `require_state` -- `_revise("topic_graph", ...)`
+    # still fails to build a real app state, the same "dependency not available yet" case
+    # `_synth`'s own docstring describes, so this is refused cleanly rather than crashing.
+    async def go():
+        cid = await ready()
+        _awaiting_approval(cid)
+        resp = await LR.revise_plan(cid, LR.TextRequest(text="add a concept"))
+        assert resp.status_code == 503
+    run(go())
+
+
+def test_lesson_revise_404_for_an_unknown_course_or_concept():
+    async def go():
+        cid = await ready()
+        assert (await LR.revise_lesson("nope", "c1", LR.TextRequest(text="x"))).status_code == 404
+        assert (await LR.revise_lesson(cid, "nope", LR.TextRequest(text="x"))).status_code == 404
+    run(go())
+
+
+def test_lesson_revise_requires_nonempty_text():
+    async def go():
+        cid = await ready()
+        resp = await LR.revise_lesson(cid, "c1", LR.TextRequest(text=" "))
+        assert resp.status_code == 400
+    run(go())
+
+
+def test_lesson_revise_503s_when_no_generator_is_reachable():
+    async def go():
+        cid = await ready()
+        resp = await LR.revise_lesson(cid, "c1", LR.TextRequest(text="go deeper"))
+        assert resp.status_code == 503
+    run(go())
+
+
+def test_building_a_concept_is_refused_while_the_plan_awaits_approval():
+    async def go():
+        cid = await ready()
+        _awaiting_approval(cid)
+        resp = await LR.build(cid, "c1")
+        assert resp.status_code == 409
+    run(go())
+
+
+def test_learner_profile_route_returns_the_snapshot():
+    PR.record_quiz_answer("Warmup", True, 3, "mcq")
+    resp = LR.learner_profile()
+    concepts = body(resp)["concepts"]
+    assert any(c["title"] == "Warmup" for c in concepts)
+
+
+def test_learner_profile_route_is_empty_before_any_quiz_is_answered():
+    resp = LR.learner_profile()
+    assert body(resp) == {"concepts": [], "digest": ""}
 
 
 def test_figure_lookup_is_none_with_no_cached_html():

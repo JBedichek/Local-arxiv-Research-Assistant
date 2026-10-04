@@ -13,6 +13,10 @@ SHARED = "_shared"
 #: A shared concept older than this is rebuilt, not reused: the corpus and the field move.
 SHARED_MAX_AGE_DAYS = 30
 
+#: The cross-course knowledge profile (see lara.learn.profile) -- a sibling of ROOT, not
+#: nested under it: it belongs to the person, not to any one course.
+PROFILE_PATH = Path.home() / ".lara" / "learner" / "profile.json"
+
 
 def slug(text: str, limit: int = 40) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:limit] or "x"
@@ -96,12 +100,28 @@ def trace_path(course_id: str, concept_id: str) -> Path:
     return course_dir(course_id) / "concepts" / f"{slug(concept_id)}.trace.jsonl"
 
 
+def map_trace_path(course_id: str) -> Path:
+    """Where the course-mapping Profile view's event log lives -- same idea as `trace_path`
+    above, but for `pipeline.map_course`'s research-driven branch, which runs before any
+    concept id exists to key a per-concept trace file by. Kept beside `course.json`, not
+    under `concepts/`: it belongs to the course itself, not to any one concept."""
+    return course_dir(course_id) / "map.trace.jsonl"
+
+
 def save_learner(course_id: str, learner: dict) -> None:
     _write(course_dir(course_id) / "learner.json", learner)
 
 
 def load_learner(course_id: str) -> dict:
     return _read(course_dir(course_id) / "learner.json") or {}
+
+
+def save_profile(data: dict) -> None:
+    _write(PROFILE_PATH, data)
+
+
+def load_profile() -> dict:
+    return _read(PROFILE_PATH) or {}
 
 
 def shared_get(title: str, *, max_age_days: float = SHARED_MAX_AGE_DAYS) -> dict | None:

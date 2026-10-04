@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import types
 
 import pytest
@@ -239,6 +240,47 @@ def test_finish_or_no_call_increments_idle_rounds(monkeypatch):
     progressed = asyncio.run(
         SY._reason_round(state, base_url="x", model="m", max_model_len=100_000))
     assert progressed is False and state.idle_rounds == 3
+
+
+def test_a_finish_only_round_increments_finish_streak(monkeypatch):
+    monkeypatch.setattr(converse, "talk", _fake_talk_calling(SY.FINISH_TOOL, {}))
+    state = SY.SynthesizerState(objective="obj")
+    asyncio.run(SY._reason_round(state, base_url="x", model="m", max_model_len=100_000))
+    assert state.finish_streak == 1
+    asyncio.run(SY._reason_round(state, base_url="x", model="m", max_model_len=100_000))
+    assert state.finish_streak == 2, "two genuine finish-only rounds in a row"
+
+
+def test_a_spawn_resets_finish_streak_same_as_idle_rounds(monkeypatch):
+    monkeypatch.setattr(converse, "talk", _fake_talk_calling(SY.FINISH_TOOL, {}))
+    state = SY.SynthesizerState(objective="obj", finish_streak=1)
+    monkeypatch.setattr(converse, "talk", _fake_talk_calling(
+        SY.SPAWN_TOOL, {"text": "new angle", "depends_on": []}))
+    asyncio.run(SY._reason_round(state, base_url="x", model="m", max_model_len=100_000))
+    assert state.finish_streak == 0
+
+
+def test_finish_called_alongside_a_spawn_is_not_a_genuine_finish_signal(monkeypatch):
+    """A round that also progressed is not "nothing further would help" — the two must
+    not be folded into one flag (see `_reason_round`'s own `finished` vs `progressed`)."""
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        dispatch(SY.FINISH_TOOL, {})
+        dispatch(SY.SPAWN_TOOL, {"text": "new angle", "depends_on": []})
+        return types.SimpleNamespace(text="")
+    monkeypatch.setattr(converse, "talk", talk)
+    state = SY.SynthesizerState(objective="obj", finish_streak=1)
+    asyncio.run(SY._reason_round(state, base_url="x", model="m", max_model_len=100_000))
+    assert state.finish_streak == 0
+    assert state.idle_rounds == 0, "the spawn is still real progress for idle_rounds"
+
+
+def test_a_silent_round_resets_finish_streak_too(monkeypatch):
+    """A round that never even calls `finish` breaks the streak exactly as much as a
+    round that spawned something — "consecutive" means consecutive."""
+    monkeypatch.setattr(converse, "talk", _fake_talk_silent())
+    state = SY.SynthesizerState(objective="obj", finish_streak=1)
+    asyncio.run(SY._reason_round(state, base_url="x", model="m", max_model_len=100_000))
+    assert state.finish_streak == 0
 
 
 def test_a_refused_refinement_does_not_reset_idle_rounds(monkeypatch):
@@ -766,6 +808,34 @@ def test_write_deliverable_writes_one_section_per_breadth_cluster_then_stitches(
     assert "section text 1" in final and "section text 2" in final
 
 
+def test_write_deliverable_calls_on_section_once_per_section_with_its_real_text(
+        monkeypatch):
+    # Not a token stream (see _write_deliverable's own docstring on why) -- one call per
+    # section, in the order they are actually written, each with that section's real
+    # composed text, not a placeholder or a count.
+    calls = []
+
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        if tools:
+            got = dispatch(SY.STITCH_TOOL, {"order": ["section-a", "section-b"]})
+            if inspect.isawaitable(got):
+                await got
+            return types.SimpleNamespace(text="")
+        idx = len(calls) + 1
+        return types.SimpleNamespace(text=f"section text {idx}")
+    monkeypatch.setattr(converse, "talk", talk)
+
+    state = SY.SynthesizerState(objective="obj", goals={
+        "a": _goal("a", status=SY.DONE, refines=None, summary="finding a"),
+        "b": _goal("b", status=SY.DONE, refines=None, summary="finding b")})
+
+    asyncio.run(SY._write_deliverable(
+        state, base_url="x", model="m", max_model_len=100_000,
+        on_section=lambda label, text: calls.append((label, text))))
+
+    assert [text for _label, text in calls] == ["section text 1", "section text 2"]
+
+
 def test_write_deliverable_skips_stitching_for_a_single_section(monkeypatch):
     calls = {"n": 0}
 
@@ -844,6 +914,256 @@ def test_write_deliverable_of_an_empty_graph_returns_nothing():
     final, refs, degraded, because = asyncio.run(SY._write_deliverable(
         state, base_url="x", model="m", max_model_len=100_000))
     assert final == "" and refs == {} and degraded is False and because == ""
+
+
+# ── the topic-graph deliverable: candidates read from tldr, then organized ────────
+
+
+def test_write_deliverable_reads_tldr_not_thorough_for_a_topic_graph_section(
+        monkeypatch):
+    """The whole point of `LogicalGoal.tldr` (see its own docstring): an outline-writing
+    pass gets a title and a couple of sentences per candidate, not the full page of
+    evidence a report section reads -- so the source text a topic_graph section composes
+    from must be the tldr, never the thorough answer, even though both are on the goal."""
+    captured = {}
+
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        if tools:
+            got = dispatch(SY.CURRICULUM_TOOL, {"subjects": [
+                {"title": "S", "lesson_ids": ["cand-1"]}]})
+            if inspect.isawaitable(got):
+                await got
+            return types.SimpleNamespace(text="")
+        captured["source"] = messages[-1]["content"]
+        return types.SimpleNamespace(text=json.dumps(
+            {"concepts": [{"title": "T", "summary": "short [1]"}]}))
+    monkeypatch.setattr(converse, "talk", talk)
+
+    state = SY.SynthesizerState(objective="obj", goals={
+        "a": _goal("a", status=SY.DONE, summary="the full thorough answer, pages of it",
+                  tldr="the short tldr answer", citations={"1": {}}, tldr_citations={"1": {}})})
+
+    asyncio.run(SY._write_deliverable(
+        state, base_url="x", model="m", max_model_len=100_000,
+        deliverable_mode="topic_graph"))
+
+    assert "the short tldr answer" in captured["source"]
+    assert "the full thorough answer" not in captured["source"]
+
+
+def test_write_deliverable_falls_back_to_summary_when_a_goal_has_no_tldr(monkeypatch):
+    """An older persisted graph (saved before `tldr` existed -- see that field's own
+    docstring) still renders something, not a blank answer."""
+    captured = {}
+
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        if tools:
+            return types.SimpleNamespace(text="")
+        captured["source"] = messages[-1]["content"]
+        return types.SimpleNamespace(text=json.dumps({"concepts": []}))
+    monkeypatch.setattr(converse, "talk", talk)
+
+    state = SY.SynthesizerState(objective="obj", goals={
+        "a": _goal("a", status=SY.DONE, summary="the only answer available", tldr="")})
+
+    asyncio.run(SY._write_deliverable(
+        state, base_url="x", model="m", max_model_len=100_000,
+        deliverable_mode="topic_graph"))
+
+    assert "the only answer available" in captured["source"]
+
+
+def test_write_deliverable_report_mode_still_reads_the_thorough_answer(monkeypatch):
+    """Only topic_graph mode switches to tldr -- a report/lesson section is exactly as
+    thorough as before this change."""
+    captured = {}
+
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        captured["source"] = messages[-1]["content"]
+        return types.SimpleNamespace(text="section text")
+    monkeypatch.setattr(converse, "talk", talk)
+
+    state = SY.SynthesizerState(objective="obj", goals={
+        "a": _goal("a", status=SY.DONE, summary="the full thorough answer",
+                  tldr="the short tldr")})
+
+    asyncio.run(SY._write_deliverable(
+        state, base_url="x", model="m", max_model_len=100_000))
+
+    assert "the full thorough answer" in captured["source"]
+    assert "the short tldr" not in captured["source"]
+
+
+def test_write_deliverable_topic_graph_mode_produces_a_subjects_shaped_deliverable(
+        monkeypatch):
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        if tools:
+            got = dispatch(SY.CURRICULUM_TOOL, {"subjects": [
+                {"title": "Fundamentals", "summary": "", "lesson_ids": ["cand-1", "cand-2"]}]})
+            if inspect.isawaitable(got):
+                await got
+            return types.SimpleNamespace(text="")
+        content = messages[-1]["content"]
+        if "goal a" in content:
+            return types.SimpleNamespace(
+                text=json.dumps({"concepts": [{"title": "Warmup", "summary": "s [1]"}]}))
+        return types.SimpleNamespace(
+            text=json.dumps({"concepts": [{"title": "Decay", "summary": "s [2]"}]}))
+    monkeypatch.setattr(converse, "talk", talk)
+
+    state = SY.SynthesizerState(objective="obj", goals={
+        "a": _goal("a", status=SY.DONE, refines=None, text="goal a", tldr="a's tldr [1]",
+                  tldr_citations={"1": {}}),
+        "b": _goal("b", status=SY.DONE, refines=None, text="goal b", tldr="b's tldr [2]",
+                  tldr_citations={"2": {}})})
+
+    final, _refs, _degraded, _because = asyncio.run(SY._write_deliverable(
+        state, base_url="x", model="m", max_model_len=100_000,
+        deliverable_mode="topic_graph"))
+
+    data = json.loads(final)
+    assert [s["title"] for s in data["subjects"]] == ["Fundamentals"]
+    titles = [c["title"] for c in data["subjects"][0]["concepts"]]
+    assert set(titles) == {"Warmup", "Decay"}
+    assert "id" not in data["subjects"][0]["concepts"][0], \
+        "the internal candidate id never leaks into the deliverable"
+
+
+# ── organizing topic-graph candidates into subjects, without rewriting them ────────
+
+
+def test_organize_curriculum_never_alters_a_candidates_title_or_summary(monkeypatch):
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        got = dispatch(SY.CURRICULUM_TOOL, {"subjects": [
+            {"title": "Fundamentals", "summary": "The basics.",
+             "lesson_ids": ["cand-2", "cand-1"]}]})
+        if inspect.isawaitable(got):
+            await got
+        return types.SimpleNamespace(text="")
+    monkeypatch.setattr(converse, "talk", talk)
+
+    candidates = [{"id": "cand-1", "title": "Warmup", "summary": "Warmup avoids spikes [1]."},
+                 {"id": "cand-2", "title": "Decay", "summary": "Decay helps too [2]."}]
+    subjects, _tin, _tout = asyncio.run(SY._organize_curriculum(
+        candidates, objective="obj", base_url="x", model="m", max_model_len=100_000))
+
+    assert len(subjects) == 1
+    assert subjects[0]["title"] == "Fundamentals" and subjects[0]["summary"] == "The basics."
+    # Reordered per lesson_ids (Decay before Warmup), text untouched either way.
+    got_titles = [c["title"] for c in subjects[0]["concepts"]]
+    got_summaries = [c["summary"] for c in subjects[0]["concepts"]]
+    assert got_titles == ["Decay", "Warmup"]
+    assert got_summaries == ["Decay helps too [2].", "Warmup avoids spikes [1]."]
+
+
+def test_organize_curriculum_falls_back_to_one_subject_with_everything_on_failure(
+        monkeypatch):
+    async def broken(*a, **kw):
+        raise RuntimeError("replica unreachable")
+    monkeypatch.setattr(converse, "talk", broken)
+
+    candidates = [{"id": "cand-1", "title": "A", "summary": "a"},
+                 {"id": "cand-2", "title": "B", "summary": "b"}]
+    subjects, tin, tout = asyncio.run(SY._organize_curriculum(
+        candidates, objective="obj", base_url="x", model="m", max_model_len=100_000))
+
+    assert len(subjects) == 1
+    assert {c["title"] for c in subjects[0]["concepts"]} == {"A", "B"}
+    assert tin == 0 and tout == 0
+
+
+def test_organize_curriculum_trusts_a_real_replys_omission_as_a_deliberate_drop(
+        monkeypatch):
+    """The entire point of this call: leaving a candidate id out consolidates it away.
+    Only a call that comes back with nothing usable at all falls back to keeping
+    everyone -- see `_organize_curriculum`'s own docstring on why the two cases must not
+    be conflated."""
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        got = dispatch(SY.CURRICULUM_TOOL, {"subjects": [
+            {"title": "Fundamentals", "lesson_ids": ["cand-1"]}]})   # cand-2 left out
+        if inspect.isawaitable(got):
+            await got
+        return types.SimpleNamespace(text="")
+    monkeypatch.setattr(converse, "talk", talk)
+
+    candidates = [{"id": "cand-1", "title": "Kept", "summary": "k"},
+                 {"id": "cand-2", "title": "Dropped as a duplicate", "summary": "d"}]
+    subjects, _tin, _tout = asyncio.run(SY._organize_curriculum(
+        candidates, objective="obj", base_url="x", model="m", max_model_len=100_000))
+
+    all_titles = [c["title"] for s in subjects for c in s["concepts"]]
+    assert all_titles == ["Kept"]
+
+
+def test_organize_curriculum_forces_its_own_tool_choice(monkeypatch):
+    captured = {}
+
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None,
+                   tool_choice=None, **kw):
+        captured["tool_choice"] = tool_choice
+        captured["tool_names"] = [t["function"]["name"] for t in (tools or [])]
+        return types.SimpleNamespace(text="")
+    monkeypatch.setattr(converse, "talk", talk)
+
+    asyncio.run(SY._organize_curriculum(
+        [{"id": "cand-1", "title": "A", "summary": "a"}], objective="obj",
+        base_url="x", model="m", max_model_len=100_000))
+
+    assert captured["tool_choice"] == {"type": "function",
+                                       "function": {"name": SY.CURRICULUM_TOOL}}
+    assert captured["tool_names"] == [SY.CURRICULUM_TOOL]
+
+
+def test_finalize_topic_graph_pools_candidates_from_every_section(monkeypatch):
+    captured = {}
+
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        captured["prompt"] = messages[-1]["content"]
+        got = dispatch(SY.CURRICULUM_TOOL, {"subjects": [
+            {"title": "S", "lesson_ids": ["cand-1", "cand-2"]}]})
+        if inspect.isawaitable(got):
+            await got
+        return types.SimpleNamespace(text="")
+    monkeypatch.setattr(converse, "talk", talk)
+
+    texts = [json.dumps({"concepts": [{"title": "A", "summary": "a"}]}),
+            json.dumps({"concepts": [{"title": "B", "summary": "b"}]})]
+    final, _tin, _tout = asyncio.run(SY._finalize_topic_graph(
+        texts, objective="obj", base_url="x", model="m", max_model_len=100_000))
+
+    assert "cand-1" in captured["prompt"] and "cand-2" in captured["prompt"]
+    data = json.loads(final)
+    titles = {c["title"] for c in data["subjects"][0]["concepts"]}
+    assert titles == {"A", "B"}
+
+
+def test_finalize_topic_graph_skips_a_malformed_sections_candidates_only(monkeypatch):
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        got = dispatch(SY.CURRICULUM_TOOL, {"subjects": [
+            {"title": "S", "lesson_ids": ["cand-1"]}]})
+        if inspect.isawaitable(got):
+            await got
+        return types.SimpleNamespace(text="")
+    monkeypatch.setattr(converse, "talk", talk)
+
+    texts = ["not json at all", json.dumps({"concepts": [{"title": "A", "summary": "a"}]})]
+    final, _tin, _tout = asyncio.run(SY._finalize_topic_graph(
+        texts, objective="obj", base_url="x", model="m", max_model_len=100_000))
+    data = json.loads(final)
+    titles = {c["title"] for s in data["subjects"] for c in s["concepts"]}
+    assert titles == {"A"}
+
+
+def test_finalize_topic_graph_with_no_candidates_makes_no_model_call(monkeypatch):
+    async def talk(*a, **kw):
+        raise AssertionError("should never be called -- nothing to organize")
+    monkeypatch.setattr(converse, "talk", talk)
+
+    final, tin, tout = asyncio.run(SY._finalize_topic_graph(
+        ["not json", json.dumps({"concepts": []})], objective="obj",
+        base_url="x", model="m", max_model_len=100_000))
+    assert json.loads(final) == {"subjects": []}
+    assert tin == 0 and tout == 0
 
 
 # ── the optional final-compression pass: one targeted answer over the finished report ──
@@ -944,6 +1264,68 @@ def test_run_skips_the_compression_pass_when_no_prompt_is_given(monkeypatch):
         max_idle_rounds=1))
     assert "## Full report" not in result.deliverable
     assert result.deliverable == "the compressed answer"
+
+
+def test_run_stops_after_two_consecutive_finish_calls_reporting_exit_reason_finished(
+        monkeypatch):
+    monkeypatch.setattr(converse, "talk", _fake_talk_calling(SY.FINISH_TOOL, {}))
+    state = SY.SynthesizerState(objective="obj")
+    result = asyncio.run(SY.run(
+        state, base_url="x", model="m", max_model_len=100_000, aresearch=None,
+        # Deliberately far above what a finish-streak exit should ever need, so hitting
+        # round 2 proves the finish signal fired, not that idle_rounds happened to also
+        # reach it around the same time.
+        max_idle_rounds=100))
+    assert result.rounds == 2
+    assert result.exit_reason == "finished"
+
+
+def test_run_idle_exit_still_works_and_reports_exit_reason_idle(monkeypatch):
+    monkeypatch.setattr(converse, "talk", _fake_talk_silent())
+    state = SY.SynthesizerState(objective="obj")
+    result = asyncio.run(SY.run(
+        state, base_url="x", model="m", max_model_len=100_000, aresearch=None,
+        max_idle_rounds=3))
+    assert result.rounds == 3
+    assert result.exit_reason == "idle"
+
+
+def test_run_stops_at_max_rounds_when_the_graph_never_goes_idle_or_finishes(monkeypatch):
+    """The pathological case the hard cap exists for: a graph that keeps legitimately
+    finding one more goal every round, never idle, never calling `finish`."""
+    counter = {"n": 0}
+
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        counter["n"] += 1
+        got = dispatch(SY.SPAWN_TOOL, {"text": f"angle {counter['n']}", "depends_on": []})
+        if inspect.isawaitable(got):
+            await got
+        return types.SimpleNamespace(text="")
+    monkeypatch.setattr(converse, "talk", talk)
+
+    async def aresearch(question, *, model, base_url, api_key):
+        return _research(f"answer to {question}")
+
+    state = SY.SynthesizerState(objective="obj")
+    result = asyncio.run(SY.run(
+        state, base_url="x", model="m", max_model_len=100_000, aresearch=aresearch,
+        max_idle_rounds=100, max_rounds=5))
+    assert result.rounds == 5
+    assert result.exit_reason == "max_rounds"
+
+
+def test_max_rounds_none_preserves_todays_exact_behavior_for_every_other_caller(
+        monkeypatch):
+    """The standalone Synthesize feature (and anything else calling `run` without opting
+    in) must see no behavior change: unset stays unset, only `max_idle_rounds` bounds
+    the loop, same as before this cap existed."""
+    monkeypatch.setattr(converse, "talk", _fake_talk_silent())
+    state = SY.SynthesizerState(objective="obj")
+    result = asyncio.run(SY.run(
+        state, base_url="x", model="m", max_model_len=100_000, aresearch=None,
+        max_idle_rounds=7))
+    assert result.rounds == 7
+    assert result.exit_reason == "idle"
 
 
 def test_run_final_compression_prompt_defaults_to_off():
