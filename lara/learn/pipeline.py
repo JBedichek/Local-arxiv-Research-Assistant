@@ -77,7 +77,7 @@ async def map_course(llm: Llm, corpus, course: dict, *, topic_graph_synth=None,
                 course["mapping"] = "decomposing"
                 store.save_course(course)
                 try:
-                    decomposition = await DC.decompose(llm, decompose_research, course,
+                    decomposition = await DC.decompose(decompose_research, course,
                                                        force=force_decompose)
                     course["decomposition"] = {k: decomposition.get(k) for k in
                                                ("subject", "question", "stopped_because", "built", "cached")}

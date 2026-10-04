@@ -136,10 +136,6 @@ def test_the_plan_goes_into_the_lessons_research_objective():
 
 # ── the decomposition and the map ────────────────────────────────────────────────
 
-SUBJECT = ("one deep-research question", json.dumps({"subject": "LR schedules",
-                                                      "question": "Foundations of LR schedules?"}))
-
-
 def researcher(text="Warmup [11] underlies Decay [12]."):
     calls = []
 
@@ -152,21 +148,29 @@ def researcher(text="Warmup [11] underlies Decay [12]."):
     return research
 
 
-def test_a_decomposition_is_researched_once_and_cached_per_subject():
-    m, r = llm(SUBJECT), researcher()
+def test_the_decomposition_question_is_a_fixed_template_quoting_the_learners_words():
+    r = researcher()
+    run(DC.decompose(r, {"goal": "I want to learn  about\nvoice models", "competencies": []}))
+    assert r.calls == ['Find the foundational concepts, from the simplest to the most complex, that '
+                       'someone needs to understand for a course based on this request: '
+                       '"I want to learn about voice models"']
+
+
+def test_a_decomposition_is_researched_once_and_cached_per_request():
+    r = researcher()
     course = {"goal": "learn schedules", "competencies": []}
-    first = run(DC.decompose(m, r, course))
-    second = run(DC.decompose(m, r, course))
-    assert r.calls == ["Foundations of LR schedules?"]
+    first = run(DC.decompose(r, course))
+    second = run(DC.decompose(r, course))
+    assert len(r.calls) == 1 and first["subject"] == "learn schedules"
     assert not first["cached"] and second["cached"] and second["text"] == first["text"]
-    run(DC.decompose(m, r, course, force=True))
+    run(DC.decompose(r, course, force=True))
     assert len(r.calls) == 2
 
 
 def test_an_empty_decomposition_is_an_error_not_a_cached_map():
     with pytest.raises(ValueError, match="no evidence"):
-        run(DC.decompose(llm(SUBJECT), researcher(text=""), {"goal": "g", "competencies": []}))
-    assert store.decomposition_get("LR schedules") is None
+        run(DC.decompose(researcher(text=""), {"goal": "g", "competencies": []}))
+    assert store.decomposition_get("g") is None
 
 
 def test_the_mapping_objective_starts_from_the_decomposition():
@@ -207,14 +211,14 @@ def mapped(m, research=None):
 
 
 def test_mapping_decomposes_the_subject_first_and_assigns_needs():
-    course = mapped(model(SUBJECT, NEEDS), researcher())
-    assert course["decomposition"]["subject"] == "LR schedules"
+    course = mapped(model(NEEDS), researcher())
+    assert course["decomposition"]["subject"] == "learn pretraining"
     assert "Warmup [11] underlies Decay [12]." in _topic_graph.objectives[0]
     assert course["concepts"][0]["need"] == 4 and course["status"] == "awaiting_approval"
 
 
 def test_a_failed_decomposition_does_not_fail_the_course():
-    course = mapped(model(SUBJECT), researcher(text=""))
+    course = mapped(model(), researcher(text=""))
     assert course["status"] == "awaiting_approval" and "error" in course["decomposition"]
     assert "A MAP OF THE WHOLE SUBJECT" not in _topic_graph.objectives[0]
 
