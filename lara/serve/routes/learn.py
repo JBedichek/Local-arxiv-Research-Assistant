@@ -68,7 +68,7 @@ class ExpandRequest(BaseModel):
 
 
 class LessonRequest(BaseModel):
-    variant: str                # "tldr", "thorough" or "pages"
+    variant: str                # "tldr", "thorough", "pages", or "compress-high|med|low"
     pages: int | None = None
 
 

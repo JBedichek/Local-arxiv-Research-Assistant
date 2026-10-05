@@ -12,6 +12,7 @@ import asyncio
 import time
 
 from lara.learn import claims as CL
+from lara.learn import compress as CP
 from lara.learn import decompose as DC
 from lara.learn import depth as DP
 from lara.learn import expand as EX
@@ -502,6 +503,8 @@ def variant_key(variant: str, pages=None) -> tuple[str, int | None]:
     if variant == "pages":
         n = DP.clamp_pages(pages)
         return f"pages-{n}", n
+    if variant.startswith("compress-") and variant.split("-", 1)[1] in CP.LEVELS:
+        return variant, None
     raise ValueError(f"unknown lesson variant {variant!r}")
 
 
@@ -522,8 +525,9 @@ async def _top_up_quiz(llm: Llm, meta: dict, content: dict, new_claims: list[dic
 
 async def write_variant(llm: Llm, corpus, course: dict, cid: str, variant: str, pages=None, *,
                         embed=None) -> dict:
-    """Writes a TL;DR, thorough or custom-length lesson and keeps it beside the others. Deeper
-    ones research new claims, which join the concept's own (and its quiz)."""
+    """Writes a TL;DR, thorough, custom-length or compressed lesson and keeps it beside the
+    others. Deeper ones research new claims, which join the concept's own (and its quiz); a
+    compressed one is cut down from the standard lesson's own text (`compress`)."""
     key, n = variant_key(variant, pages)
     meta = {**next(c for c in course["concepts"] if c["id"] == cid), "goal": course["goal"]}
     titles = {c["id"]: c["title"] for c in course["concepts"]}
@@ -539,7 +543,10 @@ async def write_variant(llm: Llm, corpus, course: dict, cid: str, variant: str, 
         TR.emit("build_start", variant=key, forced=False)
         try:
             note(stage=f"writing {key}", detail="starting")
-            if key == "tldr":
+            if key.startswith("compress-"):
+                lesson = await CP.compress(llm, content.get("lesson"), key.split("-", 1)[1])
+                changes = {}
+            elif key == "tldr":
                 lesson = await LE.compose(llm, meta, content["claims"], content.get("conflicts", []),
                                           [titles[p] for p in meta["prereqs"]], length_note=LE.tldr_note(len(LE.usable(content["claims"]))))
                 changes = {}

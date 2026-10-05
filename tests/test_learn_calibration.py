@@ -115,7 +115,8 @@ def _plan(*items):
 
 def test_the_brief_says_what_to_use_explain_and_research():
     text = TM.brief(_plan(("A", TM.USE), ("B", TM.SECTION), ("C", TM.INTUITION)))
-    assert "use freely, do not explain: A" in text and "'Background: <term>'" in text and ": B" in text
+    assert "use freely, do not explain: A" in text and "explain fully, from the ground up" in text
+    assert "ONCE in the whole lesson" in text and "Background:" not in text
     assert "do not explain it from general knowledge" in text
 
 
@@ -423,3 +424,62 @@ def test_saying_whether_you_know_a_lesson_topic_is_term_evidence():
     run(PL.set_familiarity(model(), corpus(), course, LN.blank(), "c1", "t1", "yes", ""))
     ev = PR.load()["terms"]["cosine-annealing"]["evidence"][0]
     assert ev["kind"] == "self" and ev["level"] == 3
+
+
+# ── compression ──────────────────────────────────────────────────────────────────
+
+from lara.learn import compress as CP  # noqa: E402
+
+
+def _long_lesson():
+    return {"insufficient": False, "generated": 1.0, "stats": {}, "sections": [
+        {"heading": "Spectrograms", "sentences": [
+            {"text": "A spectrogram shows frequency content over time.", "claims": ["11"]},
+            {"text": "It is computed with the STFT.", "claims": ["12"]}]},
+        {"heading": "What the concept is", "sentences": [
+            {"text": "A spectrogram, again, shows frequency over time.", "claims": ["11"]}]}]}
+
+
+def test_each_level_is_its_own_fixed_prompt():
+    m = llm(("Shorten and compress", "## Spectrograms\nA spectrogram shows frequency over time [11]."))
+    run(CP.compress(m, _long_lesson(), "high"))
+    run(CP.compress(m, _long_lesson(), "low"))
+    systems = [s for s, _ in m.calls]
+    assert systems[0].startswith("Shorten and compress this lesson text with high discarding")
+    assert systems[1].startswith("Shorten and compress this lesson text with low discarding")
+
+
+def test_compression_keeps_only_real_citations_and_reports_the_ratio():
+    m = llm(("Shorten and compress", "## Spectrograms\nA spectrogram shows frequency over time [11, 99]."))
+    out = run(CP.compress(m, _long_lesson(), "med"))
+    assert out["sections"] == [{"heading": "Spectrograms", "sentences": [
+        {"text": "A spectrogram shows frequency over time.", "claims": ["11"]}]}]
+    assert out["compression"]["level"] == "med" and out["compression"]["ratio"] < 1
+
+
+def test_a_long_lesson_is_compressed_in_chunks_each_seeing_what_was_kept(monkeypatch):
+    monkeypatch.setattr(CP, "CHUNK_WORDS", 5)
+    m = llm(("Shorten and compress", "## Spectrograms\nA spectrogram shows frequency over time [11]."))
+    run(CP.compress(m, _long_lesson(), "high"))
+    assert len(m.calls) == 2
+    assert "ALREADY KEPT:\n(nothing yet)" in m.calls[0][1]
+    assert "A spectrogram shows frequency over time [11]" in m.calls[1][1].split("TEXT TO COMPRESS")[0]
+
+
+def test_an_unknown_level_or_missing_lesson_is_refused():
+    with pytest.raises(ValueError):
+        run(CP.compress(llm(), _long_lesson(), "extreme"))
+    with pytest.raises(ValueError):
+        run(CP.compress(llm(), None, "high"))
+
+
+def test_a_compressed_version_is_stored_beside_the_standard_lesson():
+    m = model(TERMS, ("Shorten and compress", "## Warmup\nWarmup avoids them [1, 2]."))
+    course, content, _ = built(m)
+    lesson = run(PL.write_variant(m, corpus(), course, "c1", "compress-high"))
+    stored = store.load_concept(course["id"], "c1")
+    assert stored["lessons"]["compress-high"]["variant"] == "compress-high"
+    assert stored["lesson"]["sections"] == content["lesson"]["sections"]
+    assert lesson["sections"][0]["sentences"][0]["claims"] == ["1", "2"]
+    with pytest.raises(ValueError):
+        PL.variant_key("compress-extreme")
