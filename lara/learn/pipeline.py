@@ -201,7 +201,12 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
         build.update(kw)
         store.save_build(course["id"], cid, build)
 
+    # Set once the research-driven "claims" stage has written this build's lesson -- see the
+    # stage loop below, which then skips the legacy "lesson" stage even on a forced rebuild.
+    wrote_research_lesson = False
+
     async def run_stage(stage: str) -> None:
+        nonlocal wrote_research_lesson
         note(stage=stage, error="")
         if stage == "claims" and lesson_synth is not None:
             # The learner's cross-course quiz-evidence digest (lara.learn.profile) --
@@ -230,6 +235,7 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
             # concept reused whole from an earlier course (see build_concept's `shared`
             # branch above) or rebuilt by the legacy pipeline never sets this.
             content["research_driven"] = True
+            wrote_research_lesson = True
             # RS.build_lesson's own model calls run through `synth`, not this build's
             # `llm` -- so they never pass through `metered`'s wrap of `llm.complete`
             # above, and `meter` alone would report 0 regardless of what was actually
@@ -303,6 +309,12 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
     TR.emit("build_start", variant="standard", forced=force)
     try:
         for stage in STAGES:
+            # A research-driven build writes its lesson in the "claims" stage. A forced
+            # rebuild ("Refresh from the corpus") used to run the legacy "lesson" stage
+            # straight after it, and depth.deepen overwrote the lesson research had just
+            # written.
+            if stage == "lesson" and wrote_research_lesson:
+                continue
             if stage in stages and (force or not _stage_done(content, stage)):
                 await run_stage(stage)
         note(stage="done" if all(_stage_done(content, s) for s in STAGES) else build.get("stage", ""),

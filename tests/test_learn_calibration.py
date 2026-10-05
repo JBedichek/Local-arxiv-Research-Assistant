@@ -483,3 +483,16 @@ def test_a_compressed_version_is_stored_beside_the_standard_lesson():
     assert lesson["sections"][0]["sentences"][0]["claims"] == ["1", "2"]
     with pytest.raises(ValueError):
         PL.variant_key("compress-extreme")
+
+
+def test_refreshing_a_research_driven_lesson_keeps_the_researched_lesson():
+    """"Refresh from the corpus" (force=True) used to run the legacy lesson stage after the
+    research-driven one, and depth.deepen overwrote the lesson research had just written."""
+    m = model(TERMS)
+    course, _, _ = built(m)
+    synth = _lesson_synth()
+    content = run(PL.build_concept(m, corpus(), course, "c1", lesson_synth=synth, force=True))
+    assert len(synth.seen) == 1
+    texts = [s["text"] for sec in content["lesson"]["sections"] for s in sec["sentences"]]
+    assert texts == ["A loss spike is a sudden jump in loss.", "Warmup avoids them."]
+    assert not any("plan a self-study lesson" in sys for sys, _ in m.calls[-40:])
