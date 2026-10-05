@@ -2528,3 +2528,41 @@ def test_synthesis_result_to_dict_includes_tokens():
     result = SY.SynthesisResult(tokens_in=10, tokens_out=20)
     d = result.to_dict()
     assert d["tokens_in"] == 10 and d["tokens_out"] == 20
+
+
+def test_a_later_lesson_section_is_told_what_earlier_sections_covered(monkeypatch):
+    """Lesson sections are written one theme at a time without seeing each other; without
+    this every theme re-introduced the concept and re-explained the same background."""
+    sources = []
+
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        sources.append(messages[-1]["content"])
+        if tools:
+            return types.SimpleNamespace(text="", tool_calls=[])
+        n = len(sources)
+        return types.SimpleNamespace(text=f"## Theme {n} heading\nTheme {n} explains spectrograms [1].")
+    monkeypatch.setattr(converse, "talk", talk)
+
+    state = SY.SynthesizerState(objective="obj", goals={
+        "a": _goal("a", status=SY.DONE, summary="answer a"),
+        "b": _goal("b", status=SY.DONE, summary="answer b")})
+    asyncio.run(SY._write_deliverable(state, base_url="x", model="m", max_model_len=100_000,
+                                      deliverable_mode="lesson"))
+    assert "ALREADY COVERED" not in sources[0]
+    assert "ALREADY COVERED" in sources[1] and "Theme 1 heading" in sources[1]
+    assert "Theme 1 explains spectrograms." in sources[1]
+
+
+def test_a_report_section_is_not_given_earlier_sections(monkeypatch):
+    sources = []
+
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        sources.append(messages[-1]["content"])
+        return types.SimpleNamespace(text="## H\nText [1].", tool_calls=[])
+    monkeypatch.setattr(converse, "talk", talk)
+
+    state = SY.SynthesizerState(objective="obj", goals={
+        "a": _goal("a", status=SY.DONE, summary="answer a"),
+        "b": _goal("b", status=SY.DONE, summary="answer b")})
+    asyncio.run(SY._write_deliverable(state, base_url="x", model="m", max_model_len=100_000))
+    assert not any("ALREADY COVERED" in s for s in sources)

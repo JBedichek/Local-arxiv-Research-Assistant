@@ -9,7 +9,7 @@ picks one treatment:
     need <= 1                  gloss      name it with a one-clause gloss
     need == 2                  intuition  a short intuition before it is used
     need >= 3, gap of 1        refresher  a brief refresher before it is used
-    need >= 3, gap of 2+       section    its own Background section: mechanism, then use
+    need >= 3, gap of 2+       section    explained fully, from the ground up, before it is used
 
 The plan is written into the lesson's own objective (`brief`, read by
 `research._lesson_objective`), so the synthesis run that writes the lesson also researches
@@ -113,12 +113,15 @@ def brief(the_plan: dict) -> str:
               (GLOSS, "define in a clause the first time it is used"),
               (INTUITION, "give a short intuition (two or three sentences) before using it"),
               (REFRESHER, "give a brief refresher before using it"),
-              (SECTION, "research and explain fully, from the ground up, in a section headed "
-                        "'Background: <term>' before the main material")]
+              (SECTION, "research and explain fully, from the ground up, before the lesson "
+                        "relies on it")]
     for key, label in labels:
         if groups[key]:
             lines.append(f"- {label}: {', '.join(groups[key])}")
     lines.append(f"- Introduce at most {NEW_TERMS_PER_SECTION} new terms in any one section.")
+    lines.append("- Explain each of these ONCE in the whole lesson, where it is first needed. "
+                 "This lesson is written a section at a time: if an earlier section already "
+                 "explains a term, use it without explaining it again.")
     if any(groups[k] for k in EXPLAINED):
         lines.append("- Explain these only from what the papers say, with citations. If the "
                      "corpus has nothing that explains one, do not explain it from general "

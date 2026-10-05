@@ -656,6 +656,11 @@ it works, then what is known about using it (results, numbers, conditions, limit
 whichever of those actually apply to this material; skip one this theme's research did \
 not touch.
 
+The lesson is written one theme at a time. When ALREADY COVERED lists what earlier sections \
+wrote, this is not the first section: do not explain anything listed there again (use it, \
+it is already explained), do not open with another "what the concept is" introduction, and \
+name each heading after this theme's own subject rather than a generic label.
+
 Rules:
 - Cite every factual sentence with the chunk id(s) it rests on, in square brackets exactly \
 as they appear below, e.g. [12345] or [12345, 67890]. Never invent one; never drop one \
@@ -675,6 +680,35 @@ introduction to the whole lesson, or a conclusion; start on the material and end
 does.
 - If something the corpus discusses did not work or is disputed, say so plainly rather \
 than omitting it."""
+
+
+#: Lesson mode only: how much of what earlier sections wrote (headings and each one's first
+#: sentence) a later section's writer is shown. Sections are written one at a time without
+#: seeing each other, so without this every theme re-introduced the concept and re-explained
+#: the same background -- one 22-theme lesson repeated each of its background explanations
+#: 21-23 times.
+COVERED_CHARS = 4_000
+
+
+def _covered(sections: list[tuple[str, str, str]]) -> str:
+    """What the sections written so far cover, for the next lesson section's writer."""
+    full, heads = [], []
+    for _, _, text in sections:
+        heading = None
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.startswith("#"):
+                heading = line.lstrip("#").strip()
+                full.append(f"- {heading}")
+                heads.append(f"- {heading}")
+            elif line and heading is not None:
+                first = re.sub(r"\s*\[[\d,\s]+\]", "", line)[:200]
+                full.append(f"  {first}")
+                heading = None
+    text = "\n".join(full)
+    if len(text) > COVERED_CHARS:
+        text = "\n".join(heads)
+    return text[:COVERED_CHARS]
 
 
 def _lesson_section_system(n_goals: int) -> str:
@@ -1559,6 +1593,9 @@ async def _write_deliverable(state: SynthesizerState, *, base_url: str, model: s
     for cluster in _cluster_goals(state.goals):
         root = cluster[0]
         source = _cluster_digest(state.objective, cluster, use_tldr=use_tldr)
+        if deliverable_mode == "lesson" and sections:
+            source += ("\n\nALREADY COVERED by earlier sections of this lesson -- do not "
+                       "explain any of this again:\n" + _covered(sections))
         text, degraded, why, tin, tout = await _compose(
             source, system=section_system(len(cluster)), base_url=base_url,
             model=model, max_model_len=max_model_len, api_key=api_key, cap=cap,
