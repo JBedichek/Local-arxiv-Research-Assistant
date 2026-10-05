@@ -2566,3 +2566,57 @@ def test_a_report_section_is_not_given_earlier_sections(monkeypatch):
         "b": _goal("b", status=SY.DONE, summary="answer b")})
     asyncio.run(SY._write_deliverable(state, base_url="x", model="m", max_model_len=100_000))
     assert not any("ALREADY COVERED" in s for s in sources)
+
+
+def test_organize_curriculum_retries_before_falling_back(monkeypatch):
+    """One failed reply used to send every candidate through unorganized."""
+    calls = []
+
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("transient")
+        got = dispatch(SY.CURRICULUM_TOOL, {"subjects": [{"title": "S", "lesson_ids": ["cand-1"]}]})
+        if inspect.isawaitable(got):
+            await got
+        return types.SimpleNamespace(text="")
+    monkeypatch.setattr(converse, "talk", talk)
+
+    subjects, _tin, _tout = asyncio.run(SY._organize_curriculum(
+        [{"id": "cand-1", "title": "A", "summary": "a"}, {"id": "cand-2", "title": "B", "summary": "b"}],
+        objective="obj", base_url="x", model="m", max_model_len=100_000))
+    assert len(calls) == 2 and [s["title"] for s in subjects] == ["S"]
+
+
+def test_the_fallback_drops_only_candidates_with_the_same_title(monkeypatch):
+    async def broken(*a, **kw):
+        raise RuntimeError("replica unreachable")
+    monkeypatch.setattr(converse, "talk", broken)
+
+    candidates = [{"id": "cand-1", "title": "Sparse Autoencoders for Feature Disentanglement", "summary": "a"},
+                  {"id": "cand-2", "title": "Sparse Autoencoders and Feature Disentanglement", "summary": "b"},
+                  {"id": "cand-3", "title": "Disentangling Features with Sparse Autoencoders (SAEs)", "summary": "c"}]
+    subjects, _tin, _tout = asyncio.run(SY._organize_curriculum(
+        candidates, objective="obj", base_url="x", model="m", max_model_len=100_000))
+    assert [c["summary"] for c in subjects[0]["concepts"]] == ["a", "c"]
+
+
+def test_a_later_topic_graph_theme_is_told_what_earlier_themes_proposed(monkeypatch):
+    sources = []
+
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        sources.append(messages[-1]["content"])
+        if tools:
+            return types.SimpleNamespace(text="")
+        n = len(sources)
+        return types.SimpleNamespace(text=json.dumps({"concepts": [
+            {"title": f"Concept {n}", "summary": "s [1].", "prereqs_text": "", "competencies": []}]}))
+    monkeypatch.setattr(converse, "talk", talk)
+
+    state = SY.SynthesizerState(objective="obj", goals={
+        "a": _goal("a", status=SY.DONE, summary="answer a", tldr="a"),
+        "b": _goal("b", status=SY.DONE, summary="answer b", tldr="b")})
+    asyncio.run(SY._write_deliverable(state, base_url="x", model="m", max_model_len=100_000,
+                                      deliverable_mode="topic_graph"))
+    assert "ALREADY PROPOSED" not in sources[0]
+    assert "ALREADY PROPOSED" in sources[1] and "- Concept 1" in sources[1]

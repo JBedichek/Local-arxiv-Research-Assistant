@@ -627,6 +627,9 @@ handled separately, and every theme's candidates are organized into the final co
 later pass that may group, reorder or drop one that turns out to duplicate another -- \
 propose freely from what this theme alone supports; do not worry about overlap with \
 themes you cannot see), not a single fact.
+- When ALREADY PROPOSED lists concepts earlier themes already proposed, never propose one \
+of them again, even reworded: propose only what this theme adds. If it adds nothing new, \
+reply {"concepts": []}.
 - "summary": 2-4 sentences a learner would read before studying it, citing the chunk ids \
 that support it in square brackets exactly as they appear in the research below, e.g. \
 [12345] or [12345, 67890]. Never invent a citation; never drop one still load-bearing.
@@ -762,6 +765,32 @@ teaches better than a long flat list of every candidate that was ever proposed.
 to its lessons, not a restatement of them.
 
 Call organize_curriculum exactly once."""
+
+
+#: Attempts at the organizing call before falling back. One failed reply used to send every
+#: candidate through unorganized -- a 20-theme course came out as 72 lessons in one
+#: "Course topics" group, a dozen of them the same three concepts.
+CURRICULUM_ATTEMPTS = 3
+
+
+def _title_key(title: str) -> frozenset:
+    """A candidate's title as a set of its content words -- equal for two titles that say
+    the same thing in a different order or with different connectives."""
+    return frozenset(w for w in re.findall(r"[a-z0-9]+", title.lower()) if len(w) > 3)
+
+
+def _dedupe_by_title(candidates: list[dict]) -> list[dict]:
+    """The fallback's only editorial act: a candidate whose title is the same as an earlier
+    one's (`_title_key`) is dropped. Nothing is rewritten, and two candidates that differ in
+    any content word are both kept."""
+    seen: set[frozenset] = set()
+    out = []
+    for c in candidates:
+        k = _title_key(c["title"]) or frozenset([c["title"]])
+        if k not in seen:
+            seen.add(k)
+            out.append(c)
+    return out
 
 
 def _curriculum_schema(candidate_ids: list[str]) -> dict:
@@ -1427,36 +1456,46 @@ async def _organize_curriculum(candidates: list[dict], *, objective: str, base_u
         return "recorded"
 
     tokens_in = tokens_out = 0
-    try:
-        reply = await CV.talk(
-            base_url, model, CV.opening(CURRICULUM_SYSTEM, prompt),
-            tools=[_curriculum_schema(ids)], dispatch=dispatch, max_turns=1,
-            max_tokens=room, api_key=api_key,
-            tool_choice={"type": "function", "function": {"name": CURRICULUM_TOOL}},
-            enable_thinking=False)
-        tokens_in = int(getattr(reply, "tokens_in", 0) or 0)
-        tokens_out = int(getattr(reply, "tokens_out", 0) or 0)
-    except Exception:                                          # noqa: BLE001
-        pass
-
-    raw_subjects = captured.get("subjects")
     subjects: list[dict] = []
-    seen: set[str] = set()
-    if isinstance(raw_subjects, list):
-        for s in raw_subjects:
-            if not isinstance(s, dict):
-                continue
-            kept = [dict(by_id[cid]) for cid in (s.get("lesson_ids") or [])
-                   if isinstance(cid, str) and cid in by_id and cid not in seen]
-            if not kept:
-                continue
-            seen.update(c["id"] for c in kept)
-            subjects.append({"title": str(s.get("title") or "").strip(),
-                             "summary": str(s.get("summary") or "").strip(),
-                             "concepts": kept})
+    why = ""
+    for attempt in range(1, CURRICULUM_ATTEMPTS + 1):
+        captured.clear()
+        try:
+            reply = await CV.talk(
+                base_url, model, CV.opening(CURRICULUM_SYSTEM, prompt),
+                tools=[_curriculum_schema(ids)], dispatch=dispatch, max_turns=1,
+                max_tokens=room, api_key=api_key,
+                tool_choice={"type": "function", "function": {"name": CURRICULUM_TOOL}},
+                enable_thinking=False)
+            tokens_in += int(getattr(reply, "tokens_in", 0) or 0)
+            tokens_out += int(getattr(reply, "tokens_out", 0) or 0)
+        except Exception as e:                                 # noqa: BLE001
+            why = f"{type(e).__name__}: {e}"
+            continue
+
+        raw_subjects = captured.get("subjects")
+        seen: set[str] = set()
+        if isinstance(raw_subjects, list):
+            for s in raw_subjects:
+                if not isinstance(s, dict):
+                    continue
+                kept = [dict(by_id[cid]) for cid in (s.get("lesson_ids") or [])
+                       if isinstance(cid, str) and cid in by_id and cid not in seen]
+                if not kept:
+                    continue
+                seen.update(c["id"] for c in kept)
+                subjects.append({"title": str(s.get("title") or "").strip(),
+                                 "summary": str(s.get("summary") or "").strip(),
+                                 "concepts": kept})
+        if subjects:
+            break
+        why = ("no organize_curriculum call came back" if not captured
+               else "the reply named no real candidate")
     if not subjects:
+        logging.getLogger(__name__).warning("curriculum organizing fell back after %d attempt(s): %s",
+                       CURRICULUM_ATTEMPTS, why)
         subjects = [{"title": "Course topics", "summary": "",
-                    "concepts": [dict(c) for c in candidates]}]
+                    "concepts": [dict(c) for c in _dedupe_by_title(candidates)]}]
     for s in subjects:
         for c in s["concepts"]:
             c.pop("id", None)
@@ -1596,6 +1635,12 @@ async def _write_deliverable(state: SynthesizerState, *, base_url: str, model: s
         if deliverable_mode == "lesson" and sections:
             source += ("\n\nALREADY COVERED by earlier sections of this lesson -- do not "
                        "explain any of this again:\n" + _covered(sections))
+        elif deliverable_mode == "topic_graph" and sections:
+            proposed = [str(item.get("title", "")).strip() for _, _, t in sections
+                        for item in _parse_topic_graph_section(t)]
+            if any(proposed):
+                source += ("\n\nALREADY PROPOSED by earlier themes -- do not propose any of "
+                           "these again:\n" + "\n".join(f"- {t}" for t in proposed if t))
         text, degraded, why, tin, tout = await _compose(
             source, system=section_system(len(cluster)), base_url=base_url,
             model=model, max_model_len=max_model_len, api_key=api_key, cap=cap,
