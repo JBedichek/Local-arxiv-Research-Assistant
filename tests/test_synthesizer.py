@@ -2620,3 +2620,20 @@ def test_a_later_topic_graph_theme_is_told_what_earlier_themes_proposed(monkeypa
                                       deliverable_mode="topic_graph"))
     assert "ALREADY PROPOSED" not in sources[0]
     assert "ALREADY PROPOSED" in sources[1] and "- Concept 1" in sources[1]
+
+
+def test_organize_curriculum_drops_a_same_titled_candidate_the_reply_kept(monkeypatch):
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        got = dispatch(SY.CURRICULUM_TOOL, {"subjects": [
+            {"title": "S", "lesson_ids": ["cand-1", "cand-2", "cand-3"]}]})
+        if inspect.isawaitable(got):
+            await got
+        return types.SimpleNamespace(text="")
+    monkeypatch.setattr(converse, "talk", talk)
+
+    candidates = [{"id": "cand-1", "title": "Sparse Autoencoders for Feature Disentanglement", "summary": "a"},
+                  {"id": "cand-2", "title": "Sparse Autoencoders and Feature Disentanglement", "summary": "b"},
+                  {"id": "cand-3", "title": "Superposition and Polysemanticity", "summary": "c"}]
+    subjects, _tin, _tout = asyncio.run(SY._organize_curriculum(
+        candidates, objective="obj", base_url="x", model="m", max_model_len=100_000))
+    assert [c["summary"] for c in subjects[0]["concepts"]] == ["a", "c"]

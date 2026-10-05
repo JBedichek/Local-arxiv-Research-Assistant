@@ -1475,12 +1475,23 @@ async def _organize_curriculum(candidates: list[dict], *, objective: str, base_u
 
         raw_subjects = captured.get("subjects")
         seen: set[str] = set()
+        titles: set[frozenset] = set()
         if isinstance(raw_subjects, list):
             for s in raw_subjects:
                 if not isinstance(s, dict):
                     continue
-                kept = [dict(by_id[cid]) for cid in (s.get("lesson_ids") or [])
-                       if isinstance(cid, str) and cid in by_id and cid not in seen]
+                kept = []
+                for cid in s.get("lesson_ids") or []:
+                    if not isinstance(cid, str) or cid not in by_id or cid in seen:
+                        continue
+                    # A reply can keep two candidates with the same title (one live run
+                    # kept three "Sparse Autoencoders for Feature Disentanglement"): the
+                    # same check the fallback makes, applied to what the reply kept.
+                    k = _title_key(by_id[cid]["title"]) or frozenset([by_id[cid]["title"]])
+                    if k in titles:
+                        continue
+                    titles.add(k)
+                    kept.append(dict(by_id[cid]))
                 if not kept:
                     continue
                 seen.update(c["id"] for c in kept)
