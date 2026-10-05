@@ -732,6 +732,9 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn-bar { display: flex; align-items: center; gap: 1em; padding: .5em 1em;
              background: var(--panel); border-bottom: 1px solid var(--line); }
 #learn-bar h2 { font-size: 1em; margin: 0; }
+/* How wide a lesson's column (and everything read inside it) may grow. In `ch`, so it
+   scales with the font size; capped at the pane by min(..., 100%) below. */
+#learn { --learn-measure: 120ch; }
 #learn-main { flex: 1 1 auto; overflow: auto; padding: .8em 1.4em 4em;
   font-family: var(--paper-font, inherit); font-size: var(--paper-size, 16px);
   line-height: var(--paper-leading, 1.6); }
@@ -777,9 +780,9 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .learn-subject > .hint { margin: 0 0 6px; }
 /* A lesson is read, not scanned -- centered as a column instead of pinned to the left edge
  * of a full-width overlay, the way the course list and concept map stay full width. */
-#learn .learn-concept { max-width: 86ch; margin: 0 auto; }
+#learn .learn-concept { max-width: min(var(--learn-measure), 100%); margin: 0 auto; }
 #learn .learn-card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-              padding: 12px 14px; margin: 12px 0; max-width: 84ch; }
+              padding: 12px 14px; margin: 12px 0; max-width: var(--learn-measure); }
 #learn .learn-card.claim { border-color: var(--accent); }
 #learn .learn-card blockquote { margin: 8px 0; padding: 6px 10px; border-left: 3px solid var(--line);
                          color: var(--dim); font-size: 0.9286em; }
@@ -789,7 +792,7 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .bar { flex: none; width: 90px; height: 6px; background: var(--panel-2); border-radius: 3px; overflow: hidden; }
 #learn .bar i { display: block; height: 100%; background: var(--accent); }
 #learn .learn-progress li.done .bar i { background: var(--ok); }
-#learn .lesson-p { max-width: 78ch; line-height: 1.7; }
+#learn .lesson-p { max-width: var(--learn-measure); line-height: 1.7; }
 #learn .lsent { margin-right: 0.25em; }
 /* Jump nav: only shown for a lesson with more than one section (see sectionNav in learn.js). */
 #learn .lesson-nav { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 18px; }
@@ -874,7 +877,7 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .read-bar button { font-size: 0.8571em; }
 #learn .lsent.reading-now { background: var(--panel-2); border-radius: 3px;
               box-shadow: 0 0 0 2px var(--panel-2); transition: background .15s; }
-#learn .expansion { max-width: 78ch; margin: 8px 0 14px; padding: 6px 12px; border-left: 3px solid var(--accent);
+#learn .expansion { max-width: var(--learn-measure); margin: 8px 0 14px; padding: 6px 12px; border-left: 3px solid var(--accent);
              background: var(--panel-2); border-radius: 0 6px 6px 0; }
 #learn .expansion summary { cursor: pointer; color: var(--accent); font-size: 0.9286em; }
 #learn .expansion .lesson-p { margin: 6px 0; }
@@ -882,7 +885,7 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
 #learn .variant-bar input { width: 4.5em; }
 /* The blocking familiarity gate (see topicsGate in learn.js): one row per indexed topic, shown
  * before any lesson content until every row has an answer. */
-#learn .topics-gate { max-width: 78ch; }
+#learn .topics-gate { max-width: var(--learn-measure); }
 #learn .topic-gate-row { padding: 8px 0; border-top: 1px solid var(--line); }
 #learn .topic-gate-row:first-of-type { border-top: 0; }
 #learn .topic-gate-buttons { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
@@ -928,7 +931,7 @@ label.adv input[type=checkbox] { accent-color: var(--accent); margin-right: 4px;
  * at all. */
 #learn .refs { list-style: none; padding: 0; margin: 8px 0; display: flex; flex-direction: column; gap: 6px; }
 #learn .refs li.ref { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
-              padding: 8px 10px; max-width: 84ch; }
+              padding: 8px 10px; max-width: var(--learn-measure); }
 #learn .ref-title { font-weight: 600; margin: 0 0 3px; }
 #learn .ref-title a { color: inherit; }
 #learn .ref-body { color: var(--dim); font-size: 0.9286em; }
