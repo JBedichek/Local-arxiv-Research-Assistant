@@ -68,7 +68,7 @@ class ExpandRequest(BaseModel):
 
 
 class LessonRequest(BaseModel):
-    variant: str                # "tldr", "thorough", "pages", or "compress-high|med|low"
+    variant: str                # "tldr", "thorough", "pages", "reorganized", or "compress-high|med|low"
     pages: int | None = None
 
 
@@ -139,7 +139,10 @@ def _synth(mode: str, course_id: str, cid: str = ""):
     if mode == "topic_graph":
         return LR.topic_graph_synth(state, course_id)
     if mode == "lesson":
-        return LR.lesson_synth(state, course_id, cid)
+        course = _course(course_id) or {}
+        meta = next((c for c in course.get("concepts", []) if c["id"] == cid), {})
+        return LR.lesson_synth(state, course_id, cid,
+                               max_rounds=LR.lesson_rounds(meta.get("need", 2)))
     if mode == "expand":
         return LR.expand_synth(state)
     if mode == "decompose":

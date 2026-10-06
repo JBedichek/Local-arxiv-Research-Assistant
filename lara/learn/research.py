@@ -91,10 +91,34 @@ def _insufficient(result: dict) -> dict:
                     "rounds": result.get("rounds", 0)}}
 
 
-def _lesson_objective(concept: dict, *, profile_digest: str = "", brief: str = "") -> str:
+#: A lesson's length, by how well the course's goal needs its concept (0-4, see
+#: lara.learn.profile.LEVELS). Without a budget a lesson ran until its research round limit:
+#: one need-4 lesson came out at 36,000 words.
+LESSON_WORDS = {0: 1_000, 1: 1_000, 2: 2_000, 3: 3_500, 4: 6_000}
+
+
+def lesson_words(need) -> int:
+    try:
+        return LESSON_WORDS[max(0, min(4, int(need)))]
+    except (TypeError, ValueError):
+        return LESSON_WORDS[2]
+
+
+def _lesson_objective(concept: dict, *, profile_digest: str = "", brief: str = "",
+                      others: list[str] | tuple = (), words: int = 0) -> str:
     objective = (f"{concept['title']} -- {concept.get('summary', '')}\n\n"
                 f"Write this as a lesson for a learner whose goal is: "
                 f"{concept.get('goal') or '(not given)'}")
+    if others:
+        # The lesson's scope. Without it, research on one concept wandered into every
+        # neighbouring one, and a single lesson re-taught most of its course.
+        objective += ("\n\nSCOPE: this is one lesson of a course. These are taught in "
+                      "lessons of their own -- research and teach only what this lesson needs "
+                      "from them, in a sentence or two, naming the lesson:\n"
+                      + "\n".join(f"- {t}" for t in others))
+    if words:
+        objective += (f"\n\nLENGTH: about {words} words in all. Stop researching once this "
+                      "lesson's own material is covered.")
     if profile_digest:
         # See pipeline.build_concept's own call site: `profile_digest` is this learner's
         # whole cross-course knowledge digest (lara.learn.profile.digest), unfiltered --
@@ -150,7 +174,8 @@ def _lesson_from_result(result: dict) -> dict:
                     "rounds": result.get("rounds", 0)}}
 
 
-async def build_lesson(concept: dict, *, synth, profile_digest: str = "", brief: str = "") -> dict:
+async def build_lesson(concept: dict, *, synth, profile_digest: str = "", brief: str = "",
+                       others: list[str] | tuple = (), words: int = 0) -> dict:
     """Phase 2: one full synthesis run scoped to this concept, its own citation writing
     becoming the lesson directly -- replaces claims.build() + depth.deepen()'s standard-
     lesson path (see pipeline.build_concept's "claims" stage).
@@ -162,7 +187,8 @@ async def build_lesson(concept: dict, *, synth, profile_digest: str = "", brief:
     takes one, since a revision is already a specific, human-directed instruction rather
     than this general personalization."""
     TR.set_phase(f"lesson_research: {concept['title']}")
-    result = await synth(_lesson_objective(concept, profile_digest=profile_digest, brief=brief))
+    result = await synth(_lesson_objective(concept, profile_digest=profile_digest, brief=brief,
+                                           others=others, words=words))
     TR.emit("lesson_research", tokens_in=result.get("tokens_in", 0),
            tokens_out=result.get("tokens_out", 0), degraded=result.get("degraded"))
     return _lesson_from_result(result)

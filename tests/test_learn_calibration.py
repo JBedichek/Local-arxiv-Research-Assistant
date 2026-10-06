@@ -496,3 +496,66 @@ def test_refreshing_a_research_driven_lesson_keeps_the_researched_lesson():
     texts = [s["text"] for sec in content["lesson"]["sections"] for s in sec["sentences"]]
     assert texts == ["A loss spike is a sudden jump in loss.", "Warmup avoids them."]
     assert not any("plan a self-study lesson" in sys for sys, _ in m.calls[-40:])
+
+
+# ── scope, length and reorganization ─────────────────────────────────────────────
+
+from lara.learn import reorganize as RG  # noqa: E402
+
+
+def test_a_lesson_objective_names_the_other_lessons_and_a_length():
+    objective = RS._lesson_objective({"title": "Residual stream", "summary": "s", "goal": "g"},
+                                     others=["Superposition", "Sparse autoencoders"],
+                                     words=RS.lesson_words(4))
+    assert "SCOPE:" in objective and "- Superposition" in objective and "- Sparse autoencoders" in objective
+    assert "LENGTH: about 6000 words" in objective
+    assert RS.lesson_words(1) < RS.lesson_words(3) < RS.lesson_words(4) and RS.lesson_words("x") == 2000
+
+
+def test_a_lessons_research_is_told_its_scope_and_length():
+    course, content, synth = built(model(TERMS))
+    assert "SCOPE:" in synth.seen[0] and "- Decay" in synth.seen[0] and "- Warmup" not in synth.seen[0]
+    assert "LENGTH: about" in synth.seen[0]
+
+
+def _messy_lesson():
+    return {"insufficient": False, "generated": 1.0, "stats": {}, "sections": [
+        {"heading": "Where sources disagree", "sentences": [{"text": "Papers differ on X.", "claims": ["2"]}]},
+        {"heading": "Superposition aside", "sentences": [{"text": "Superposition packs features.", "claims": ["3"]}]},
+        {"heading": "The residual stream", "sentences": [{"text": "The stream is a running sum.", "claims": ["1"]}]}]}
+
+
+OUTLINE = json.dumps({"sections": [
+    {"heading": "A running sum", "establishes": "what the stream is", "from": ["s3", "s1"], "words": 200},
+    {"heading": "Nothing", "establishes": "x", "from": ["s9"]}]})
+
+
+def test_reorganizing_plans_an_outline_and_rewrites_from_the_lessons_own_text():
+    m = llm(("reorganize an existing lesson", OUTLINE),
+            ("rewrite part of an existing lesson", "The stream is a running sum [1].\nPapers differ on X [2, 99]."))
+    out = run(RG.reorganize(m, _messy_lesson(), {"title": "Residual stream"}, others=["Superposition"], words=300))
+    assert [s["heading"] for s in out["sections"]] == ["A running sum"]
+    assert [x["claims"] for x in out["sections"][0]["sentences"]] == [["1"], ["2"]]
+    assert out["reorganized"]["source_sections"] == 3 and out["reorganized"]["sections"] == 1
+    outline_prompt = m.calls[0][1]
+    assert "OTHER LESSONS IN THIS COURSE:\n- Superposition" in outline_prompt and "[s2] Superposition aside" in outline_prompt
+    section_prompt = m.calls[1][1]
+    assert "The stream is a running sum [1]." in section_prompt and "Superposition packs" not in section_prompt
+
+
+def test_reorganizing_without_a_usable_outline_is_an_error():
+    with pytest.raises(ValueError, match="outline"):
+        run(RG.reorganize(llm(("reorganize an existing lesson", "{}")), _messy_lesson(), {"title": "t"}))
+    with pytest.raises(ValueError):
+        run(RG.reorganize(llm(), None, {"title": "t"}))
+
+
+def test_a_reorganized_version_is_stored_beside_the_standard_lesson():
+    m = model(TERMS, ("reorganize an existing lesson", json.dumps({"sections": [
+        {"heading": "Warmup, in order", "establishes": "e", "from": ["s1"], "words": 200}]})),
+              ("rewrite part of an existing lesson", "Warmup avoids them [1, 2]."))
+    course, content, _ = built(m)
+    run(PL.write_variant(m, corpus(), course, "c1", "reorganized"))
+    stored = store.load_concept(course["id"], "c1")
+    assert stored["lessons"]["reorganized"]["sections"][0]["heading"] == "Warmup, in order"
+    assert stored["lesson"]["sections"] == content["lesson"]["sections"]

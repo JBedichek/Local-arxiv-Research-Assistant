@@ -49,6 +49,17 @@ LEARN_MAX_IDLE_ROUNDS = SY.SUBSYNTHESIS_MAX_IDLE_ROUNDS
 #: runs once there are some.
 LEARN_MAX_ROUNDS_TOPIC_GRAPH = 20
 LEARN_MAX_ROUNDS_LESSON = 12
+#: A lesson's round budget by how well the course needs its concept (0-4) -- the ceiling
+#: above for the concepts the goal needs most, less for the rest. Every lesson used to get
+#: the full 12, and broad ones used all of them researching neighbouring concepts.
+LESSON_ROUNDS = {0: 4, 1: 4, 2: 6, 3: 9, 4: LEARN_MAX_ROUNDS_LESSON}
+
+
+def lesson_rounds(need) -> int:
+    try:
+        return LESSON_ROUNDS[max(0, min(4, int(need)))]
+    except (TypeError, ValueError):
+        return LESSON_ROUNDS[2]
 
 
 async def _run(app_state, objective: str = "", *, deliverable_mode: str,
@@ -213,7 +224,8 @@ def topic_graph_revise(app_state, course_id: str, *, model: str | None = None):
     return revise
 
 
-def lesson_synth(app_state, course_id: str, cid: str, *, model: str | None = None):
+def lesson_synth(app_state, course_id: str, cid: str, *, model: str | None = None,
+                 max_rounds: int | None = None):
     """The `synth` capability `lara.learn.research.build_lesson` takes: one call is one
     full concept-scoped synthesis run, its deliverable already the lesson prose
     (`deliverable_mode="lesson"`) -- caller sets `trace.set_phase` before awaiting.
@@ -223,7 +235,7 @@ def lesson_synth(app_state, course_id: str, cid: str, *, model: str | None = Non
 
     async def synth(objective: str) -> dict:
         result = await _run(app_state, objective, deliverable_mode="lesson", model=model,
-                            max_rounds=LEARN_MAX_ROUNDS_LESSON, state_id=state_id)
+                            max_rounds=max_rounds or LEARN_MAX_ROUNDS_LESSON, state_id=state_id)
         return _parse_lesson(result)
     return synth
 

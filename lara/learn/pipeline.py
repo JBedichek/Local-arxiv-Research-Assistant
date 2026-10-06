@@ -22,6 +22,7 @@ from lara.learn import lesson as LE
 from lara.learn import profile as PR
 from lara.learn import quiz as QZ
 from lara.learn import reader as RD
+from lara.learn import reorganize as RG
 from lara.learn import research as RS
 from lara.learn import store
 from lara.learn import topics as TP
@@ -220,9 +221,11 @@ async def build_concept(llm: Llm, corpus, course: dict, cid: str, *, stages=STAG
             # treatment.py).
             TR.set_phase("plan")
             the_plan = await TM.plan(llm, PR.load(), course, concept)
+            others = [c["title"] for c in course["concepts"] if c["id"] != cid]
             content.update(await RS.build_lesson(concept, synth=lesson_synth,
                                                  profile_digest=digest,
-                                                 brief=TM.brief(the_plan)))
+                                                 brief=TM.brief(the_plan), others=others,
+                                                 words=RS.lesson_words(concept.get("need", 2))))
             TM.mark_uncovered(the_plan, content.get("lesson"))
             content["plan"] = TM.public(the_plan)
             if simulated_reader and content.get("lesson") and not content["lesson"].get("insufficient"):
@@ -517,6 +520,8 @@ def variant_key(variant: str, pages=None) -> tuple[str, int | None]:
         return f"pages-{n}", n
     if variant.startswith("compress-") and variant.split("-", 1)[1] in CP.LEVELS:
         return variant, None
+    if variant == "reorganized":
+        return variant, None
     raise ValueError(f"unknown lesson variant {variant!r}")
 
 
@@ -557,6 +562,12 @@ async def write_variant(llm: Llm, corpus, course: dict, cid: str, variant: str, 
             note(stage=f"writing {key}", detail="starting")
             if key.startswith("compress-"):
                 lesson = await CP.compress(llm, content.get("lesson"), key.split("-", 1)[1])
+                changes = {}
+            elif key == "reorganized":
+                lesson = await RG.reorganize(
+                    llm, content.get("lesson"), meta,
+                    others=[c["title"] for c in course["concepts"] if c["id"] != cid],
+                    words=RS.lesson_words(meta.get("need", 2)))
                 changes = {}
             elif key == "tldr":
                 lesson = await LE.compose(llm, meta, content["claims"], content.get("conflicts", []),
