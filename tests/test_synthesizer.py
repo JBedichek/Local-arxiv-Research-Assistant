@@ -2530,12 +2530,15 @@ def test_synthesis_result_to_dict_includes_tokens():
     assert d["tokens_in"] == 10 and d["tokens_out"] == 20
 
 
-def test_a_later_lesson_section_is_told_what_earlier_sections_covered(monkeypatch):
-    """Lesson sections are written one theme at a time without seeing each other; without
-    this every theme re-introduced the concept and re-explained the same background."""
+def test_without_an_outline_a_later_lesson_section_is_told_what_earlier_ones_covered(monkeypatch):
+    """The per-theme fallback: sections are written one theme at a time without seeing each
+    other; without this every theme re-introduced the concept and re-explained the same
+    background."""
     sources = []
 
     async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        if messages[0]["content"] == SY.LESSON_OUTLINE_SYSTEM:
+            return types.SimpleNamespace(text="not json")          # no outline -> fallback
         sources.append(messages[-1]["content"])
         if tools:
             return types.SimpleNamespace(text="", tool_calls=[])
@@ -2551,6 +2554,36 @@ def test_a_later_lesson_section_is_told_what_earlier_sections_covered(monkeypatc
     assert "ALREADY COVERED" not in sources[0]
     assert "ALREADY COVERED" in sources[1] and "Theme 1 heading" in sources[1]
     assert "Theme 1 explains spectrograms." in sources[1]
+
+
+def test_a_lesson_is_outlined_first_then_written_section_by_section(monkeypatch):
+    sections = []
+    outline = {"sections": [
+        {"heading": "Why a running sum", "establishes": "the stream adds", "findings": ["b"], "words": 300},
+        {"heading": "Reading by projection", "establishes": "heads read linearly", "findings": ["a", "zz"], "words": 200},
+        {"heading": "Dropped", "establishes": "x", "findings": ["zz"]}]}
+
+    async def talk(base_url, model, messages, *, tools=None, dispatch=None, **kw):
+        if messages[0]["content"] == SY.LESSON_OUTLINE_SYSTEM:
+            assert "answer a" in messages[-1]["content"] and "answer b" in messages[-1]["content"]
+            return types.SimpleNamespace(text=json.dumps(outline))
+        assert messages[0]["content"] == SY.LESSON_OUTLINED_SECTION_SYSTEM
+        sections.append(messages[-1]["content"])
+        return types.SimpleNamespace(text=f"Section {len(sections)} prose [1].")
+    monkeypatch.setattr(converse, "talk", talk)
+
+    state = SY.SynthesizerState(objective="obj", goals={
+        "a": _goal("a", status=SY.DONE, summary="answer a"),
+        "b": _goal("b", status=SY.DONE, summary="answer b")})
+    text, _refs, _deg, _why = asyncio.run(SY._write_deliverable(
+        state, base_url="x", model="m", max_model_len=100_000, deliverable_mode="lesson"))
+
+    assert text.index("## Why a running sum") < text.index("## Reading by projection")
+    assert "Dropped" not in text and len(sections) == 2
+    assert "answer b" in sections[0] and "answer a" not in sections[0]
+    assert "LENGTH: about 300 words" in sections[0]
+    assert "ALREADY COVERED" in sections[1] and "Why a running sum" in sections[1]
+    assert "answer a" in sections[1] and "answer b" not in sections[1].split("FINDINGS:")[1]
 
 
 def test_a_report_section_is_not_given_earlier_sections(monkeypatch):

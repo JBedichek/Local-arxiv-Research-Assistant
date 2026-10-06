@@ -714,6 +714,150 @@ def _covered(sections: list[tuple[str, str, str]]) -> str:
     return text[:COVERED_CHARS]
 
 
+#: Lesson mode's main path: plan a teaching outline over every finding, then write each
+#: section from the findings it draws on (`_write_lesson_outlined`). Writing one section per
+#: research theme and only reordering them afterwards (`_stitch`) produced lessons that read
+#: as a pile of separate reports -- one representation-theory lesson ran 182 sections, 28 of
+#: them "Where sources disagree", in research order rather than teaching order.
+LESSON_OUTLINE_SYSTEM = """You plan the outline of one lesson for a learner, from research \
+already gathered on it. Below are the lesson's objective and every research finding, each \
+under its id.
+
+Reply with JSON only:
+{"sections": [{"heading": "...", "establishes": "...", "findings": ["<finding id>"], "words": N}]}
+
+- Order the sections the way a learner should meet them: what the concept is and why it \
+matters, then how it works, then the evidence and how it is used, then its limits and open \
+questions. Each section builds on the ones before it and never needs a later one.
+- heading: what the section is about, specifically -- never a generic label such as "What \
+the concept is" or "Where sources disagree".
+- establishes: one sentence -- what the learner understands after reading it.
+- findings: the ids whose material the section draws on. A finding may serve several \
+sections. Leave out findings that fall outside the lesson's scope as the objective defines \
+it -- material that belongs to other lessons it names.
+- A disagreement between sources belongs in the section about the point in dispute, not in \
+a section of its own.
+- words: this section's share of the LENGTH the objective gives; together they add up to \
+it. A section is a few hundred words, not a few dozen."""
+
+LESSON_OUTLINED_SECTION_SYSTEM = """You write ONE section of a lesson for a learner, from \
+research findings. The lesson's outline is given for orientation; write only the section \
+named as yours, under no heading of your own (the caller adds it).
+
+Rules:
+- Establish what the outline says this section establishes, at about the length given, \
+from the findings provided. Prose that teaches: connect each point to the one before it.
+- Cite every factual sentence with the chunk id(s) it rests on, in square brackets exactly \
+as they appear in the findings, e.g. [12345] or [12345, 67890]. Never invent one.
+- The first time a sentence uses a technical term, acronym or named method, briefly say \
+what it means as part of that sentence -- unless ALREADY COVERED shows an earlier section \
+explained it. Never explain again what ALREADY COVERED lists.
+- Convey certainty as the research shows it: say when a point rests on one paper, is only \
+proposed rather than shown, or was contradicted by other work. Where findings disagree, say \
+so here, naming what each side found and under what conditions, without picking a winner.
+- No introduction to the whole lesson and no conclusion; start on this section's material \
+and stop when it is covered."""
+
+#: Outline attempts before falling back to one section per research theme.
+LESSON_OUTLINE_ATTEMPTS = 2
+
+
+def _lesson_findings(state: SynthesizerState) -> dict[str, str]:
+    """Every landed finding, by id, rendered in full -- what an outlined lesson is written from."""
+    out = {f"prior-{i}": f"### prior-{i} (established earlier in this run)\n{c}"
+           for i, c in enumerate(state.compressed, 1)}
+    for gid, g in state.goals.items():
+        if g.status == DONE:
+            out[gid] = _render_goal(g)
+    return out
+
+
+def _parse_outline(text: str, known: set[str]) -> list[dict]:
+    try:
+        data = json.loads(text)
+    except ValueError:
+        match = re.search(r"\{.*\}", text or "", re.DOTALL)
+        try:
+            data = json.loads(match.group(0)) if match else {}
+        except ValueError:
+            data = {}
+    out = []
+    for sec in (data.get("sections") if isinstance(data, dict) else None) or []:
+        if not isinstance(sec, dict) or not str(sec.get("heading", "")).strip():
+            continue
+        findings = [f for f in sec.get("findings") or [] if isinstance(f, str) and f in known]
+        if not findings:
+            continue
+        try:
+            words = max(150, min(2_500, int(sec.get("words") or 400)))
+        except (TypeError, ValueError):
+            words = 400
+        out.append({"heading": str(sec["heading"]).strip(),
+                    "establishes": str(sec.get("establishes", "")).strip(),
+                    "findings": findings, "words": words})
+    return out
+
+
+async def _write_lesson_outlined(state: SynthesizerState, *, base_url: str, model: str,
+                                 max_model_len: int, api_key: str, cap: int, on_section=None):
+    """(text, degraded, degraded_because, tokens_in, tokens_out), or None when no usable
+    outline came back -- the caller then writes one section per research theme instead."""
+    from lara.serve import converse as CV
+
+    findings = _lesson_findings(state)
+    if not findings:
+        return None
+    listing = "\n\n".join(findings.values())
+    prompt = f"Objective: {state.objective}\n\nFINDINGS:\n\n{listing}"
+    room = CX.reply_room(max_model_len, LESSON_OUTLINE_SYSTEM, prompt,
+                         stage="synthesizer.lesson_outline", default=2_000, cap=6_000)
+    tokens_in = tokens_out = 0
+    outline: list[dict] = []
+    for _ in range(LESSON_OUTLINE_ATTEMPTS):
+        try:
+            reply = await CV.talk(base_url, model, CV.opening(LESSON_OUTLINE_SYSTEM, prompt),
+                                  max_turns=1, max_tokens=room, api_key=api_key,
+                                  enable_thinking=False)
+        except Exception:                                      # noqa: BLE001
+            continue
+        tokens_in += int(getattr(reply, "tokens_in", 0) or 0)
+        tokens_out += int(getattr(reply, "tokens_out", 0) or 0)
+        outline = _parse_outline(getattr(reply, "text", "") or "", set(findings))
+        if outline:
+            break
+    if not outline:
+        logging.getLogger(__name__).warning("lesson outline failed; writing one section per theme")
+        return None
+
+    plan = "\n".join(f"{i}. {sec['heading']} -- {sec['establishes']}"
+                      for i, sec in enumerate(outline, 1))
+    written: list[tuple[str, str, str]] = []
+    parts: list[str] = []
+    degraded_any, degraded_because = False, ""
+    for i, sec in enumerate(outline, 1):
+        source = (f"Objective: {state.objective}\n\nLESSON OUTLINE:\n{plan}\n\n"
+                  f"YOUR SECTION: {i}. {sec['heading']}\nIt establishes: {sec['establishes']}\n"
+                  f"LENGTH: about {sec['words']} words")
+        if written:
+            source += ("\n\nALREADY COVERED by earlier sections -- do not explain any of this "
+                       "again:\n" + _covered(written))
+        source += "\n\nFINDINGS:\n\n" + "\n\n".join(findings[f] for f in sec["findings"])
+        text, degraded, why, tin, tout = await _compose(
+            source, system=LESSON_OUTLINED_SECTION_SYSTEM, base_url=base_url, model=model,
+            max_model_len=max_model_len, api_key=api_key, cap=cap,
+            stage="synthesizer.section")
+        tokens_in += tin
+        tokens_out += tout
+        degraded_any = degraded_any or degraded
+        degraded_because = why or degraded_because
+        block = f"## {sec['heading']}\n{text.strip()}"
+        written.append((f"section-{i}", sec["heading"], block))
+        parts.append(block)
+        if on_section is not None:
+            on_section(sec["heading"], block)
+    return "\n\n".join(parts), degraded_any, degraded_because, tokens_in, tokens_out
+
+
 def _lesson_section_system(n_goals: int) -> str:
     return LESSON_DELIVERABLE_SYSTEM + (
         f"\n\nThis section covers {n_goals} sub-question{'s' if n_goals != 1 else ''} of "
@@ -1619,6 +1763,17 @@ async def _write_deliverable(state: SynthesizerState, *, base_url: str, model: s
     use_tldr = deliverable_mode == "topic_graph"
 
     cap = deliverable_tokens or MAX_COMPRESS_TOKENS
+    if deliverable_mode == "lesson":
+        outlined = await _write_lesson_outlined(
+            state, base_url=base_url, model=model, max_model_len=max_model_len,
+            api_key=api_key, cap=cap, on_section=on_section)
+        if outlined is not None:
+            text, degraded, why, tin, tout = outlined
+            state.tokens_in += tin
+            state.tokens_out += tout
+            cited = C.bind(text, known=known, conn=conn)
+            return cited.text, cited.references, degraded, why
+
     degraded_any = False
     degraded_because = ""
     total_in = total_out = 0
