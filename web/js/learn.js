@@ -763,7 +763,8 @@ function profileView(rows) {
 /* Versions of the lesson ------------------------------------------------------------ */
 
 const PRESET = { tldr: "TL;DR", standard: "Standard", thorough: "Thorough (about 5 pages)",
-  "compress-low": "Shorter", "compress-med": "Much shorter", "compress-high": "Essentials only" };
+  "compress-low": "Shorter", "compress-med": "Much shorter", "compress-high": "Essentials only",
+  reorganized: "Reorganized" };
 /* Compressed versions are cut down from the standard lesson's own text, discarding more detail
  * at each level -- lara/learn/compress.py. */
 const COMPRESSED = ["compress-low", "compress-med", "compress-high"];
@@ -777,7 +778,7 @@ function variantLabel(key) {
 }
 
 function variantBar(concept) {
-  const keys = ["tldr", "standard", ...COMPRESSED, "thorough", ...Object.keys(concept.lessons || {}).filter((k) => k.startsWith("pages-"))];
+  const keys = ["tldr", "standard", "reorganized", ...COMPRESSED, "thorough", ...Object.keys(concept.lessons || {}).filter((k) => k.startsWith("pages-"))];
   const buttons = keys.map((k) => `<button type="button" class="length-tab ${k === L.variant ? "active" : ""}" data-learn="variant"
       data-variant="${escapeHtml(k)}" title="${concept.lessons?.[k] ? "written" : "not written yet"}">${escapeHtml(variantLabel(k))}${concept.lessons?.[k] ? "" : " ·"}</button>`).join("");
   return `<div class="length-bar variant-bar">${buttons}
@@ -796,11 +797,16 @@ function writeCard(concept) {
   }
   const failed = b.stage === "error" && b.variant === L.variant;
   const compressed = COMPRESSED.includes(L.variant);
+  const reorganized = L.variant === "reorganized";
   const eta = L.variant === "tldr" ? "about half a minute"
-    : compressed ? "a minute or two" : "a few minutes: it searches the papers again for every section";
+    : compressed ? "a minute or two"
+      : reorganized ? "a few minutes: it plans an outline, then rewrites the lesson section by section"
+        : "a few minutes: it searches the papers again for every section";
   const what = compressed
     ? "It is cut down from the standard lesson's own text, deliberately dropping detail; nothing new is added."
-    : "It only says what the sources support, so it may come out shorter than asked.";
+    : reorganized
+      ? "It rewrites the standard lesson in the order a learner should meet it, merging repeats and trimming material that belongs to the course's other lessons. Nothing is researched again and nothing new is added."
+      : "It only says what the sources support, so it may come out shorter than asked.";
   const spec = L.variant.startsWith("pages-") ? `data-variant="pages" data-pages="${escapeHtml(L.variant.slice(6))}"` : `data-variant="${escapeHtml(L.variant)}"`;
   return `<div class="learn-card"><p>The ${escapeHtml(variantLabel(L.variant))} version has not been written yet.
     <span class="hint">Takes ${eta}. ${what}</span></p>
@@ -928,7 +934,9 @@ function lessonBody(concept) {
   // could not support is worth knowing about regardless of how the lesson was requested.
   const isVariant = lesson.variant && lesson.variant !== "standard";
   const squeezed = lesson.compression
-    ? `<p class="hint">${lesson.compression.words} words, ${Math.round(lesson.compression.ratio * 100)}% of the standard lesson's ${lesson.compression.source_words}.</p>` : "";
+    ? `<p class="hint">${lesson.compression.words} words, ${Math.round(lesson.compression.ratio * 100)}% of the standard lesson's ${lesson.compression.source_words}.</p>`
+    : lesson.reorganized
+      ? `<p class="hint">Reorganized from ${lesson.reorganized.source_sections} sections (${lesson.reorganized.source_words} words) into ${lesson.reorganized.sections} (${lesson.reorganized.words} words).</p>` : "";
   const length = (isVariant && lesson.target_pages
     ? `<p class="hint">About ${lesson.achieved_pages} page(s), for the ${lesson.target_pages} asked for.
         ${lesson.shortfall ? `<span class="warn">${md(lesson.shortfall)}</span>` : ""}</p>` : "")
