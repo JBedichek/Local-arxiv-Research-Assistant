@@ -20,6 +20,13 @@ from lara.learn.llm import Llm
 
 #: Words of a section shown to the outline call -- enough to know what the section is about.
 PREVIEW_WORDS = 45
+#: A section's length bounds. Without an upper bound an outline sized one 36,000-word lesson
+#: into six 2,000-word walls of text.
+MIN_SECTION_WORDS, MAX_SECTION_WORDS = 150, 900
+#: A rewritten section citing a smaller share of its sentences than this fraction of its
+#: source's share is written again once -- the first live run kept citations on 55% of
+#: sentences, from a lesson that had them on 81%.
+CITATION_KEEP = 0.8
 
 OUTLINE_SYSTEM = """You reorganize an existing lesson into the order a learner should meet \
 its material. Below are the lesson's concept, its scope, and every current section: an id, \
@@ -39,7 +46,8 @@ the same ground; a current section may feed several new ones. Material about the
 disagreement concerns goes with that point -- never a section of disagreements on their own.
 - Leave out current sections whose material belongs to the OTHER LESSONS listed, beyond what \
 this lesson needs from them.
-- words: this section's share of the LENGTH given; together they add up to it."""
+- words: this section's share of the LENGTH given; together they add up to it. A section is \
+300 to 800 words: a long topic becomes several sections, each with its own specific heading."""
 
 SECTION_SYSTEM = """You rewrite part of an existing lesson into ONE section of its new \
 outline. The outline is given for orientation; write only the section named as yours, under \
@@ -49,8 +57,10 @@ Format: one sentence per line.
 
 - Establish what the outline says this section establishes, at about the length given, using \
 only the source text provided. Prose that teaches: connect each point to the one before it.
-- Keep each sentence's citation brackets exactly as written in the source, e.g. [12345] or \
-[c3]. Never invent a citation and never add a fact the source does not state.
+- End every sentence that states a fact with the citation brackets of the source sentences \
+it comes from, exactly as written there, e.g. [12345] or [c3]. When you merge source \
+sentences, carry all of their brackets. Never invent a citation and never add a fact the \
+source does not state.
 - When the source says the same thing more than once, say it once. Never explain again what \
 ALREADY COVERED lists.
 - Where the source reports that findings disagree, keep that, with what each side found."""
@@ -65,6 +75,11 @@ def _sections_listing(sections: list[dict]) -> str:
     return "\n".join(rows)
 
 
+def _cited_share(sections: list[dict]) -> float:
+    flat = [s for sec in sections for s in sec.get("sentences", [])]
+    return sum(1 for s in flat if s.get("claims")) / len(flat) if flat else 0.0
+
+
 def _parse_outline(data, known: set[str]) -> list[dict]:
     out = []
     for sec in (data.get("sections") if isinstance(data, dict) else None) or []:
@@ -74,7 +89,7 @@ def _parse_outline(data, known: set[str]) -> list[dict]:
         if not sources:
             continue
         try:
-            words = max(120, min(2_500, int(sec.get("words") or 400)))
+            words = max(MIN_SECTION_WORDS, min(MAX_SECTION_WORDS, int(sec.get("words") or 400)))
         except (TypeError, ValueError):
             words = 400
         out.append({"heading": str(sec["heading"]).strip(),
@@ -110,15 +125,24 @@ async def reorganize(llm: Llm, lesson: dict, concept: dict, *, others=(), words:
         TR.set_phase(f"reorganize: {sec['heading']}")
         already = CP._render([{"heading": w["heading"], "sentences": w["sentences"][:1]}
                               for w in written]) or "(nothing yet)"
-        source = CP._render([by_id[f] for f in sec["from"]])
-        text = await llm.ask(SECTION_SYSTEM,
-                             f"CONCEPT: {concept['title']}\nNEW OUTLINE:\n{plan}\n\n"
-                             f"YOUR SECTION: {i}. {sec['heading']}\nIt establishes: {sec['establishes']}\n"
-                             f"LENGTH: about {sec['words']} words\n\nALREADY COVERED:\n{already}\n\n"
-                             f"SOURCE TEXT:\n{source}",
-                             default=max(500, int(sec["words"] * 2.2)), cap=0,
-                             stage="learn_reorganize_section")
-        sentences = [s for _, sents in CP._parse(text, known) for s in sents]
+        sources = [by_id[f] for f in sec["from"]]
+        source = CP._render(sources)
+        prompt = (f"CONCEPT: {concept['title']}\nNEW OUTLINE:\n{plan}\n\n"
+                  f"YOUR SECTION: {i}. {sec['heading']}\nIt establishes: {sec['establishes']}\n"
+                  f"LENGTH: about {sec['words']} words\n\nALREADY COVERED:\n{already}\n\n"
+                  f"SOURCE TEXT:\n{source}")
+        want = _cited_share(sources) * CITATION_KEEP
+        sentences: list[dict] = []
+        for attempt in range(2):
+            text = await llm.ask(SECTION_SYSTEM, prompt if attempt == 0 else prompt + (
+                "\n\nYour last version dropped citations: every factual sentence must end with "
+                "the brackets of the source sentences it comes from."),
+                default=max(500, int(sec["words"] * 2.2)), cap=0, stage="learn_reorganize_section")
+            got = [s for _, sents in CP._parse(text, known) for s in sents]
+            if not sentences or _cited_share([{"sentences": got}]) > _cited_share([{"sentences": sentences}]):
+                sentences = got
+            if _cited_share([{"sentences": sentences}]) >= want:
+                break
         if sentences:
             written.append({"heading": sec["heading"], "sentences": sentences})
     if not written:

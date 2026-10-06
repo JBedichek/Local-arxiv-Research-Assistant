@@ -559,3 +559,21 @@ def test_a_reorganized_version_is_stored_beside_the_standard_lesson():
     stored = store.load_concept(course["id"], "c1")
     assert stored["lessons"]["reorganized"]["sections"][0]["heading"] == "Warmup, in order"
     assert stored["lesson"]["sections"] == content["lesson"]["sections"]
+
+
+def test_a_rewritten_section_that_drops_citations_is_written_again():
+    replies = iter(["The stream is a running sum.\nPapers differ on X.",
+                    "The stream is a running sum [1].\nPapers differ on X [2]."])
+    m = llm(("reorganize an existing lesson", OUTLINE),
+            ("rewrite part of an existing lesson", lambda s, p: next(replies)))
+    out = run(RG.reorganize(m, _messy_lesson(), {"title": "Residual stream"}))
+    assert [x["claims"] for x in out["sections"][0]["sentences"]] == [["1"], ["2"]]
+    assert "dropped citations" in m.calls[-1][1]
+
+
+def test_outline_sections_are_kept_to_a_readable_length():
+    m = llm(("reorganize an existing lesson", json.dumps({"sections": [
+        {"heading": "Huge", "establishes": "e", "from": ["s3"], "words": 2500}]})),
+            ("rewrite part of an existing lesson", "The stream is a running sum [1]."))
+    run(RG.reorganize(m, _messy_lesson(), {"title": "t"}))
+    assert f"LENGTH: about {RG.MAX_SECTION_WORDS} words" in m.calls[1][1]

@@ -738,7 +738,8 @@ it -- material that belongs to other lessons it names.
 - A disagreement between sources belongs in the section about the point in dispute, not in \
 a section of its own.
 - words: this section's share of the LENGTH the objective gives; together they add up to \
-it. A section is a few hundred words, not a few dozen."""
+it. A section is 300 to 800 words: a long topic becomes several sections, each with its own \
+specific heading."""
 
 LESSON_OUTLINED_SECTION_SYSTEM = """You write ONE section of a lesson for a learner, from \
 research findings. The lesson's outline is given for orientation; write only the section \
@@ -789,7 +790,7 @@ def _parse_outline(text: str, known: set[str]) -> list[dict]:
         if not findings:
             continue
         try:
-            words = max(150, min(2_500, int(sec.get("words") or 400)))
+            words = max(150, min(900, int(sec.get("words") or 400)))
         except (TypeError, ValueError):
             words = 400
         out.append({"heading": str(sec["heading"]).strip(),
